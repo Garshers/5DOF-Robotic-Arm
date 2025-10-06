@@ -27,7 +27,12 @@ const int AS5600_ZMCO = 0x00;
 const int AS5600_RAW_ANGLE_HIGH = 0x0C; // Rejestry kąta RAW (12 bit)
 const int SDA_PIN = 21;
 const int SCL_PIN = 22;
-const uint16_t ENCODER_ZPOS[] = {100, 100, 100, 100};
+
+const uint8_t ENCODER_CHANNEL[] = {1, 2, 3, 5}; // Kanał na którym znajduje się enkoder
+const float ENCODER_LEVER[] = {2, 3.6, 4.5, 4.5}; // Dźwignia ramię/wał silnika
+const uint16_t ENCODER_ZPOS[] = {100, 100, 100, 100}; // Offset (wartość enkoderów dla pozycji startowej)
+int16_t rotationCount[] = {0, 0, 0, 0}; // Liczniki obrotów dla każdej osi
+uint16_t lastRawAngle[] = {0, 0, 0, 0}; // Ostatnie odczyty kąta
 
 // ================== Zmienne do wypisywania stanów ===================
 unsigned long previousMillis = 0; // przechowuje czas ostatniego wykonania
@@ -86,25 +91,13 @@ void loop() {
 
     /*printButtonStates(buttonStates);*/
 
-    // Oś E
-    uint8_t channel = 1;
-    uint16_t rawAngleAdjusted = getEncoderRawAngle(channel) - ENCODER_ZPOS[0];
-    printRawAngleAdjusted(channel, rawAngleAdjusted);
-    
-    // Oś X
-    channel = 2;
-    rawAngleAdjusted = getEncoderRawAngle(channel) - ENCODER_ZPOS[1];
-    printRawAngleAdjusted(channel, rawAngleAdjusted);
-
-    // Oś Y
-    channel = 3;
-    rawAngleAdjusted = getEncoderRawAngle(channel) - ENCODER_ZPOS[2];
-    printRawAngleAdjusted(channel, rawAngleAdjusted);
-
-    //Oś A
-    channel = 5;
-    rawAngleAdjusted = getEncoderRawAngle(channel) - ENCODER_ZPOS[3];
-    printRawAngleAdjusted(channel, rawAngleAdjusted);
+    for(int i = 0; i < 4; i++){
+      uint16_t rawAngleAdjusted = getEncoderRawAngle(ENCODER_CHANNEL[i]) - ENCODER_ZPOS[i]; // Korekta pozycji - offset
+      updateRotationCount(i, rawAngleAdjusted); // Dodawanie obrotów (enkoder wykrywa 0-360st)
+      float armAngleE = rawToArmAngleMultiTurn(rawAngleAdjusted, rotationCount[i], ENCODER_LEVER[i]); // Wyznaczanie kąta dla sterowanego ramienia
+      printArmAngle(ENCODER_CHANNEL[i], armAngleE);
+    }
+    Serial.println();
   }
   
   delay(1); 
@@ -177,6 +170,26 @@ uint16_t getEncoderRawAngle(uint8_t channel){
   return rawAngle;
 }
 
+float rawToArmAngleMultiTurn(uint16_t rawAngle, int16_t rotations, float lever) {
+  float totalEncoderAngle = (rotations * 360.0) + (rawAngle * 360.0 / 4096.0);
+  return totalEncoderAngle * lever;
+}
+
+void updateRotationCount(uint8_t axisIndex, uint16_t currentRaw) {
+  uint16_t lastRaw = lastRawAngle[axisIndex];
+  
+  // Wykrycie przejścia 4095->0 (obrót w przód)
+  if (lastRaw > 3000 && currentRaw < 1000) {
+    rotationCount[axisIndex]++;
+  }
+  // Wykrycie przejścia 0->4095 (obrót w tył)
+  else if (lastRaw < 1000 && currentRaw > 3000) {
+    rotationCount[axisIndex]--;
+  }
+  
+  lastRawAngle[axisIndex] = currentRaw;
+}
+
 void printButtonStates(byte buttonStates) {  
   Serial.print(" X+:");
   Serial.print((buttonStates & (1 << 0)) ? "ON" : "off");
@@ -196,10 +209,10 @@ void printButtonStates(byte buttonStates) {
   Serial.println((buttonStates & (1 << 7)) ? "ON" : "off");
 }
 
-void printRawAngleAdjusted(uint8_t channel, uint16_t rawAngleAdjusted) {
+void printArmAngle(uint8_t channel, float armAngle) {
+  Serial.print("Kanal ");
   Serial.print(channel);
   Serial.print(": ");
-  Serial.print(rawAngleAdjusted);
-  Serial.print("| ");
-  Serial.println("");
+  Serial.print(armAngle, 2);
+  Serial.print("° | ");
 }
