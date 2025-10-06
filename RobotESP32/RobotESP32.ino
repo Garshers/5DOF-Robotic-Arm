@@ -27,6 +27,7 @@ const int AS5600_ZMCO = 0x00;
 const int AS5600_RAW_ANGLE_HIGH = 0x0C; // Rejestry kąta RAW (12 bit)
 const int SDA_PIN = 21;
 const int SCL_PIN = 22;
+const uint16_t ENCODER_ZPOS[] = {100, 100, 100, 100};
 
 // ================== Zmienne do wypisywania stanów ===================
 unsigned long previousMillis = 0; // przechowuje czas ostatniego wykonania
@@ -77,7 +78,7 @@ void loop() {
   if (digitalRead(BTN_E_BACK) == LOW) {buttonStates |= (1 << 7);} // Bit 7: E BACK (E-)
   SerialPort.write(buttonStates); // Wysłanie bajtu do Arduino przez UART2
   
-  unsigned long currentMillis = millis();  // aktualny czas
+  unsigned long currentMillis = millis(); // aktualny czas
   
   // sprawdź czy minęło 500ms
   if (currentMillis - previousMillis >= interval) {
@@ -85,15 +86,25 @@ void loop() {
 
     /*printButtonStates(buttonStates);*/
 
-    for (int channel = 1; channel <= 5; channel++) {
-      if (channel == 4) {continue;}
-      uint16_t rawAngle = getEncoderRawAngle(channel);
-      Serial.print(channel);
-      Serial.print(": ");
-      Serial.print(rawAngle);
-      Serial.print("| ");
-    }
-    Serial.println("");
+    // Oś E
+    uint8_t channel = 1;
+    uint16_t rawAngleAdjusted = getEncoderRawAngle(channel) - ENCODER_ZPOS[0];
+    printRawAngleAdjusted(channel, rawAngleAdjusted);
+    
+    // Oś X
+    channel = 2;
+    rawAngleAdjusted = getEncoderRawAngle(channel) - ENCODER_ZPOS[1];
+    printRawAngleAdjusted(channel, rawAngleAdjusted);
+
+    // Oś Y
+    channel = 3;
+    rawAngleAdjusted = getEncoderRawAngle(channel) - ENCODER_ZPOS[2];
+    printRawAngleAdjusted(channel, rawAngleAdjusted);
+
+    //Oś A
+    channel = 5;
+    rawAngleAdjusted = getEncoderRawAngle(channel) - ENCODER_ZPOS[3];
+    printRawAngleAdjusted(channel, rawAngleAdjusted);
   }
   
   delay(1); 
@@ -111,7 +122,7 @@ uint8_t selectI2CChannel(uint8_t channel) {
 
 uint16_t getEncoderRawAngle(uint8_t channel){
   // Wybór kanalu przez PCA9548A
-  uint16_t pca_error = selectI2CChannel(channel);
+  uint8_t pca_error = selectI2CChannel(channel);
 
   if (pca_error != 0) {
     Serial.print("Kanal ");
@@ -119,7 +130,7 @@ uint16_t getEncoderRawAngle(uint8_t channel){
     Serial.print(" -> BLAD MULTIPLEKSERA (Kod: ");
     Serial.print(pca_error);
     Serial.println(").");
-    return pca_error;
+    return 0;
   }
   
   uint16_t rawAngle = 0;
@@ -183,4 +194,12 @@ void printButtonStates(byte buttonStates) {
   Serial.print((buttonStates & (1 << 6)) ? "ON" : "off");
   Serial.print(" | E-:");
   Serial.println((buttonStates & (1 << 7)) ? "ON" : "off");
+}
+
+void printRawAngleAdjusted(uint8_t channel, uint16_t rawAngleAdjusted) {
+  Serial.print(channel);
+  Serial.print(": ");
+  Serial.print(rawAngleAdjusted);
+  Serial.print("| ");
+  Serial.println("");
 }
