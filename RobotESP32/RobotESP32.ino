@@ -34,6 +34,7 @@ const float ENCODER_LEVER[] = {2, 3.6, 4.5, 4.5}; // Dźwignia ramię/wał silni
 const uint16_t ENCODER_ZPOS[] = {100, 100, 100, 100}; // Offset (wartość enkoderów dla pozycji startowej)
 int16_t rotationCount[] = {0, 0, 0, 0}; // Liczniki obrotów dla każdej osi
 uint16_t lastRawAngle[] = {0, 0, 0, 0}; // Ostatnie odczyty kąta
+const float angleConst = 360.0 / 4096.0; // Współczynnik zmiany raw angle na kąt 0-360
 
 // ================== Zmienne do wypisywania stanów ===================
 unsigned long previousMillis = 0; // przechowuje czas ostatniego wykonania
@@ -72,8 +73,8 @@ void setup() {
 }
 
 void loop() {
-  if (digitalRead(BTN_MODE)) {
-    Serial.write(0x01); // Stan określający moduł przycisków
+  if (digitalRead(true)) {
+    /*Serial.write(0x01); // Stan określający moduł przycisków*/
     readButtonsAndControl();
   } else {
     Serial.write(0x02); // Stan określający moduł pozycyjny
@@ -99,7 +100,7 @@ void readButtonsAndControl() {
   
   unsigned long currentMillis = millis(); // aktualny czas
   
-  // sprawdź czy minęło 500ms
+  // sprawdź czy minęło 500ms   
   if (currentMillis - previousMillis >= interval) {
     previousMillis = currentMillis;
 
@@ -120,11 +121,11 @@ void readEncodersAndControl() {
 
 }
 
-// =========================================================================================================
-// =========================================================================================================
-// =========================================== FUNKCJE DODATKOWE ===========================================
-// =========================================================================================================
-// =========================================================================================================
+// =====================================================================================================================================================
+// =====================================================================================================================================================
+// ================================================================ FUNKCJE DODATKOWE ==================================================================
+// =====================================================================================================================================================
+// =====================================================================================================================================================
 
 // =========================================================================
 // =============================== ENKODERY ================================
@@ -162,5 +163,48 @@ uint16_t getEncoderRawAngle(uint8_t channel) {
     return 0xFFFF;
   }
 
-  if (!isAS5600Available()) {
-    Serial.printf("Kanał %d -> AS5600 niedostępn
+if (!isAS5600Available()) {
+    Serial.printf("Kanał %d -> AS5600 niedostępny.\n", channel);
+    return 0xFFFF;
+  }
+
+  uint16_t angle;
+  if (!readAS5600Raw(angle)) {
+    Serial.printf("Kanał %d -> Błąd odczytu kąta.\n", channel);
+    return 0xFFFF;
+  }
+
+  return angle;
+}
+// Funkcja zwraca kąt o jaki obróciło się ramię
+float getArmAngle(uint16_t rawAngle, int16_t rotations, float lever) {
+  float totalEncoderAngle = (rotations * 360.0) + (rawAngle * 360.0 / 4096.0); // Całkowity kąt silnika
+  return totalEncoderAngle / lever; // Kąt sterowanego ramienia
+}
+// Funkcja śledzi ilość obrotów dla danego enkodera
+void updateRotationCount(uint8_t axisIndex, uint16_t currentRaw) {
+  uint16_t lastRaw = lastRawAngle[axisIndex];
+  
+  // Wykrycie przejścia 4095->0 (obrót w przód)
+  if (lastRaw > 3000 && currentRaw < 1000) { rotationCount[axisIndex]++; }
+  // Wykrycie przejścia 0->4095 (obrót w tył)
+  else if (lastRaw < 1000 && currentRaw > 3000) { rotationCount[axisIndex]--; }
+  
+  lastRawAngle[axisIndex] = currentRaw;
+}
+
+// =========================================================================
+// ================================ INNE ===================================
+// =========================================================================
+
+void printButtonStates(byte buttonStates) {
+  const char* labels[8] = {"X+", "X-", "Y+", "Y-", "Z+", "Z-", "E+", "E-"};
+  for (int i = 0; i < 8; ++i) {
+    Serial.printf("%s%s:%s", i ? " | " : " ", labels[i], (buttonStates & (1 << i)) ? "ON" : "off");
+  }
+  Serial.println();
+}
+
+void printArmAngle(uint8_t channel, float armAngle) {
+  Serial.printf("Kanal %d: %.2f° | ", channel, armAngle);
+}
