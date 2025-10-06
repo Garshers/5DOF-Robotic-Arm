@@ -19,6 +19,7 @@ HardwareSerial SerialPort(2); // Definicja portu szeregowego 2
 #define BTN_Z_BACK 25
 #define BTN_E_FWRD 33
 #define BTN_E_BACK 32
+#define BTN_MODE 35
 
 // ===================== Zmienne enkoderów (I2C) ======================
 const int PCA9548A_ADDR = 0x70; // Adres multipleksera
@@ -36,7 +37,7 @@ uint16_t lastRawAngle[] = {0, 0, 0, 0}; // Ostatnie odczyty kąta
 
 // ================== Zmienne do wypisywania stanów ===================
 unsigned long previousMillis = 0; // przechowuje czas ostatniego wykonania
-const long interval = 1000; // interwał 500ms
+const long interval = 1000; // interwał 1000ms
 
 
 void setup() {
@@ -51,6 +52,7 @@ void setup() {
   pinMode(BTN_Z_BACK, INPUT_PULLUP);
   pinMode(BTN_E_FWRD, INPUT_PULLUP);
   pinMode(BTN_E_BACK, INPUT_PULLUP);
+  pinMode(BTN_MODE, INPUT_PULLUP);
   
   // Konfiguracja UART2 dla komunikacji z Arduino
   Serial.println("=== Ustawienia komunikacji UART ===");
@@ -60,7 +62,7 @@ void setup() {
   Serial.print(", TX: ");
   Serial.print(ESP_TX_PIN);
   Serial.print(", Baud: ");
-  Serial.print(UART_BAUD);
+  Serial.println(UART_BAUD);
 
   // Konfiguracja komunikacji z multiplekserem
   Wire.begin(SDA_PIN, SCL_PIN);
@@ -70,6 +72,18 @@ void setup() {
 }
 
 void loop() {
+  if (digitalRead(BTN_MODE)) {
+    Serial.write(0x01); // Stan określający moduł przycisków
+    readButtonsAndControl();
+  } else {
+    Serial.write(0x02); // Stan określający moduł pozycyjny
+    readEncodersAndControl();
+  }
+  delay(1); 
+}
+
+// Sterowanie PRZYCISKAMI
+void readButtonsAndControl() {
   byte buttonStates = 0;
   
   // Odczyt stanów przycisków (wciśnięty = LOW) i ustawienie bitów (wciśnięty = 1)
@@ -99,8 +113,11 @@ void loop() {
     }
     Serial.println();
   }
-  
-  delay(1); 
+}
+
+// Sterowanie POZYCJĄ
+void readEncodersAndControl() {
+
 }
 
 // =========================================================================================================
@@ -146,47 +163,4 @@ uint16_t getEncoderRawAngle(uint8_t channel) {
   }
 
   if (!isAS5600Available()) {
-    Serial.printf("Kanał %d -> AS5600 niedostępny.\n", channel);
-    return 0xFFFF;
-  }
-
-  uint16_t angle;
-  if (!readAS5600Raw(angle)) {
-    Serial.printf("Kanał %d -> Błąd odczytu kąta.\n", channel);
-    return 0xFFFF;
-  }
-
-  return angle;
-}
-// Funkcja zwraca kąt o jaki obróciło się ramię
-float getArmAngle(uint16_t rawAngle, int16_t rotations, float lever) {
-  float totalEncoderAngle = (rotations * 360.0) + (rawAngle * 360.0 / 4096.0); // Całkowity kąt silnika
-  return totalEncoderAngle / lever; // Kąt sterowanego ramienia
-}
-// Funkcja śledzi ilość obrotów dla danego enkodera
-void updateRotationCount(uint8_t axisIndex, uint16_t currentRaw) {
-  uint16_t lastRaw = lastRawAngle[axisIndex];
-  
-  // Wykrycie przejścia 4095->0 (obrót w przód)
-  if (lastRaw > 3000 && currentRaw < 1000) { rotationCount[axisIndex]++; }
-  // Wykrycie przejścia 0->4095 (obrót w tył)
-  else if (lastRaw < 1000 && currentRaw > 3000) { rotationCount[axisIndex]--; }
-  
-  lastRawAngle[axisIndex] = currentRaw;
-}
-
-// =========================================================================
-// ================================ INNE ===================================
-// =========================================================================
-
-void printButtonStates(byte buttonStates) {
-  const char* labels[8] = {"X+", "X-", "Y+", "Y-", "Z+", "Z-", "E+", "E-"};
-  for (int i = 0; i < 8; ++i) {
-    Serial.printf("%s%s:%s", i ? " | " : " ", labels[i], (buttonStates & (1 << i)) ? "ON" : "off");
-  }
-  Serial.println();
-}
-
-void printArmAngle(uint8_t channel, float armAngle) {
-  Serial.printf("Kanal %d: %.2f° | ", channel, armAngle);
-}
+    Serial.printf("Kanał %d -> AS5600 niedostępn
