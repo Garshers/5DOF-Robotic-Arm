@@ -93,8 +93,8 @@ void loop() {
 
     for(int i = 0; i < 4; i++){
       uint16_t rawAngleAdjusted = getEncoderRawAngle(ENCODER_CHANNEL[i]) - ENCODER_ZPOS[i]; // Korekta pozycji - offset
-      updateRotationCount(i, rawAngleAdjusted); // Dodawanie obrotów (enkoder wykrywa 0-360st)
-      float armAngleE = rawToArmAngleMultiTurn(rawAngleAdjusted, rotationCount[i], ENCODER_LEVER[i]); // Wyznaczanie kąta dla sterowanego ramienia
+      updateRotationCount(i, rawAngleAdjusted); // Dodawanie obrotów (enkoder wykrywa 0-360°)
+      float armAngleE = getArmAngle(rawAngleAdjusted, rotationCount[i], ENCODER_LEVER[i]); // Wyznaczanie kąta dla sterowanego ramienia
       printArmAngle(ENCODER_CHANNEL[i], armAngleE);
     }
     Serial.println();
@@ -103,116 +103,90 @@ void loop() {
   delay(1); 
 }
 
+// =========================================================================================================
+// =========================================================================================================
+// =========================================== FUNKCJE DODATKOWE ===========================================
+// =========================================================================================================
+// =========================================================================================================
+
 // =========================================================================
-// ---------------------------FUNKCJE DODATKOWE-----------------------------
+// =============================== ENKODERY ================================
 // =========================================================================
 
-uint8_t selectI2CChannel(uint8_t channel) {
+// Wybranie kanału na multiplekserze PCA9548A
+bool selectI2CChannel(uint8_t channel) {
   Wire.beginTransmission(PCA9548A_ADDR);
-  Wire.write(1 << channel);
-  return Wire.endTransmission();
+  Wire.write(1 << channel); // Ustawienie bitu odpowiadającego kanałowi
+  return Wire.endTransmission() == 0; // Zwraca true, jeśli sukces
 }
-
-uint16_t getEncoderRawAngle(uint8_t channel){
-  // Wybór kanalu przez PCA9548A
-  uint8_t pca_error = selectI2CChannel(channel);
-
-  if (pca_error != 0) {
-    Serial.print("Kanal ");
-    Serial.print(channel);
-    Serial.print(" -> BLAD MULTIPLEKSERA (Kod: ");
-    Serial.print(pca_error);
-    Serial.println(").");
-    return 0;
-  }
-  
-  uint16_t rawAngle = 0;
-
-  // Sprawdzenie, czy AS5600 odpowiada na 0x36
+// Sprawdzanie, czy czujnik AS5600 odpowiada na I2C
+bool isAS5600Available() {
   Wire.beginTransmission(AS5600_ADDR);
-  uint8_t as_error = Wire.endTransmission(true);
+  return Wire.endTransmission(true) == 0;
+}
+// Odczytanie surowego kąta z AS5600 (12-bitowy)
+bool readAS5600Raw(uint16_t &angle) {
+  Wire.beginTransmission(AS5600_ADDR);
+  Wire.write(AS5600_RAW_ANGLE_HIGH); // Rejestr HIGH byte (0x0C)
+  if (Wire.endTransmission(false) != 0) return false;
 
-  if (as_error == 0) {
-    // Odczyt 12-bitowego KĄTA RAW
-    Wire.beginTransmission(AS5600_ADDR);
-    Wire.write(AS5600_RAW_ANGLE_HIGH); // Wskazujemy rejestr HIGH (0x0C)
-    Wire.endTransmission(false);
-    
-    Wire.requestFrom(AS5600_ADDR, 2); // Odczytujemy 2 bajty (0x0C i 0x0D)
-    if (Wire.available() == 2) {
-      uint8_t highByte = Wire.read();
-      uint8_t lowByte = Wire.read();
-      
-      // Polaczenie 12 bitow: 4 bity z highByte + 8 bitow z lowByte
-      rawAngle = (highByte << 8) | lowByte;
-      rawAngle &= 0x0FFF; // Maskowanie do 12 bitow
-      
-      // Odczyt testowy rejestru ZMCO
-      Wire.beginTransmission(AS5600_ADDR);
-      Wire.write(AS5600_ZMCO);
-      Wire.endTransmission(false);
-      Wire.requestFrom(AS5600_ADDR, 1);
-      if (Wire.available()) {} 
-      else { Serial.println("BLAD ZMCO."); }
-    } 
-    else {
-      Serial.println("BLAD ODCZYTU KĄTA.");
-    }
-    
-  } else {
-    Serial.print("Kanal ");
-    Serial.print(channel);
-    Serial.print(": (AS5600) BRAK (Blad: ");
-    Serial.print(as_error);
-    Serial.println(").");
+  Wire.requestFrom(AS5600_ADDR, 2); // Odczyt dwóch bajtów: HIGH i LOW
+  if (Wire.available() != 2) return false;
+
+  uint8_t high = Wire.read();
+  uint8_t low = Wire.read();
+  angle = ((high << 8) | low) & 0x0FFF; // Połączenie i maskowanie do 12 bitów
+  return true;
+}
+// Główna funkcja odczytu kąta z enkodera na wybranym kanale
+uint16_t getEncoderRawAngle(uint8_t channel) {
+  if (!selectI2CChannel(channel)) {
+    Serial.printf("Kanał %d -> Błąd multipleksera.\n", channel);
+    return 0xFFFF;
   }
 
-  return rawAngle;
-}
+  if (!isAS5600Available()) {
+    Serial.printf("Kanał %d -> AS5600 niedostępny.\n", channel);
+    return 0xFFFF;
+  }
 
-float rawToArmAngleMultiTurn(uint16_t rawAngle, int16_t rotations, float lever) {
-  float totalEncoderAngle = (rotations * 360.0) + (rawAngle * 360.0 / 4096.0);
-  return totalEncoderAngle * lever;
-}
+  uint16_t angle;
+  if (!readAS5600Raw(angle)) {
+    Serial.printf("Kanał %d -> Błąd odczytu kąta.\n", channel);
+    return 0xFFFF;
+  }
 
+  return angle;
+}
+// Funkcja zwraca kąt o jaki obróciło się ramię
+float getArmAngle(uint16_t rawAngle, int16_t rotations, float lever) {
+  float totalEncoderAngle = (rotations * 360.0) + (rawAngle * 360.0 / 4096.0); // Całkowity kąt silnika
+  return totalEncoderAngle / lever; // Kąt sterowanego ramienia
+}
+// Funkcja śledzi ilość obrotów dla danego enkodera
 void updateRotationCount(uint8_t axisIndex, uint16_t currentRaw) {
   uint16_t lastRaw = lastRawAngle[axisIndex];
   
   // Wykrycie przejścia 4095->0 (obrót w przód)
-  if (lastRaw > 3000 && currentRaw < 1000) {
-    rotationCount[axisIndex]++;
-  }
+  if (lastRaw > 3000 && currentRaw < 1000) { rotationCount[axisIndex]++; }
   // Wykrycie przejścia 0->4095 (obrót w tył)
-  else if (lastRaw < 1000 && currentRaw > 3000) {
-    rotationCount[axisIndex]--;
-  }
+  else if (lastRaw < 1000 && currentRaw > 3000) { rotationCount[axisIndex]--; }
   
   lastRawAngle[axisIndex] = currentRaw;
 }
 
-void printButtonStates(byte buttonStates) {  
-  Serial.print(" X+:");
-  Serial.print((buttonStates & (1 << 0)) ? "ON" : "off");
-  Serial.print(" | X-:");
-  Serial.print((buttonStates & (1 << 1)) ? "ON" : "off");
-  Serial.print(" | Y+:");
-  Serial.print((buttonStates & (1 << 2)) ? "ON" : "off");
-  Serial.print(" | Y-:");
-  Serial.print((buttonStates & (1 << 3)) ? "ON" : "off");
-  Serial.print(" | Z+:");
-  Serial.print((buttonStates & (1 << 4)) ? "ON" : "off");
-  Serial.print(" | Z-:");
-  Serial.print((buttonStates & (1 << 5)) ? "ON" : "off");
-  Serial.print(" | E+:");
-  Serial.print((buttonStates & (1 << 6)) ? "ON" : "off");
-  Serial.print(" | E-:");
-  Serial.println((buttonStates & (1 << 7)) ? "ON" : "off");
+// =========================================================================
+// ================================ INNE ===================================
+// =========================================================================
+
+void printButtonStates(byte buttonStates) {
+  const char* labels[8] = {"X+", "X-", "Y+", "Y-", "Z+", "Z-", "E+", "E-"};
+  for (int i = 0; i < 8; ++i) {
+    Serial.printf("%s%s:%s", i ? " | " : " ", labels[i], (buttonStates & (1 << i)) ? "ON" : "off");
+  }
+  Serial.println();
 }
 
 void printArmAngle(uint8_t channel, float armAngle) {
-  Serial.print("Kanal ");
-  Serial.print(channel);
-  Serial.print(": ");
-  Serial.print(armAngle, 2);
-  Serial.print("° | ");
+  Serial.printf("Kanal %d: %.2f° | ", channel, armAngle);
 }
