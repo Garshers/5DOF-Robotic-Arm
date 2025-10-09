@@ -29,9 +29,9 @@ const int AS5600_RAW_ANGLE_HIGH = 0x0C; // Rejestry kąta RAW (12 bit)
 const int SDA_PIN = 21;
 const int SCL_PIN = 22;
 
-const uint8_t ENCODER_CHANNEL[] = {1, 2, 3, 5}; // Kanał na którym znajduje się enkoder
+const uint8_t ENCODER_CHANNEL[] = {4, 5, 6, 7}; // Kanał na którym znajduje się enkoder
 const float ENCODER_LEVER[] = {2, 3.6, 4.5, 4.5}; // Dźwignia ramię/wał silnika
-const uint16_t ENCODER_ZPOS[] = {100, 100, 100, 100}; // Offset (wartość enkoderów dla pozycji startowej)
+const int16_t ENCODER_ZPOS[] = {2972, 36, 1793, 3824}; // Offset (wartość enkoderów dla pozycji startowej)
 int16_t rotationCount[] = {0, 0, 0, 0}; // Liczniki obrotów dla każdej osi
 uint16_t lastRawAngle[] = {0, 0, 0, 0}; // Ostatnie odczyty kąta
 const float angleConst = 360.0 / 4096.0; // Współczynnik zmiany raw angle na kąt 0-360
@@ -73,7 +73,7 @@ void setup() {
 }
 
 void loop() {
-  if (digitalRead(true)) {
+  if (digitalRead(BTN_MODE) == LOW) {
     /*Serial.write(0x01); // Stan określający moduł przycisków*/
     readButtonsAndControl();
   } else {
@@ -99,18 +99,22 @@ void readButtonsAndControl() {
   SerialPort.write(buttonStates); // Wysłanie bajtu do Arduino przez UART2
   
   unsigned long currentMillis = millis(); // aktualny czas
-  
-  // sprawdź czy minęło 500ms   
+ 
   if (currentMillis - previousMillis >= interval) {
     previousMillis = currentMillis;
 
     /*printButtonStates(buttonStates);*/
 
     for(int i = 0; i < 4; i++){
-      uint16_t rawAngleAdjusted = getEncoderRawAngle(ENCODER_CHANNEL[i]) - ENCODER_ZPOS[i]; // Korekta pozycji - offset
-      updateRotationCount(i, rawAngleAdjusted); // Dodawanie obrotów (enkoder wykrywa 0-360°)
-      float armAngleE = getArmAngle(rawAngleAdjusted, rotationCount[i], ENCODER_LEVER[i]); // Wyznaczanie kąta dla sterowanego ramienia
-      printArmAngle(ENCODER_CHANNEL[i], armAngleE);
+      uint16_t rawAngle = getEncoderRawAngle(ENCODER_CHANNEL[i]);
+      int32_t rawAngleAdjusted = (int32_t)rawAngle - (int32_t)ENCODER_ZPOS[i];
+      
+      // Modulo dla zakresu 0-4095
+      rawAngleAdjusted = ((rawAngleAdjusted % 4096) + 4096) % 4096;
+      
+      updateRotationCount(i, (uint16_t)rawAngleAdjusted);
+      float armAngle = getArmAngle((uint16_t)rawAngleAdjusted, rotationCount[i], ENCODER_LEVER[i]);
+      printArmAngle(ENCODER_CHANNEL[i], armAngle);
     }
     Serial.println();
   }
@@ -118,7 +122,7 @@ void readButtonsAndControl() {
 
 // Sterowanie POZYCJĄ
 void readEncodersAndControl() {
-
+  delay(500);
 }
 
 // =====================================================================================================================================================
@@ -163,7 +167,7 @@ uint16_t getEncoderRawAngle(uint8_t channel) {
     return 0xFFFF;
   }
 
-if (!isAS5600Available()) {
+  if (!isAS5600Available()) {
     Serial.printf("Kanał %d -> AS5600 niedostępny.\n", channel);
     return 0xFFFF;
   }
@@ -203,6 +207,10 @@ void printButtonStates(byte buttonStates) {
     Serial.printf("%s%s:%s", i ? " | " : " ", labels[i], (buttonStates & (1 << i)) ? "ON" : "off");
   }
   Serial.println();
+}
+
+void printArmAngle(uint8_t channel, int32_t armAngle) {
+  Serial.printf("Kanal %d: %d Raw Angle | ", channel, armAngle);
 }
 
 void printArmAngle(uint8_t channel, float armAngle) {
