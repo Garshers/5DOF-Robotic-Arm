@@ -37,6 +37,8 @@ int lastDirZ = 0; // Ostatni kierunek ruchu Z (1 = FRWD/LOW, 2 = BACK/HIGH, 0 = 
 bool limit_Z_blocked = false; // Flaga blokady kierunku
 
 // ======================== Sterowanie pozycyjne ========================
+
+const char axisLabels[4] = {'E', 'Z', 'Y', 'A'};
 float currentAngles[4] = {0.0, 0.0, 0.0, 0.0};
 float targetAngles[4] = {10.0, 0.0, 0.0, 0.0};
 unsigned long lastStepTime[4] = {0, 0, 0, 0};
@@ -78,7 +80,6 @@ void loop() {
     if (esp32Serial.available()) {
         String input = esp32Serial.readStringUntil('\n');
         input.trim();
-        /*Serial.println(input);*/
 
         if (input.startsWith("BTN:")) {
         handleButtonFrame(input); // ustawia currentMode = MODE_BUTTONS
@@ -95,7 +96,7 @@ void loop() {
         case MODE_POSITION: controlWithPosition();
         break;
 
-        default: delay(500);
+        default: delay(10);
         break;
     }
 }
@@ -200,12 +201,6 @@ void controlWithButtons() {
     delayMicroseconds(STEP_DELAY_MICROS);
 }
 
-void stepPulse(int stepPin) {
-    digitalWrite(stepPin, HIGH);
-    delayMicroseconds(5);
-    digitalWrite(stepPin, LOW);
-}
-
 // --------------------------- POSITION mode ---------------------------
 void handlePositionFrame(String input) {
     int axisIndex = 0;
@@ -223,9 +218,9 @@ void handlePositionFrame(String input) {
 
         switch (axis) {
         case 'E': axisIndex = 0; break;
-        case 'X': axisIndex = 1; break;
+        case 'Z': axisIndex = 1; break;
         case 'Y': axisIndex = 2; break;
-        case 'Z': axisIndex = 3; break;
+        case 'A': axisIndex = 3; break;
         default: continue;
         }
 
@@ -242,7 +237,7 @@ void handlePositionFrame(String input) {
     if (millis() - lastDebug > 5000) {
         for (int i = 0; i < 4; i++) {
             Serial.print("Oś ");
-            Serial.print(i);
+            Serial.print(axisLabels[i]);
             Serial.print(": aktualna ");
             Serial.print(currentAngles[i], 2);
             Serial.print("°, cel ");
@@ -254,7 +249,6 @@ void handlePositionFrame(String input) {
 }
 
 void controlWithPosition() {
-
     if (millis() - lastPositionUpdate > POSITION_TIMEOUT) {
         Serial.println("⚠️ TIMEOUT: Brak ramek z ESP32! Zatrzymano sterowanie pozycyjne.");
         currentMode = MODE_NONE;
@@ -268,7 +262,7 @@ void controlWithPosition() {
     
     unsigned long now = micros();
 
-    for (int i = 0; i < 4; i++) {
+    for (int i = 1; i < 4; i++) { // NARAZIE POMIJAMY OŚ X (0) - BRAK ENKODERA <--------
         float error = targetAngles[i] - currentAngles[i];
 
         // Czy dotarliśmy do celu?
@@ -279,10 +273,10 @@ void controlWithPosition() {
         // Wybór pinów
         int dirPin, stepPin, limitPin;
         switch (i) {
-            case 0: dirPin = DIR_E; stepPin = STEP_E; limitPin = LIMIT_E_PIN; break;
-            case 1: dirPin = DIR_X; stepPin = STEP_X; limitPin = LIMIT_X_PIN; break;
-            case 2: dirPin = DIR_Y; stepPin = STEP_Y; limitPin = LIMIT_Y_PIN; break;
-            case 3: dirPin = DIR_Z; stepPin = STEP_Z; limitPin = LIMIT_Z_PIN; break;
+            case 0: dirPin = DIR_X; stepPin = STEP_X; limitPin = LIMIT_X_PIN; break;
+            case 1: dirPin = DIR_E; stepPin = STEP_E; limitPin = LIMIT_E_PIN; break;
+            case 2: dirPin = DIR_Z; stepPin = STEP_Z; limitPin = LIMIT_Z_PIN; break;
+            case 3: dirPin = DIR_Y; stepPin = STEP_Y; limitPin = LIMIT_Y_PIN; break;
         }
 
         // Sprawdź krańcówkę
@@ -290,9 +284,9 @@ void controlWithPosition() {
         bool movingToLimit = (error < 0); // Zakładam, że limit = pozycja 0
         
         if (limitHit && movingToLimit) {
-            Serial.print("⚠️ Oś "); 
+            /*Serial.print("⚠️ Oś "); 
             Serial.print(i);
-            Serial.println("zablokowana przez krańcówkę");
+            Serial.println("zablokowana przez krańcówkę");*/
             continue;
         }
 
@@ -321,6 +315,12 @@ void controlWithPosition() {
 }
 
 // --------------------------- INNE ---------------------------
+
+void stepPulse(int stepPin) {
+    digitalWrite(stepPin, HIGH);
+    delayMicroseconds(5);
+    digitalWrite(stepPin, LOW);
+}
 
 const char* buttonLabels[] = {"X+", "X-", "Y+", "Y-", "Z+", "Z-", "E+", "E-"};
 void printButtonStates(byte buttonStates) {

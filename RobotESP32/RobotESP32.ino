@@ -25,9 +25,9 @@ const int AS5600_RAW_ANGLE_HIGH = 0x0C; // Rejestry kąta RAW (12 bit)
 #define SDA_PIN 21
 #define SCL_PIN 22
 
-const char axisLabels[] = {'X', 'Y', 'Z', 'E'};
-const uint8_t ENCODER_CHANNEL[] = {6, 7, 5, 4}; // Kanał na którym znajduje się enkoder [X6,Y7,Z5,E4]
-const float ENCODER_LEVER[] = {3.6, 4.5, 4.5, 2}; // Dźwignia (obrotów wału/ramię silnika)
+const char axisLabels[] = {'E', 'Z', 'Y', 'A'};
+const uint8_t ENCODER_CHANNEL[] = {4, 5, 6, 7}; // Kanał na którym znajduje się enkoder [X6,Y7,Z5,E4]
+const float ENCODER_LEVER[] = {2, 3.6, 4.5, 4.5}; // Dźwignia (obrotów wału/ramię silnika)
 int16_t ENCODER_ZPOS[] = {0, 0, 0, 0}; // Offset (wartość enkoderów dla pozycji startowej)
 int16_t rotationCount[] = {0, 0, 0, 0}; // Liczniki obrotów dla każdej osi
 uint16_t lastRawAngle[] = {0, 0, 0, 0}; // Ostatnie odczyty kąta
