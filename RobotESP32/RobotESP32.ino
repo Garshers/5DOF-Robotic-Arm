@@ -26,8 +26,8 @@ const int AS5600_RAW_ANGLE_HIGH = 0x0C; // Rejestry kąta RAW (12 bit)
 #define SCL_PIN 22
 
 const char axisLabels[] = {'X', 'Y', 'Z', 'E'};
-const uint8_t ENCODER_CHANNEL[] = {4, 5, 6, 7}; // Kanał na którym znajduje się enkoder
-const float ENCODER_LEVER[] = {2, 3.6, 4.5, 4.5}; // Dźwignia (obrotów wału/ramię silnika)
+const uint8_t ENCODER_CHANNEL[] = {6, 7, 5, 4}; // Kanał na którym znajduje się enkoder [X6,Y7,Z5,E4]
+const float ENCODER_LEVER[] = {3.6, 4.5, 4.5, 2}; // Dźwignia (obrotów wału/ramię silnika)
 int16_t ENCODER_ZPOS[] = {0, 0, 0, 0}; // Offset (wartość enkoderów dla pozycji startowej)
 int16_t rotationCount[] = {0, 0, 0, 0}; // Liczniki obrotów dla każdej osi
 uint16_t lastRawAngle[] = {0, 0, 0, 0}; // Ostatnie odczyty kąta
@@ -36,7 +36,7 @@ const float angleConst = 360.0 / 4096.0; // Współczynnik zmiany raw angle na k
 
 // ================== Zmienne do wypisywania stanów ===================
 unsigned long previousMillis = 0; // przechowuje czas ostatniego wykonania
-const long interval = 10; // interwał 1000ms
+const long interval = 50; // interwał 1000ms
 
 // =============================== SETUP ================================
 void setup() {
@@ -90,7 +90,7 @@ void loop() {
     }
 
     // Wybór trybu pracy
-    if ( true ){//digitalRead(BTN_MODE) == LOW) {
+    if ( false ){//digitalRead(BTN_MODE) == LOW) {
         readButtonsAndControl();
     } else {
         readEncodersAndControl();
@@ -153,12 +153,14 @@ void readEncodersAndControl() {
         char axisLabel = axisLabels[i]; // Pobieramy odpowiednią etykietę z tablicy
         positionFrame += String(axisLabel) + ":" + String(armAngle, 2) + ":" + String(targetAngles[i], 2) + ";";
 
-        /*Serial.printf("Kanal %d: %.2f° - %d Raw (cel: %.2f°) | ", ENCODER_CHANNEL[i], armAngle, rawAngle, targetAngles[i]);*/
+        Serial.printf("Kanal %d: %.2f° - %d Raw (cel: %.2f°) | ", ENCODER_CHANNEL[i], armAngle, rawAngle, targetAngles[i]);
     }
 
-    /*Serial.println();
-    Serial.println(positionFrame);*/
+    /*Serial.println();*/
+    Serial.println(positionFrame);
     SerialPort.println(positionFrame); // Wysyłamy ramkę do Arduino
+    SerialPort.flush(); // Poczekaj aż wszystko się wyśle
+    delay(1000); // Daj Arduino czas na odbiór
   }
 }
 
