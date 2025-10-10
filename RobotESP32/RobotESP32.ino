@@ -25,6 +25,7 @@ const int AS5600_RAW_ANGLE_HIGH = 0x0C; // Rejestry kąta RAW (12 bit)
 #define SDA_PIN 21
 #define SCL_PIN 22
 
+const char axisLabels[] = {'X', 'Y', 'Z', 'E'};
 const uint8_t ENCODER_CHANNEL[] = {4, 5, 6, 7}; // Kanał na którym znajduje się enkoder
 const float ENCODER_LEVER[] = {2, 3.6, 4.5, 4.5}; // Dźwignia (obrotów wału/ramię silnika)
 int16_t ENCODER_ZPOS[] = {0, 0, 0, 0}; // Offset (wartość enkoderów dla pozycji startowej)
@@ -35,7 +36,7 @@ const float angleConst = 360.0 / 4096.0; // Współczynnik zmiany raw angle na k
 
 // ================== Zmienne do wypisywania stanów ===================
 unsigned long previousMillis = 0; // przechowuje czas ostatniego wykonania
-const long interval = 1000; // interwał 1000ms
+const long interval = 10; // interwał 1000ms
 
 // =============================== SETUP ================================
 void setup() {
@@ -80,7 +81,7 @@ void loop() {
         char c = Serial.read();
         if (c == '<') {
         Serial.println("Otrzymano komendę!");
-        inputBuffer = ""; // Start nowej ramki <START><AXIS><TARGET_ANGLE><END> - <ST>Y+090.00<ET>
+        inputBuffer = ""; // Start nowej ramki np. <X10.5>
         } else if (c == '>') {
         parseCommand(inputBuffer);
         } else {
@@ -89,7 +90,7 @@ void loop() {
     }
 
     // Wybór trybu pracy
-    if ( false){//digitalRead(BTN_MODE) == LOW) {
+    if ( true ){//digitalRead(BTN_MODE) == LOW) {
         readButtonsAndControl();
     } else {
         readEncodersAndControl();
@@ -123,24 +124,22 @@ void readButtonsAndControl() {
             updateRotationCount(i, rawAngleAdjusted); // Dodawanie pozycji po zrobieniu pełnego okręgu
             float armAngle = getArmAngle(rawAngleAdjusted, rotationCount[i], ENCODER_LEVER[i]); // Obliczenie kąta dla ramienia
 
-            Serial.printf("Kanal %d: %.3f° - %d Raw | ", ENCODER_CHANNEL[i], armAngle, rawAngle);
+            /*Serial.printf("Kanal %d: %.3f° - %d Raw | ", ENCODER_CHANNEL[i], armAngle, rawAngle);*/
 
         }
-        Serial.println();
+        /*Serial.println();*/
     }
+
+    delay(5);
 }
 
 // Sterowanie POZYCJĄ
 void readEncodersAndControl() {
   unsigned long currentMillis = millis();
   if (currentMillis - previousMillis >= interval) {
-
     previousMillis = currentMillis;
 
     String positionFrame = "POS:"; // Ramka danych do wysłania
-
-    // Tablica z etykietami osi
-    const char axisLabels[] = {'X', 'Y', 'Z', 'E'};
 
     for (int i = 0; i < 4; i++) {
         // Wyznaczanie kąta dla ramienia
@@ -154,11 +153,11 @@ void readEncodersAndControl() {
         char axisLabel = axisLabels[i]; // Pobieramy odpowiednią etykietę z tablicy
         positionFrame += String(axisLabel) + ":" + String(armAngle, 2) + ":" + String(targetAngles[i], 2) + ";";
 
-        Serial.printf("Kanal %d: %.2f° - %d Raw (cel: %.2f°) | ", ENCODER_CHANNEL[i], armAngle, rawAngle, targetAngles[i]);
+        /*Serial.printf("Kanal %d: %.2f° - %d Raw (cel: %.2f°) | ", ENCODER_CHANNEL[i], armAngle, rawAngle, targetAngles[i]);*/
     }
 
-    Serial.println();
-    Serial.println(positionFrame);
+    /*Serial.println();
+    Serial.println(positionFrame);*/
     SerialPort.println(positionFrame); // Wysyłamy ramkę do Arduino
   }
 }
@@ -240,7 +239,7 @@ void printButtonStates(byte buttonStates) {
     Serial.println();
 }
 void parseCommand(String cmd) {
-  if (cmd.length() < 3) return;
+  if (cmd.length() < 2) return;
 
   char axis = cmd.charAt(0);
   float angle = cmd.substring(1).toFloat();
@@ -250,8 +249,10 @@ void parseCommand(String cmd) {
     case 'Y': targetAngles[1] = angle; break;
     case 'Z': targetAngles[2] = angle; break;
     case 'E': targetAngles[3] = angle; break;
-    default: break;
+    default: 
+      Serial.printf("Nieznana oś: %c\n", axis);
+      return;
   }
 
-  Serial.printf("Otrzymano komendę: oś %c, kąt %.2f°\n", axis, angle);
+  Serial.printf("Otrzymano komendę: oś %c, kąt %.2f° [%s]\n", axis, angle, cmd);
 }
