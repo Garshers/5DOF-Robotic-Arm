@@ -33,6 +33,8 @@ ControlMode currentMode = MODE_NONE;
 
 const unsigned int STEP_DELAY_MICROS = 1000; // Szybkość kroku [µs]
 bool limit_Z_last = false; // Zmienna do wykrywania zbocza na krańcówce Z
+int lastDirZ = 0; // Ostatni kierunek ruchu Z (1 = FRWD/LOW, 2 = BACK/HIGH, 0 = brak ruchu)
+bool limit_Z_blocked = false; // Flaga blokady kierunku
 
 // ======================== Sterowanie pozycyjne ========================
 float currentAngles[4] = {0.0, 0.0, 0.0, 0.0};
@@ -76,7 +78,7 @@ void loop() {
     if (esp32Serial.available()) {
         String input = esp32Serial.readStringUntil('\n');
         input.trim();
-        Serial.println(input);
+        /*Serial.println(input);*/
 
         if (input.startsWith("BTN:")) {
         handleButtonFrame(input); // ustawia currentMode = MODE_BUTTONS
@@ -113,7 +115,7 @@ void handleButtonFrame(String input) {
   String btnValue = input.substring(4, btnEnd);
   buttonStates = btnValue.toInt();
   currentMode = MODE_BUTTONS;
-  printButtonStates(buttonStates);
+  /*printButtonStates(buttonStates);*/
 }
 
 void controlWithButtons() {
@@ -133,10 +135,22 @@ void controlWithButtons() {
     bool limit_Y_hit = (digitalRead(LIMIT_Y_PIN) == HIGH);
     bool limit_Z_hit = (digitalRead(LIMIT_Z_PIN) == HIGH);
 
-    // Detekcja zbocza dla krańcówki osi Z - UPROSZCZONE
+    // Detekcja NACIŚNIĘCIA krańcówki Z
     if (limit_Z_hit && !limit_Z_last) {
-        Serial.println("!!! Naciśnięto krańcówkę osi Z (Detekcja zbocza)!");
+        Serial.println("!!! Naciśnięto krańcówkę osi Z!");
+        // Zapamiętaj aktualny kierunek ruchu
+        if (BTN_Z_FRWD) lastDirZ = 1;
+        else if (BTN_Z_BACK) lastDirZ = 2;
+        Serial.print("Zablokowany kierunek: ");
+        Serial.println(lastDirZ == 1 ? "FRWD" : "BACK");
     }
+    
+    // Detekcja ZWOLNIENIA krańcówki
+    if (!limit_Z_hit && limit_Z_last) {
+        Serial.println("Zwolniono krańcówkę osi Z - ruch odblokowany");
+        lastDirZ = 0;
+    }
+    
     limit_Z_last = limit_Z_hit;
     
     // =========================================================================
@@ -173,12 +187,12 @@ void controlWithButtons() {
         stepPulse(STEP_Y);
     }
 
-    // Oś Z - POPRAWIONE: uproszczona logika
-    if (BTN_Z_FRWD && !limit_Z_hit) {
+    // Oś Z - blokuj tylko kierunek, w którym naciśnięto krańcówkę
+    if (BTN_Z_FRWD && !(limit_Z_hit && lastDirZ == 1)) {
         digitalWrite(DIR_Z, LOW);
         stepPulse(STEP_Z);
     }
-    if (BTN_Z_BACK && !limit_Z_hit) {
+    if (BTN_Z_BACK && !(limit_Z_hit && lastDirZ == 2)) {
         digitalWrite(DIR_Z, HIGH);
         stepPulse(STEP_Z);
     }
@@ -208,10 +222,10 @@ void handlePositionFrame(String input) {
         float target = input.substring(colon2 + 1, semicolon).toFloat();
 
         switch (axis) {
-        case 'X': axisIndex = 0; break;
-        case 'Y': axisIndex = 1; break;
-        case 'Z': axisIndex = 2; break;
-        case 'E': axisIndex = 3; break;
+        case 'E': axisIndex = 0; break;
+        case 'X': axisIndex = 1; break;
+        case 'Y': axisIndex = 2; break;
+        case 'Z': axisIndex = 3; break;
         default: continue;
         }
 
@@ -240,7 +254,7 @@ void handlePositionFrame(String input) {
 }
 
 void controlWithPosition() {
-    // POPRAWIONE: Sprawdź timeout - czy ESP32 wciąż wysyła dane
+
     if (millis() - lastPositionUpdate > POSITION_TIMEOUT) {
         Serial.println("⚠️ TIMEOUT: Brak ramek z ESP32! Zatrzymano sterowanie pozycyjne.");
         currentMode = MODE_NONE;
@@ -265,10 +279,10 @@ void controlWithPosition() {
         // Wybór pinów
         int dirPin, stepPin, limitPin;
         switch (i) {
-            case 0: dirPin = DIR_X; stepPin = STEP_X; limitPin = LIMIT_X_PIN; break;
-            case 1: dirPin = DIR_Y; stepPin = STEP_Y; limitPin = LIMIT_Y_PIN; break;
-            case 2: dirPin = DIR_Z; stepPin = STEP_Z; limitPin = LIMIT_Z_PIN; break;
-            case 3: dirPin = DIR_E; stepPin = STEP_E; limitPin = LIMIT_E_PIN; break;
+            case 0: dirPin = DIR_E; stepPin = STEP_E; limitPin = LIMIT_E_PIN; break;
+            case 1: dirPin = DIR_X; stepPin = STEP_X; limitPin = LIMIT_X_PIN; break;
+            case 2: dirPin = DIR_Y; stepPin = STEP_Y; limitPin = LIMIT_Y_PIN; break;
+            case 3: dirPin = DIR_Z; stepPin = STEP_Z; limitPin = LIMIT_Z_PIN; break;
         }
 
         // Sprawdź krańcówkę
@@ -300,9 +314,7 @@ void controlWithPosition() {
             // Ustaw kierunek
             digitalWrite(dirPin, error > 0 ? LOW : HIGH);
             
-            // POPRAWIONE: Używamy tej samej funkcji stepPulse co w trybie przycisków
             stepPulse(stepPin);
-            
             lastStepTime[i] = now;
         }
     }
