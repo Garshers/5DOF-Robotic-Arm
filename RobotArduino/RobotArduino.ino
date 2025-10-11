@@ -40,7 +40,7 @@ bool limit_Z_blocked = false; // Flaga blokady kierunku
 
 const char axisLabels[4] = {'E', 'Z', 'Y', 'A'};
 float currentAngles[4] = {0.0, 0.0, 0.0, 0.0};
-float targetAngles[4] = {10.0, 0.0, 0.0, 0.0};
+float targetAngles[4] = {0.0, 0.0, 0.0, 0.0};
 unsigned long lastStepTime[4] = {0, 0, 0, 0};
 unsigned long lastPositionUpdate = 0; // Timeout dla trybu pozycyjnego
 const unsigned long POSITION_TIMEOUT = 3000; // 3 sekundy
@@ -256,13 +256,11 @@ void controlWithPosition() {
     }
 
     const float tolerance = 0.5; // Dopuszczalny błąd [°]
-    const float RAMP_DISTANCE = 30.0; // Odległość zwalniania [°]
-    const unsigned int MAX_SPEED = 300; // Najszybszy krok [µs]
-    const unsigned int MIN_SPEED = 1000; // Najwolniejszy krok [µs]
+    const unsigned int STEP_DELAY = 2000; // Stała prędkość [µs]
     
     unsigned long now = micros();
 
-    for (int i = 1; i < 4; i++) { // NARAZIE POMIJAMY OŚ X (0) - BRAK ENKODERA <--------
+    for (int i = 1; i <= 2; i++) { // TYLKO Z(1), Y(2)
         float error = targetAngles[i] - currentAngles[i];
 
         // Czy dotarliśmy do celu?
@@ -272,42 +270,54 @@ void controlWithPosition() {
 
         // Wybór pinów
         int dirPin, stepPin, limitPin;
+        bool invertDirection = false; // Flaga odwróconego kierunku
+        
         switch (i) {
-            case 0: dirPin = DIR_X; stepPin = STEP_X; limitPin = LIMIT_X_PIN; break;
-            case 1: dirPin = DIR_E; stepPin = STEP_E; limitPin = LIMIT_E_PIN; break;
-            case 2: dirPin = DIR_Z; stepPin = STEP_Z; limitPin = LIMIT_Z_PIN; break;
-            case 3: dirPin = DIR_Y; stepPin = STEP_Y; limitPin = LIMIT_Y_PIN; break;
+            case 0: 
+                dirPin = DIR_E; 
+                stepPin = STEP_E; 
+                limitPin = LIMIT_E_PIN; 
+                break;
+            case 1: 
+                dirPin = DIR_Z; 
+                stepPin = STEP_Z; 
+                limitPin = LIMIT_Z_PIN; 
+                break;
+            case 2: 
+                dirPin = DIR_Y; 
+                stepPin = STEP_Y; 
+                limitPin = LIMIT_Y_PIN;
+                invertDirection = true; // Oś Y ma odwrócony kierunek!
+                break;
+            case 3: 
+                dirPin = DIR_X; 
+                stepPin = STEP_X; 
+                limitPin = LIMIT_X_PIN; 
+                break;
         }
 
         // Sprawdź krańcówkę
         bool limitHit = (digitalRead(limitPin) == HIGH);
-        bool movingToLimit = (error < 0); // Zakładam, że limit = pozycja 0
+        bool movingBack = (error < 0); // error < 0 = jedzie w kierunku BACK
         
-        if (limitHit && movingToLimit) {
-            /*Serial.print("⚠️ Oś "); 
-            Serial.print(i);
-            Serial.println("zablokowana przez krańcówkę");*/
+        // Zablokuj ruch w kierunku BACK gdy krańcówka naciśnięta
+        if (limitHit && movingBack) {
             continue;
         }
 
-        // Profil trapezowy - zwalnianie przy zbliżaniu się do celu
-        float absError = abs(error);
-        unsigned int stepDelay;
-        
-        if (absError > RAMP_DISTANCE) {
-            // Pełna prędkość - daleko od celu
-            stepDelay = MAX_SPEED;
-        } else {
-            // Zwalniaj proporcjonalnie do odległości
-            float speedRatio = absError / RAMP_DISTANCE; // 0.0 - 1.0
-            stepDelay = MIN_SPEED - (MIN_SPEED - MAX_SPEED) * speedRatio;
-        }
-
-        // Wykonaj krok co odpowiedni interwał
-        if (now - lastStepTime[i] >= stepDelay) {
-            // Ustaw kierunek
-            digitalWrite(dirPin, error > 0 ? LOW : HIGH);
+        // Wykonaj krok co STEP_DELAY
+        if (now - lastStepTime[i] >= STEP_DELAY) {
+            // Oblicz kierunek
+            bool direction;
+            if (invertDirection) {
+                // Dla osi Y odwróć logikę
+                direction = movingBack ? HIGH : LOW;
+            } else {
+                // Dla innych osi normalnie
+                direction = movingBack ? LOW : HIGH;
+            }
             
+            digitalWrite(dirPin, direction);
             stepPulse(stepPin);
             lastStepTime[i] = now;
         }

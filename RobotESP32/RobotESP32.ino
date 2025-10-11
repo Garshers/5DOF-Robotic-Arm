@@ -80,12 +80,12 @@ void loop() {
     while (Serial.available()) {
         char c = Serial.read();
         if (c == '<') {
-        Serial.println("Otrzymano komendę!");
-        inputBuffer = ""; // Start nowej ramki np. <X10.5>
+            Serial.println("Otrzymano komendę!");
+            inputBuffer = ""; // Start nowej ramki np. <X10.5>
         } else if (c == '>') {
-        parseCommand(inputBuffer);
+            parseCommand(inputBuffer);
         } else {
-        inputBuffer += c;
+            inputBuffer += c;
         }
     }
 
@@ -150,17 +150,16 @@ void readEncodersAndControl() {
         float armAngle = getArmAngle(rawAngleAdjusted, rotationCount[i], ENCODER_LEVER[i]); // Obliczenie kąta dla ramienia
 
         // Dodajemy do ramki
-        char axisLabel = axisLabels[i]; // Pobieramy odpowiednią etykietę z tablicy
-        positionFrame += String(axisLabel) + ":" + String(armAngle, 2) + ":" + String(targetAngles[i], 2) + ";";
+        positionFrame += String(axisLabels[i]) + ":" + String(armAngle, 2) + ":" + String(targetAngles[i], 2) + ";";
 
-        Serial.printf("Kanal %d: %.2f° - %d Raw (cel: %.2f°) | ", ENCODER_CHANNEL[i], armAngle, rawAngle, targetAngles[i]);
+        /*Serial.printf("Kanal %d: %.2f° - %d Raw (cel: %.2f°) | ", ENCODER_CHANNEL[i], armAngle, rawAngle, targetAngles[i]);*/
     }
 
-    /*Serial.println();*/
-    Serial.println(positionFrame);
+    //Serial.println();
+    //Serial.println(positionFrame);
     SerialPort.println(positionFrame); // Wysyłamy ramkę do Arduino
     SerialPort.flush(); // Poczekaj aż wszystko się wyśle
-    delay(1000); // Daj Arduino czas na odbiór
+    delay(10); // Daj Arduino czas na odbiór
   }
 }
 
@@ -247,10 +246,10 @@ void parseCommand(String cmd) {
   float angle = cmd.substring(1).toFloat();
 
   switch (axis) {
-    case 'X': targetAngles[0] = angle; break;
-    case 'Y': targetAngles[1] = angle; break;
-    case 'Z': targetAngles[2] = angle; break;
-    case 'E': targetAngles[3] = angle; break;
+    case 'E': targetAngles[0] = angle; break;
+    case 'Z': targetAngles[1] = angle; break;
+    case 'Y': targetAngles[2] = angle; break;
+    case 'A': targetAngles[3] = angle; break;
     default: 
       Serial.printf("Nieznana oś: %c\n", axis);
       return;
