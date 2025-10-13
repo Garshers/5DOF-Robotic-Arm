@@ -16,6 +16,9 @@ String inputBuffer = "";
 const char* buttonLabels[] = {"X+", "X-", "Y+", "Y-", "Z+", "Z-", "E+", "E-"};
 const uint8_t buttonPins[] = { 13,   12,   14,   27,   26,   25,   33,   32};
 #define BTN_MODE 35
+bool isButtonMode = true;
+int currentBtnState;
+int lastBtnState = HIGH;
 
 // ===================== Zmienne enkoderów (I2C) ======================
 const int PCA9548A_ADDR = 0x70; // Adres multipleksera
@@ -89,8 +92,18 @@ void loop() {
         }
     }
 
+    // Przycisk zmieniający moduł sterowania
+    currentBtnState = digitalRead(BTN_MODE);
+    if (currentBtnState != lastBtnState) {
+        if (currentBtnState == LOW) {
+        isButtonMode = !isButtonMode;
+        }
+        delay(50);
+    }
+    lastBtnState = currentBtnState;
+
     // Wybór trybu pracy
-    if ( false ){//digitalRead(BTN_MODE) == LOW) {
+    if (isButtonMode) {
         readButtonsAndControl();
     } else {
         readEncodersAndControl();
@@ -124,10 +137,10 @@ void readButtonsAndControl() {
             updateRotationCount(i, rawAngleAdjusted); // Dodawanie pozycji po zrobieniu pełnego okręgu
             float armAngle = getArmAngle(rawAngleAdjusted, rotationCount[i], ENCODER_LEVER[i]); // Obliczenie kąta dla ramienia
 
-            /*Serial.printf("Kanal %d: %.3f° - %d Raw | ", ENCODER_CHANNEL[i], armAngle, rawAngle);*/
-
+            //Serial.printf("Kanal %d: %.3f° - %d Raw | ", ENCODER_CHANNEL[i], armAngle, rawAngle);
+            //Serial.printf("Wysłanie ramki: BTN:%s;\n", String(buttonStates));
         }
-        /*Serial.println();*/
+        //Serial.println();
     }
 
     delay(5);
@@ -159,7 +172,7 @@ void readEncodersAndControl() {
     //Serial.println(positionFrame);
     SerialPort.println(positionFrame); // Wysyłamy ramkę do Arduino
     SerialPort.flush(); // Poczekaj aż wszystko się wyśle
-    delay(10); // Daj Arduino czas na odbiór
+    delay(20); // Daj Arduino czas na odbiór
   }
 }
 
