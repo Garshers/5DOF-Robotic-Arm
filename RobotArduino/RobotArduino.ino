@@ -1,125 +1,146 @@
 #include <Arduino.h>
-#include <SoftwareSerial.h>
 #include <AccelStepper.h>
 
 // ==================== Podstawowe ustawienia systemowe =====================
-#define BAUD 9600 // Prędkość komunikacji Arudino -> Komputer
+#define BAUD 115200 // Prędkość komunikacji ESP32 -> Komputer
 
 // =================== Zmienne dotyczące komunikacji UART ===================
-#define UART_RX_PIN 13 // PIN_13(Arduino) -> TX2(ESP-32)
-#define UART_TX_PIN 12 // PIN_12(Arduino) -> RX2(ESP-32)
+// ESP32 ma wbudowane porty UART - używamy UART2
+#define UART_RX_PIN 16 // RX2
+#define UART_TX_PIN 17 // TX2
 #define UART_BAUD 57600 // Szybkość transmisji
 byte buttonStates = 0; // Zmienna przechowująca stany przycisków
-SoftwareSerial esp32Serial(UART_RX_PIN, UART_TX_PIN); // Definicja portu szeregowego
+HardwareSerial esp32Serial(2); // UART2 na ESP32
+unsigned long lastInputTime = 0;
 
 // ======================= Zmienne sterujące silnikami ======================
-#define STEP_X 2
-#define STEP_Y 3
-#define STEP_Z 4
-#define DIR_X 5
-#define DIR_Y 6
-#define DIR_Z 7
-#define LIMIT_X_PIN 9
-#define LIMIT_Y_PIN 10
-#define LIMIT_Z_PIN 11
+#define STEP_X 23
+#define DIR_X 22
+#define STEP_Y 21
+#define DIR_Y 19
+#define STEP_A 33
+#define DIR_A 32
+#define STEP_Z 26
+#define DIR_Z 25
+#define STEP_E 14 
+#define DIR_E 27
 
-// Silnik piąty - podpięty osobno - NEMA 14
-#define STEP_E A1
-#define DIR_E A0
-#define ENABLE_E A2
-#define LIMIT_E_PIN A3
+//25+26; 32+33; 21+19; 23+22; 27+14
+
+#define LIMIT_X_PIN 0
+#define LIMIT_Y_PIN 0
+#define LIMIT_Z_PIN 0
+#define LIMIT_E_PIN 0
 
 // Definicje obiektów AccelStepper
-AccelStepper stepperE(AccelStepper::DRIVER, STEP_E, DIR_E);
 AccelStepper stepperX(AccelStepper::DRIVER, STEP_X, DIR_X);
 AccelStepper stepperY(AccelStepper::DRIVER, STEP_Y, DIR_Y);
+AccelStepper stepperA(AccelStepper::DRIVER, STEP_A, DIR_A);
 AccelStepper stepperZ(AccelStepper::DRIVER, STEP_Z, DIR_Z);
+AccelStepper stepperE(AccelStepper::DRIVER, STEP_E, DIR_E);
 
 enum ControlMode { MODE_NONE, MODE_BUTTONS, MODE_POSITION };
 ControlMode currentMode = MODE_NONE;
 
-const unsigned int STEP_DELAY_MICROS = 1000; // Szybkość kroku [µs]
 bool limit_Z_last = false; // Zmienna do wykrywania zbocza na krańcówce Z
 int lastDirZ = 0; // Ostatni kierunek ruchu Z (1 = FRWD/LOW, 2 = BACK/HIGH, 0 = brak ruchu)
 bool limit_Z_blocked = false; // Flaga blokady kierunku
 
 // ======================== Sterowanie pozycyjne ========================
 
-const char axisLabels[4] = {'E', 'Z', 'Y', 'A'};
-float currentAngles[4] = {0.0, 0.0, 0.0, 0.0};
-float targetAngles[4] = {0.0, 0.0, 0.0, 0.0};
-unsigned long lastStepTime[4] = {0, 0, 0, 0};
+const char axisLabels[5] = {'E', 'Z', 'Y', 'A', 'X'};
+float currentAngles[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+float targetAngles[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+unsigned long lastStepTime[5] = {0, 0, 0, 0, 0};
 unsigned long lastPositionUpdate = 0; // Timeout dla trybu pozycyjnego
 const unsigned long POSITION_TIMEOUT = 3000; // 3 sekundy
+
+// Synchronizacja Y i A
+const float SYNC_TOLERANCE = 0.5; // Próg różnicy w stopniach
 
 void setup() {
     pinMode(STEP_X, OUTPUT);
     pinMode(DIR_X, OUTPUT);
     pinMode(STEP_Y, OUTPUT);
     pinMode(DIR_Y, OUTPUT);
+    pinMode(STEP_A, OUTPUT);
+    pinMode(DIR_A, OUTPUT);
     pinMode(STEP_Z, OUTPUT);
     pinMode(DIR_Z, OUTPUT);
     pinMode(STEP_E, OUTPUT);
     pinMode(DIR_E, OUTPUT);
-    pinMode(ENABLE_E, OUTPUT);
 
     pinMode(LIMIT_X_PIN, INPUT_PULLUP);
     pinMode(LIMIT_Y_PIN, INPUT_PULLUP);
     pinMode(LIMIT_Z_PIN, INPUT_PULLUP);
     pinMode(LIMIT_E_PIN, INPUT_PULLUP);
 
-    digitalWrite(ENABLE_E, LOW); // Włącz silnik E (LOW = aktywny dla większości sterowników)
-
     // Konfiguracja silników
     stepperE.setMaxSpeed(2000);    // kroki/s
     stepperE.setAcceleration(1000); // kroki/s²
-    
+
     stepperX.setMaxSpeed(2000);
     stepperX.setAcceleration(1000);
     
     stepperY.setMaxSpeed(2000);
     stepperY.setAcceleration(1000);
-    stepperY.setPinsInverted(true, false, false); // Odwrócony kierunek dla Y
     
+    stepperA.setMaxSpeed(2000);
+    stepperA.setAcceleration(1000);
+    stepperA.setPinsInverted(true, false, false); // Oś A odwrócona fizycznie
+
     stepperZ.setMaxSpeed(2000);
     stepperZ.setAcceleration(1000);
 
     Serial.begin(BAUD);
+    delay(500); // Krótkie opóźnienie dla stabilności
 
-    Serial.println("=== Ustawienia komunikacji UART ===");
-    esp32Serial.begin(UART_BAUD);
-    Serial.print("UART RX: ");
+    Serial.println("=== ESP32 - Ustawienia komunikacji UART ===");
+    
+    // Inicjalizacja UART2 z określonymi pinami
+    esp32Serial.begin(UART_BAUD, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
+    
+    Serial.print("UART2 RX: GPIO");
     Serial.print(UART_RX_PIN);
-    Serial.print(", TX: ");
+    Serial.print(", TX: GPIO");
     Serial.print(UART_TX_PIN);
     Serial.print(", Baud: ");
     Serial.print(UART_BAUD);
     Serial.println(". Czekam na dane...");
 }
 
+
 void loop() {
     if (esp32Serial.available()) {
         String input = esp32Serial.readStringUntil('\n');
         input.trim();
-        //Serial.println(input);
+        
+        if (millis() - lastInputTime >= 500) {
+            Serial.println(input);
+            lastInputTime = millis();
+        }
+
 
         if (input.startsWith("BTN:")) {
-        handleButtonFrame(input); // ustawia currentMode = MODE_BUTTONS
+            handleButtonFrame(input); // ustawia currentMode = MODE_BUTTONS
         } else if (input.startsWith("POS:")) {
-        handlePositionFrame(input); // ustawia currentMode = MODE_POSITION
+            handlePositionFrame(input); // ustawia currentMode = MODE_POSITION
         }
     }
 
     // Wybór sterowania
     switch (currentMode) {
-        case MODE_BUTTONS: controlWithButtons();
-        break;
+        case MODE_BUTTONS: 
+            controlWithButtons();
+            break;
 
-        case MODE_POSITION: controlWithPosition();
-        break;
+        case MODE_POSITION: 
+            controlWithPosition();
+            break;
 
-        default: delay(5);
-        break;
+        default: 
+            delay(5);
+            break;
     }
 }
 
@@ -132,13 +153,13 @@ void loop() {
 // --------------------------- BUTTON mode ---------------------------
 
 void handleButtonFrame(String input) {
-  int btnEnd = input.indexOf(';');
-  if (btnEnd == -1) return;
+    int btnEnd = input.indexOf(';');
+    if (btnEnd == -1) return;
 
-  String btnValue = input.substring(4, btnEnd);
-  buttonStates = btnValue.toInt();
-  currentMode = MODE_BUTTONS;
-  /*printButtonStates(buttonStates);*/
+    String btnValue = input.substring(4, btnEnd);
+    buttonStates = btnValue.toInt();
+    currentMode = MODE_BUTTONS;
+    //printButtonStates(buttonStates);
 }
 
 void controlWithButtons() {
@@ -180,13 +201,13 @@ void controlWithButtons() {
     // ---------------------------STEROWANIE SILNIKAMI--------------------------
     // =========================================================================
 
-    const long CONTINUOUS_SPEED = 1000; // Prędkość ciągłego ruchu [kroki/s]
+    const long CONTINUOUS_SPEED = 100; // Prędkość ciągłego ruchu [kroki/s]
 
     // Oś E
     if (BTN_E_FRWD) {
         stepperE.setSpeed(CONTINUOUS_SPEED);
         stepperE.runSpeed();
-    } else if (BTN_E_BACK && !limit_E_hit) {
+    } else if (BTN_E_BACK) {
         stepperE.setSpeed(-CONTINUOUS_SPEED);
         stepperE.runSpeed();
     } else {
@@ -197,29 +218,34 @@ void controlWithButtons() {
     if (BTN_X_FRWD) {
         stepperX.setSpeed(CONTINUOUS_SPEED);
         stepperX.runSpeed();
-    } else if (BTN_X_BACK && !limit_X_hit) {
+    } else if (BTN_X_BACK) {
         stepperX.setSpeed(-CONTINUOUS_SPEED);
         stepperX.runSpeed();
     } else {
         stepperX.setSpeed(0);
     }
 
-    // Oś Y
+    // Osie Y i A - poruszają się razem, A jest odwrócona sprzętowo
     if (BTN_Y_FRWD) {
         stepperY.setSpeed(CONTINUOUS_SPEED);
         stepperY.runSpeed();
-    } else if (BTN_Y_BACK && !limit_Y_hit) {
+        stepperA.setSpeed(CONTINUOUS_SPEED);
+        stepperA.runSpeed();
+    } else if (BTN_Y_BACK) {
         stepperY.setSpeed(-CONTINUOUS_SPEED);
         stepperY.runSpeed();
+        stepperA.setSpeed(-CONTINUOUS_SPEED);
+        stepperA.runSpeed();
     } else {
         stepperY.setSpeed(0);
+        stepperA.setSpeed(0);
     }
 
     // Oś Z - blokuj tylko kierunek, w którym naciśnięto krańcówkę
-    if (BTN_Z_FRWD && !(limit_Z_hit && lastDirZ == 1)) {
+    if (BTN_Z_FRWD) {
         stepperZ.setSpeed(CONTINUOUS_SPEED);
         stepperZ.runSpeed();
-    } else if (BTN_Z_BACK && !(limit_Z_hit && lastDirZ == 2)) {
+    } else if (BTN_Z_BACK) {
         stepperZ.setSpeed(-CONTINUOUS_SPEED);
         stepperZ.runSpeed();
     } else {
@@ -243,11 +269,17 @@ void handlePositionFrame(String input) {
         float target = input.substring(colon2 + 1, semicolon).toFloat();
 
         switch (axis) {
-        case 'E': axisIndex = 0; break;
-        case 'Z': axisIndex = 1; break;
-        case 'Y': axisIndex = 2; break;
-        case 'A': axisIndex = 3; break;
-        default: continue;
+            case 'E': axisIndex = 0; break;
+            case 'Z': axisIndex = 1; break;
+            case 'Y': 
+                axisIndex = 2;
+                // Synchronizuj cel dla osi A z osią Y
+                currentAngles[3] = current;
+                targetAngles[3] = target;
+                break;
+            case 'A': axisIndex = 3; break;
+            case 'X': axisIndex = 4; break;
+            default: continue;
         }
 
         currentAngles[axisIndex] = current;
@@ -261,7 +293,7 @@ void handlePositionFrame(String input) {
 
     static unsigned long lastDebug = 0;
     if (millis() - lastDebug > 5000) {
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 5; i++) {
             Serial.print("Oś ");
             Serial.print(axisLabels[i]);
             Serial.print(": aktualna ");
@@ -286,7 +318,17 @@ void controlWithPosition() {
     
     unsigned long now = micros();
 
-    for (int i = 0; i <= 2; i++) { // TYLKO E(0), Z(1), Y(2)
+    // Sprawdź synchronizację Y i A
+    float diffYA = currentAngles[2] - currentAngles[3];
+    bool needsSync = abs(diffYA) > SYNC_TOLERANCE;
+    
+    if (needsSync && millis() % 5000 < 10) {
+        Serial.print("⚠️ Synchronizacja Y-A: różnica = ");
+        Serial.print(diffYA, 2);
+        Serial.println("°");
+    }
+
+    for (int i = 0; i < 5; i++) {
         float error = targetAngles[i] - currentAngles[i];
 
         // Czy dotarliśmy do celu?
@@ -296,27 +338,36 @@ void controlWithPosition() {
 
         // Wybór pinów
         int dirPin, stepPin, limitPin;
-        bool invertDirection = false; // Flaga odwróconego kierunku
+        bool invertDirection = false;
         
         switch (i) {
-            case 0: 
+            case 0: // E
                 dirPin = DIR_E; 
                 stepPin = STEP_E; 
                 limitPin = LIMIT_E_PIN; 
-                invertDirection = true; // Oś E ma odwrócony kierunek!
                 break;
-            case 1: 
+            case 1: // Z
                 dirPin = DIR_Z; 
                 stepPin = STEP_Z; 
                 limitPin = LIMIT_Z_PIN; 
                 break;
-            case 2: 
+            case 2: // Y
                 dirPin = DIR_Y; 
                 stepPin = STEP_Y; 
                 limitPin = LIMIT_Y_PIN;
-                invertDirection = true; // Oś Y ma odwrócony kierunek!
                 break;
-            case 3: 
+            case 3: // A (odwrócona sprzętowo przez setPinsInverted)
+                dirPin = DIR_A; 
+                stepPin = STEP_A; 
+                limitPin = LIMIT_Y_PIN; // używa tej samej krańcówki co Y
+                
+                // Pętla zwrotna: jeśli A jest w tyle za Y, przyspiesz
+                if (needsSync && diffYA > SYNC_TOLERANCE) {
+                    // Y jest przed A, A musi dogonić
+                    error = targetAngles[2] - currentAngles[3]; // cel Y - pozycja A
+                }
+                break;
+            case 4: // X
                 dirPin = DIR_X; 
                 stepPin = STEP_X; 
                 limitPin = LIMIT_X_PIN; 
@@ -325,7 +376,7 @@ void controlWithPosition() {
 
         // Sprawdź krańcówkę
         bool limitHit = (digitalRead(limitPin) == HIGH);
-        bool movingBack = (error < 0); // error < 0 = jedzie w kierunku BACK
+        bool movingBack = (error < 0);
         
         // Zablokuj ruch w kierunku BACK gdy krańcówka naciśnięta
         if (limitHit && movingBack) {
@@ -334,15 +385,8 @@ void controlWithPosition() {
 
         // Wykonaj krok co STEP_DELAY
         if (now - lastStepTime[i] >= STEP_DELAY) {
-            // Oblicz kierunek
-            bool direction;
-            if (invertDirection) {
-                // Dla osi Y odwróć logikę
-                direction = movingBack ? HIGH : LOW;
-            } else {
-                // Dla innych osi normalnie
-                direction = movingBack ? LOW : HIGH;
-            }
+            // Kierunek: error > 0 = FORWARD (HIGH), error < 0 = BACK (LOW)
+            bool direction = (error > 0) ? HIGH : LOW;
             
             digitalWrite(dirPin, direction);
             stepPulse(stepPin);

@@ -2,7 +2,7 @@
 #include <Wire.h> // Biblioteka do komunikacji I2C
 
 // ==================== Podstawowe ustawienia systemowe =====================
-#define BAUD 9600 // Prędkość komunikacji ESP-32 -> Komputer
+#define BAUD 115200 // Prędkość komunikacji ESP-32 -> Komputer
 
 // =================== Zmienne dotyczące komunikacji UART ===================
 #define ESP_RX_PIN 16 // RX2(ESP-32) -> PIN_12(Arduino)
@@ -14,8 +14,8 @@ String inputBuffer = "";
 
 // ===================== Przyciski sterujące silnikami ======================
 const char* buttonLabels[] = {"X+", "X-", "Y+", "Y-", "Z+", "Z-", "E+", "E-"};
-const uint8_t buttonPins[] = { 13,   12,   14,   27,   26,   25,   33,   32};
-#define BTN_MODE 35
+const uint8_t buttonPins[] = {  12,   14,   27,   26,   25,   33,   32,   13};
+#define BTN_MODE 18
 bool isButtonMode = true;
 int currentBtnState;
 int lastBtnState = HIGH;
@@ -92,11 +92,12 @@ void loop() {
         }
     }
 
-    // Przycisk zmieniający moduł sterowania
+    // Przycisk zmieniający moduł sterowania<E
     currentBtnState = digitalRead(BTN_MODE);
     if (currentBtnState != lastBtnState) {
-        if (currentBtnState == LOW) {
+        if (currentBtnState == HIGH) {
         isButtonMode = !isButtonMode;
+        Serial.println("mode change");
         }
         delay(50);
     }
@@ -127,7 +128,7 @@ void readButtonsAndControl() {
     if (currentMillis - previousMillis >= interval) {
         previousMillis = currentMillis;
 
-        /*printButtonStates(buttonStates);*/
+        printButtonStates(buttonStates);
 
         for(int i = 0; i < 4; i++){
             // Wyznaczanie kąta dla ramienia
@@ -138,7 +139,6 @@ void readButtonsAndControl() {
             float armAngle = getArmAngle(rawAngleAdjusted, rotationCount[i], ENCODER_LEVER[i]); // Obliczenie kąta dla ramienia
 
             //Serial.printf("Kanal %d: %.3f° - %d Raw | ", ENCODER_CHANNEL[i], armAngle, rawAngle);
-            //Serial.printf("Wysłanie ramki: BTN:%s;\n", String(buttonStates));
         }
         //Serial.println();
     }
@@ -165,10 +165,10 @@ void readEncodersAndControl() {
         // Dodajemy do ramki
         positionFrame += String(axisLabels[i]) + ":" + String(armAngle, 2) + ":" + String(targetAngles[i], 2) + ";";
 
-        /*Serial.printf("Kanal %d: %.2f° - %d Raw (cel: %.2f°) | ", ENCODER_CHANNEL[i], armAngle, rawAngle, targetAngles[i]);*/
+        Serial.printf("Kanal %d: %.2f° - %d Raw (cel: %.2f°) | ", ENCODER_CHANNEL[i], armAngle, rawAngle, targetAngles[i]);
     }
 
-    //Serial.println();
+    Serial.println();
     //Serial.println(positionFrame);
     SerialPort.println(positionFrame); // Wysyłamy ramkę do Arduino
     SerialPort.flush(); // Poczekaj aż wszystko się wyśle
