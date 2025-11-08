@@ -10,13 +10,13 @@ import math
 
 # --- Stałe D-H (parametry robota 5-DOF) ---
 # Z diagramu:
-l1_val = 18.368      # λ1 (offset w X dla frame 1)
-l2_val = 149.006     # L2 (długość ramienia 2)
-l3_val = 120.3       # L3 (długość ramienia 3)
-l4_val = 87.9        # L4 (długość ramienia 4) - BRAK NA DIAGRAMIE, może być częścią l5
-l5_val = 100.0       # L5 (długość ramienia 5)
-lambda1_val = 78.8   # λ1 (wysokość podstawy)
-lambda5_val = 10.005 # λ5 (offset końcówki w Z)
+l1_val = 18.4               # λ1 (offset w X dla frame 1)
+l2_val = 149.0              # L2 (długość ramienia 2)
+l3_val = 120.3              # L3 (długość ramienia 3)
+l4_val = 87.8               # L4 (długość ramienia 4)
+l5_val = 23.0               # L5 (długość ramienia 5)
+lambda1_val = 110.8 # 78.8 + 34.9   # λ1 (wysokość podstawy)
+lambda5_val = 10.0          # λ5 (offset końcówki w Z)
 
 # Definicja symboli
 th1, th2, th3, th4, alpha5 = sp.symbols('θ1 θ2 θ3 θ4 α5')
@@ -151,118 +151,71 @@ def forward_kinematics_detailed(th1_val, th2_val, th3_val, th4_val, alpha5_val=0
 # =====================================================================
 
 def inverse_kinematics(x_target, y_target, z_target, phi_deg=0.0, elbow_up=True):
-    """
-    Oblicza kinematykę odwrotną dla robota 5-DOF.
-    
-    Argumenty:
-        x_target (float): Docelowa pozycja X [mm]
-        y_target (float): Docelowa pozycja Y [mm]
-        z_target (float): Docelowa pozycja Z [mm]
-        phi_deg (float): Orientacja końcówki w płaszczyźnie pionowej [stopnie]
-        elbow_up (bool): True = łokieć w górę, False = łokieć w dół
-    
-    Zwraca:
-        (th1, th2, th3, th4) w radianach lub None jeśli cel nieosiągalny
-    """
-    
     print(f"\n{'='*60}")
     print(f"KINEMATYKA ODWROTNA - Obliczanie kątów")
     print(f"{'='*60}")
     print(f"Cel: X={x_target:.2f}, Y={y_target:.2f}, Z={z_target:.2f} mm")
     print(f"Orientacja φ={phi_deg:.2f}°")
     
-    # --- KROK 1: Obliczenie θ1 (kąt obrotu podstawy) ---
+    # --- KROK 1: θ1 (obrót podstawy) ---
     th1 = math.atan2(y_target, x_target)
-    print(f"\n[Krok 1] θ1 = {math.degrees(th1):.2f}° (obrót wokół osi Z)")
+    print(f"\n[Krok 1] θ1 = {math.degrees(th1):.2f}°")
     
     # --- KROK 2: Przejście do płaszczyzny R-Z ---
-    R = math.sqrt(x_target**2 + y_target**2)  # Odległość radialna
+    R = math.sqrt(x_target**2 + y_target**2)
     Z = z_target
-    print(f"[Krok 2] Rzut na płaszczyznę R-Z: R={R:.2f}, Z={Z:.2f}")
+    print(f"[Krok 2] Rzut R-Z: R={R:.2f}, Z={Z:.2f}")
     
-    # Parametry dla łańcucha 3-DOF
-    L1 = l2_val  # ramię od θ2 do θ3
-    L2 = l3_val  # ramię od θ3 do θ4
-    L3_horizontal = l4_val + l5_val  # 87.9 + 100.0 = 187.9
-    L3 = math.sqrt(L3_horizontal**2 + lambda5_val**2)  # L3 = sqrt((l4 + l5)^2 + λ5^2)
+    # --- KROK 3: Parametry dla IK 3-DOF (tylko θ2, θ3, θ4) ---
+    L1 = l2_val  # 149.006
+    L2 = l3_val  # 120.3
+    L3 = math.sqrt((l4_val + l5_val)**2 + lambda5_val**2) # 111.3
     
-    # Kąt wewnętrzny między L3 a poziomem (offset angle dla θ4)
-    gamma = math.atan2(lambda5_val, L3_horizontal)
+    print(f"[Krok 3] Łańcuch 3-DOF: L1={L1:.1f}, L2={L2:.1f}, L3={L3:.1f}")
     
-    print(f"[Krok 2] Długości: L1={L1:.1f}, L2={L2:.1f}")
-    print(f"[Krok 2] L3 (wypadkowa): {L3:.3f} mm (horizontal={L3_horizontal:.1f}, vertical={lambda5_val:.3f})")
-    print(f"[Krok 2] Kąt γ (offset L3): {math.degrees(gamma):.3f}° = {gamma:.5f} rad")
-    
-    # Przesunięcie początku układu (base offset)
-    R_base = R - l1_val
-    Z_base = Z - lambda1_val
-    
-    print(f"[Krok 2] Po odjęciu offsetu base (l1={l1_val:.3f}, λ1={lambda1_val:.3f}):")
-    print(f"         R'={R_base:.2f}, Z'={Z_base:.2f}")
-    
-    # --- KROK 3: Obliczenie pozycji nadgarstka ---
+    # Pozycja "nadgarstka" (punkt przed l4)
     phi_rad = math.radians(phi_deg)
+    phi_corr = phi_rad + math.atan2(lambda5_val, l4_val + l5_val)
+    print(f"[Krok 3] phi_rad={math.degrees(phi_rad):.2f}, phi_corr={math.degrees(phi_corr):.2f}")
+
+    R_wrist = R - l1_val - L3 * math.cos(phi_corr)
+    Z_wrist = Z - lambda1_val - L3 * math.sin(phi_corr)
     
-    # Efektywny kąt orientacji uwzględniający offset γ
-    phi_effective = phi_rad + gamma
+    print(f"[Krok 3] Nadgarstek: R_w={R_wrist:.2f}, Z_w={Z_wrist:.2f}")
+
     
-    # Pozycja nadgarstka (punkt przed końcówką)
-    R_wrist = R_base - L3 * math.cos(phi_effective)
-    Z_wrist = Z_base - L3 * math.sin(phi_effective)
-    
-    print(f"[Krok 3] Orientacja φ: {phi_deg:.2f}° = {phi_rad:.5f} rad")
-    print(f"[Krok 3] Efektywna orientacja (φ + γ): {math.degrees(phi_effective):.3f}°")
-    print(f"[Krok 3] Pozycja nadgarstka: R_w={R_wrist:.2f}, Z_w={Z_wrist:.2f}")
-    
-    # --- KROK 4: Rozwiązanie trójkąta (θ2, θ3) ---
+    # --- KROK 4: Rozwiązanie dla θ2, θ3 ---
     D = math.sqrt(R_wrist**2 + Z_wrist**2)
+    print(f"[Krok 4] Odległość do nadgarstka D={D:.2f} mm")
     
-    print(f"[Krok 4] Odległość do nadgarstka: D={D:.2f} mm")
-    
-    # Sprawdzenie osiągalności
     if D > (L1 + L2) or D < abs(L1 - L2):
-        print(f"[BŁĄD] Cel nieosiągalny!")
-        print(f"        Wymagane: {abs(L1-L2):.1f} <= D <= {L1+L2:.1f}")
-        print(f"        Otrzymano: D = {D:.1f}")
+        print(f"[BŁĄD] Nieosiągalne! Wymagane: {abs(L1-L2):.1f} <= D <= {L1+L2:.1f}")
         return None
     
-    # Kąt θ3 (łokcia) - prawo cosinusów
     cos_th3 = (D**2 - L1**2 - L2**2) / (2 * L1 * L2)
     cos_th3 = np.clip(cos_th3, -1.0, 1.0)
     
-    if elbow_up:
-        th3_ik = math.acos(cos_th3)  # Łokieć w górę
-    else:
-        th3_ik = -math.acos(cos_th3)  # Łokieć w dół
+    th3_ik = math.acos(cos_th3) if elbow_up else -math.acos(cos_th3)
     
-    print(f"[Krok 4] θ3_ik = {math.degrees(th3_ik):.2f}° (konfiguracja łokcia: {'góra' if elbow_up else 'dół'})")
-    
-    # Kąt θ2 (ramienia) 
     alpha = math.atan2(Z_wrist, R_wrist)
     beta = math.atan2(L2 * math.sin(th3_ik), L1 + L2 * math.cos(th3_ik))
     th2 = alpha - beta
     
-    print(f"[Krok 4] θ2 = {math.degrees(th2):.2f}° (kąt ramienia)")
+    print(f"[Krok 4] θ2={math.degrees(th2):.2f}°, θ3_ik={math.degrees(th3_ik):.2f}°")
     
-    # --- KROK 5: Obliczenie θ4 (nadgarstka) ---
-    # UWAGA: θ4 musi kompensować zarówno φ jak i kąt γ (offset L3)
-    th4_ik = phi_rad - th2 - th3_ik + gamma
+    # --- KROK 5: θ4 ---
+    th4_ik = phi_rad - th2 - th3_ik
+    print(f"[Krok 5] θ4_ik={math.degrees(th4_ik):.2f}°")
     
-    print(f"[Krok 5] θ4_ik = {math.degrees(th4_ik):.2f}° (kąt nadgarstka z korekcją γ)")
-    
-    # --- KROK 6: Mapowanie na konwencję D-H ---
-    # W D-H: A3 używa -θ3, A4 używa -θ4
+    # --- KROK 6: Mapowanie D-H ---
     th3 = -th3_ik
     th4 = -th4_ik
     
-    print(f"\n[Krok 6] Mapowanie na D-H:")
-    print(f"  θ1 = {math.degrees(th1):7.2f}°")
-    print(f"  θ2 = {math.degrees(th2):7.2f}°")
-    print(f"  θ3 = {math.degrees(th3):7.2f}° (D-H: -θ3_ik)")
-    print(f"  θ4 = {math.degrees(th4):7.2f}° (D-H: -θ4_ik)")
-    print(f"  γ  = {math.degrees(gamma):7.3f}° (offset wbudowany w θ4)")
+    print(f"\n[Krok 6] Kąty D-H:")
+    print(f"  θ1={math.degrees(th1):7.2f}°, θ2={math.degrees(th2):7.2f}°")
+    print(f"  θ3={math.degrees(th3):7.2f}°, θ4={math.degrees(th4):7.2f}°")
     
-    # Normalizacja kątów do zakresu [-π, π]
+    # Normalizacja
     th1 = math.atan2(math.sin(th1), math.cos(th1))
     th2 = math.atan2(math.sin(th2), math.cos(th2))
     th3 = math.atan2(math.sin(th3), math.cos(th3))
