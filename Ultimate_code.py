@@ -360,50 +360,65 @@ def main():
             math.radians(th4_curr_deg)
         )
             
-        # Konfiguracja łokcia (ta konfiguracja będzie użyta dla obu baz)
-        elbow_choice = input("\nKonfiguracja łokcia - góra/dół? (g/d): ").lower()
-        elbow_up = (elbow_choice != 'd')
-        
     except ValueError:
         print("\n✗ Błąd: Wprowadź poprawne wartości liczbowe!")
         return
     
-    # --- OBLICZANIE KINEMATYKI ODWROTNEJ (DWIE WERSJE) ---
+    # --- OBLICZANIE KINEMATYKI ODWROTNEJ (CZTERY WERSJE) ---
     print(f"\n{'='*60}")
-    print("ANALIZA OPTYMALNEJ ŚCIEŻKI")
+    print("ANALIZA OPTYMALNEJ ŚCIEŻKI (WSZYSTKIE 4 OPCJE)")
     print(f"{'='*60}")
     
-    print("Obliczanie rozwiązania 1 (Baza Normalna)...")
-    sol_normal = inverse_kinematics(x_target, y_target, z_target, phi_deg, elbow_up, reverse_base=False)
+    print("Obliczanie rozwiązania 1 (Baza Normalna, Łokieć GÓRA)...")
+    sol_normal_up = inverse_kinematics(x_target, y_target, z_target, phi_deg, elbow_up=True, reverse_base=False)
     
-    print("\nObliczanie rozwiązania 2 (Baza Odwrócona)...")
-    sol_reversed = inverse_kinematics(x_target, y_target, z_target, phi_deg, elbow_up, reverse_base=True)
+    print("\nObliczanie rozwiązania 2 (Baza Normalna, Łokieć DÓŁ)...")
+    sol_normal_down = inverse_kinematics(x_target, y_target, z_target, phi_deg, elbow_up=False, reverse_base=False)
 
-    # Sprawdzenie, czy jakiekolwiek rozwiązanie istnieje
-    if sol_normal is None and sol_reversed is None:
-        print("\n✗ Nie udało się znaleźć żadnego rozwiązania IK dla obu konfiguracji bazy.")
-        return
+    print("\nObliczanie rozwiązania 3 (Baza Odwrócona, Łokieć GÓRA)...")
+    sol_reversed_up = inverse_kinematics(x_target, y_target, z_target, phi_deg, elbow_up=True, reverse_base=True)
+    
+    print("\nObliczanie rozwiązania 4 (Baza Odwrócona, Łokieć DÓŁ)...")
+    sol_reversed_down = inverse_kinematics(x_target, y_target, z_target, phi_deg, elbow_up=False, reverse_base=True)
 
     # --- WYBÓR OPTYMALNEJ ŚCIEŻKI ---
-    cost_normal = calculate_joint_distance(current_angles, sol_normal)
-    cost_reversed = calculate_joint_distance(current_angles, sol_reversed)
     
-    print(f"\n--- Porównanie kosztów ruchu ---")
-    print(f"Koszt (Baza Normalna):   {cost_normal:.4f}")
-    print(f"Koszt (Baza Odwrócona):  {cost_reversed:.4f}")
+    # Lista wszystkich potencjalnych rozwiązań z ich nazwami
+    solutions = [
+        (sol_normal_up, "Baza Normalna, Łokieć GÓRA"),
+        (sol_normal_down, "Baza Normalna, Łokieć DÓŁ"),
+        (sol_reversed_up, "Baza Odwrócona, Łokieć GÓRA"),
+        (sol_reversed_down, "Baza Odwrócona, Łokieć DÓŁ")
+    ]
 
-    if cost_normal <= cost_reversed:
-        print("-> Wybrano konfigurację: BAZA NORMALNA (niższy koszt)")
-        result = sol_normal
-    else:
-        print("-> Wybrano konfigurację: BAZA ODWRÓCONA (niższy koszt)")
-        result = sol_reversed
+    # Oblicz koszty dla wszystkich OSIĄGALNYCH rozwiązań
+    solution_costs = []
+    for sol, name in solutions:
+        cost = calculate_joint_distance(current_angles, sol)
+        if cost != float('inf'): # Sprawdź, czy rozwiązanie jest osiągalne
+            solution_costs.append((cost, sol, name))
+
+    # Sprawdzenie, czy jakiekolwiek rozwiązanie istnieje
+    if not solution_costs:
+        print("\n✗ Nie udało się znaleźć żadnego osiągalnego rozwiązania IK dla żadnej konfiguracji.")
+        return
+    
+    # Sortowanie listy rozwiązań po koszcie (od najmniejszego)
+    solution_costs.sort(key=lambda x: x[0])
+    
+    best_cost, best_solution, best_name = solution_costs[0]
+    
+    print(f"\n--- Porównanie kosztów ruchu (wszystkie osiągalne opcje) ---")
+    for cost, sol, name in solution_costs:
+        print(f"  Koszt ({name: <28}): {cost:.4f}")
+    
+    print(f"\n-> Wybrano konfigurację: {best_name} (najniższy koszt)")
+    result = best_solution
         
     th1, th2, th3, th4 = result
     alpha5 = 0.0  # Brak obrotu wokół osi końcówki
     
     # --- WERYFIKACJA ---
-    # (Reszta kodu pozostaje bez zmian, ponieważ bazuje na zmiennej 'result')
     print(f"\n{'='*60}")
     print("WERYFIKACJA (dla wybranej konfiguracji) - Kinematyka Prosta")
     print(f"{'='*60}")
