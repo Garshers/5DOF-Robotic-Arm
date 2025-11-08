@@ -8,7 +8,7 @@
 // ESP32 ma wbudowane porty UART - używamy UART2
 #define UART_RX_PIN 16 // RX2
 #define UART_TX_PIN 17 // TX2
-#define UART_BAUD 57600 // Szybkość transmisji
+#define UART_BAUD 115200 // Szybkość transmisji
 byte buttonStates = 0; // Zmienna przechowująca stany przycisków
 HardwareSerial esp32Serial(2); // UART2 na ESP32
 unsigned long lastInputTime = 0;
@@ -84,10 +84,10 @@ void setup() {
     
     stepperY.setMaxSpeed(2000);
     stepperY.setAcceleration(1000);
-    
+    stepperY.setPinsInverted(true, false, false); // Oś Y obwrócona względem A
+
     stepperA.setMaxSpeed(2000);
     stepperA.setAcceleration(1000);
-    stepperA.setPinsInverted(true, false, false); // Oś A odwrócona fizycznie
 
     stepperZ.setMaxSpeed(2000);
     stepperZ.setAcceleration(1000);
@@ -115,11 +115,10 @@ void loop() {
         String input = esp32Serial.readStringUntil('\n');
         input.trim();
         
-        if (millis() - lastInputTime >= 500) {
+        if (millis() - lastInputTime >= 1000) {
             Serial.println(input);
             lastInputTime = millis();
         }
-
 
         if (input.startsWith("BTN:")) {
             handleButtonFrame(input); // ustawia currentMode = MODE_BUTTONS
@@ -163,7 +162,6 @@ void handleButtonFrame(String input) {
 }
 
 void controlWithButtons() {
-    // Wydobycie stanów przycisków z odebranego bajtu
     bool BTN_X_FRWD = (buttonStates & (1 << 0));
     bool BTN_X_BACK = (buttonStates & (1 << 1));
     bool BTN_Y_FRWD = (buttonStates & (1 << 2));
@@ -173,23 +171,19 @@ void controlWithButtons() {
     bool BTN_E_FRWD = (buttonStates & (1 << 6));
     bool BTN_E_BACK = (buttonStates & (1 << 7));
 
-    // Odczyt stanów krańcówek
     bool limit_X_hit = (digitalRead(LIMIT_X_PIN) == HIGH);
     bool limit_Y_hit = (digitalRead(LIMIT_Y_PIN) == HIGH);
     bool limit_Z_hit = (digitalRead(LIMIT_Z_PIN) == HIGH);
     bool limit_E_hit = (digitalRead(LIMIT_E_PIN) == HIGH);
 
-    // Detekcja NACIŚNIĘCIA krańcówki Z
     if (limit_Z_hit && !limit_Z_last) {
         Serial.println("!!! Naciśnięto krańcówkę osi Z!");
-        // Zapamiętaj aktualny kierunek ruchu
         if (BTN_Z_FRWD) lastDirZ = 1;
         else if (BTN_Z_BACK) lastDirZ = 2;
         Serial.print("Zablokowany kierunek: ");
         Serial.println(lastDirZ == 1 ? "FRWD" : "BACK");
     }
     
-    // Detekcja ZWOLNIENIA krańcówki
     if (!limit_Z_hit && limit_Z_last) {
         Serial.println("Zwolniono krańcówkę osi Z - ruch odblokowany");
         lastDirZ = 0;
@@ -197,60 +191,56 @@ void controlWithButtons() {
     
     limit_Z_last = limit_Z_hit;
     
+    const long CONTINUOUS_SPEED = 100;
+
     // =========================================================================
-    // ---------------------------STEROWANIE SILNIKAMI--------------------------
+    // ----------------- 1. USTAWIENIE PRĘDKOŚCI DOCELOWYCH ------------------
     // =========================================================================
 
-    const long CONTINUOUS_SPEED = 100; // Prędkość ciągłego ruchu [kroki/s]
-
-    // Oś E
     if (BTN_E_FRWD) {
         stepperE.setSpeed(CONTINUOUS_SPEED);
-        stepperE.runSpeed();
     } else if (BTN_E_BACK) {
         stepperE.setSpeed(-CONTINUOUS_SPEED);
-        stepperE.runSpeed();
     } else {
         stepperE.setSpeed(0);
     }
 
-    // Oś X
     if (BTN_X_FRWD) {
         stepperX.setSpeed(CONTINUOUS_SPEED);
-        stepperX.runSpeed();
     } else if (BTN_X_BACK) {
         stepperX.setSpeed(-CONTINUOUS_SPEED);
-        stepperX.runSpeed();
     } else {
         stepperX.setSpeed(0);
     }
 
-    // Osie Y i A - poruszają się razem, A jest odwrócona sprzętowo
     if (BTN_Y_FRWD) {
         stepperY.setSpeed(CONTINUOUS_SPEED);
-        stepperY.runSpeed();
         stepperA.setSpeed(CONTINUOUS_SPEED);
-        stepperA.runSpeed();
     } else if (BTN_Y_BACK) {
         stepperY.setSpeed(-CONTINUOUS_SPEED);
-        stepperY.runSpeed();
         stepperA.setSpeed(-CONTINUOUS_SPEED);
-        stepperA.runSpeed();
     } else {
         stepperY.setSpeed(0);
         stepperA.setSpeed(0);
     }
 
-    // Oś Z - blokuj tylko kierunek, w którym naciśnięto krańcówkę
-    if (BTN_Z_FRWD) {
+    if (BTN_Z_FRWD && lastDirZ != 1) {
         stepperZ.setSpeed(CONTINUOUS_SPEED);
-        stepperZ.runSpeed();
-    } else if (BTN_Z_BACK) {
+    } else if (BTN_Z_BACK && lastDirZ != 2) {
         stepperZ.setSpeed(-CONTINUOUS_SPEED);
-        stepperZ.runSpeed();
     } else {
         stepperZ.setSpeed(0);
     }
+
+    // =========================================================================
+    // -------------------- 2. WYKONANIE RUCHU (W KAŻDEJ PĘTLI) -----------------
+    // =========================================================================
+    
+    stepperX.runSpeed();
+    stepperY.runSpeed();
+    stepperA.runSpeed();
+    stepperZ.runSpeed();
+    stepperE.runSpeed();
 }
 
 // --------------------------- POSITION mode ---------------------------

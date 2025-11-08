@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import os
 
-def create_dh_excel_file(theta_1_rad):
+def create_dh_excel_file():
     """Tworzy plik Excel z macierzami transformacji DH."""
     
     filename = "macierze_składowe_Ai.xlsx"
@@ -16,7 +16,7 @@ def create_dh_excel_file(theta_1_rad):
     full_path = os.path.join(script_dir, filename)
 
     # Definicja symboli
-    theta1, theta2, theta3, theta4, alpha5 = sp.symbols('theta_1 theta_2 theta_3 theta_4 alpha_5')
+    th1, th2, th3, th4, alpha5 = sp.symbols('θ1 θ2 θ3 θ4 α5')
     pi = sp.pi
 
     # Parametry DH
@@ -26,7 +26,7 @@ def create_dh_excel_file(theta_1_rad):
     l4_val = 87.9
     l5_val = 120.0
     lambda1_val = 78.8
-    lambda5_val = 10.0
+    lambda5_val = 100.0
     alpha1_val = pi / 2 
     alpha4_val = -pi / 2 
 
@@ -66,26 +66,22 @@ def create_dh_excel_file(theta_1_rad):
         ])
 
     # Obliczanie macierzy składowych A_i
-    A1 = RotZ(theta1) * TransZ(lambda1_val) * TransX(l1_val) * RotX(alpha1_val)
-    A2 = RotZ(theta2) * TransX(l2_val)
-    A3 = RotZ(-theta3) * TransX(l3_val)
-    A4 = RotZ(-theta4) * TransX(l4_val) * RotX(alpha4_val)
+    A1 = RotZ(th1) * TransZ(lambda1_val) * TransX(l1_val) * RotX(alpha1_val)
+    A2 = RotZ(th2) * TransX(l2_val)
+    A3 = RotZ(-th3) * TransX(l3_val)
+    A4 = RotZ(-th4) * TransX(l4_val) * RotX(alpha4_val)
     A5 = TransZ(lambda5_val) * TransX(l5_val) * RotX(alpha5)
 
     # Macierz wynikowa A = A1 * A2 * A3 * A4 * A5
     A = sp.simplify(A1 * A2 * A3 * A4 * A5)
-    
-    # Podstawienie wartości numerycznej theta_1
-    A1_num = A1.subs(theta1, theta_1_rad).evalf() 
-    A_partially_solved = A.subs(theta1, theta_1_rad).evalf()
 
     matrices = {
-        'A1_num': A1_num,
+        'A1': A1,
         'A2': A2,
         'A3': A3,
         'A4': A4,
         'A5': A5,
-        'A_partially_solved': A_partially_solved
+        'A': A
     }
 
     # Zapis do pliku Excel
@@ -115,15 +111,15 @@ if __name__ == "__main__":
     print(H_target)
     print()
 
-    # Obliczanie kąta fi1 (theta_1)
+    # Obliczanie kąta fi1 (th_1)
     px = H_target[0, 3]
     py = H_target[1, 3]
-    theta_1_rad = np.arctan2(py, px)
-    theta_1_deg = np.rad2deg(theta_1_rad)
+    th_1_rad = np.arctan2(py, px)
+    th_1_deg = np.rad2deg(th_1_rad)
     
-    print(f"Obliczony kąt fi1 (theta_1):")
-    print(f"  {theta_1_deg:.2f}° ({theta_1_rad:.4f} rad)")
+    print(f"Obliczony kąt fi1 (th_1):")
+    print(f"  {th_1_deg:.2f}° ({th_1_rad:.4f} rad)")
     print()
     
     # Generowanie pliku Excel
-    create_dh_excel_file(theta_1_rad)
+    create_dh_excel_file()

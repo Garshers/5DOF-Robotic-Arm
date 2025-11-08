@@ -7,7 +7,7 @@
 // =================== Zmienne dotyczące komunikacji UART ===================
 #define ESP_RX_PIN 16 // RX2(ESP-32) -> PIN_12(Arduino)
 #define ESP_TX_PIN 17 // TX2(ESP-32) -> PIN_13(Arduino)
-#define UART_BAUD 57600
+#define UART_BAUD 115200
 HardwareSerial SerialPort(2); // Definicja portu szeregowego 2
 String inputBuffer = "";
 
