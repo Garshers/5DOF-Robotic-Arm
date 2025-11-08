@@ -158,7 +158,11 @@ def inverse_kinematics(x_target, y_target, z_target, phi_deg=0.0, elbow_up=True)
     print(f"Orientacja φ={phi_deg:.2f}°")
     
     # --- KROK 1: θ1 (obrót podstawy) ---
-    th1 = math.atan2(y_target, x_target)
+    if math.sqrt(x_target**2 + y_target**2) < 0.01:
+        th1 = 0.0 
+    else:
+        th1 = math.atan2(y_target, x_target)
+    
     print(f"\n[Krok 1] θ1 = {math.degrees(th1):.2f}°")
     
     # --- KROK 2: Przejście do płaszczyzny R-Z ---
