@@ -150,7 +150,34 @@ def forward_kinematics_detailed(th1_val, th2_val, th3_val, th4_val, alpha5_val=0
 # CZĘŚĆ 3: KINEMATYKA ODWROTNA (Inverse Kinematics)
 # =====================================================================
 
-def inverse_kinematics(x_target, y_target, z_target, phi_deg=0.0, elbow_up=True):
+import math
+import numpy as np
+
+# Założenie: Wartości l1_val, l2_val, l3_val, l4_val, l5_val, lambda1_val, lambda5_val 
+# są zdefiniowane globalnie lub przekazane do funkcji w inny sposób.
+# Poniżej przykładowe definicje, aby kod był wykonywalny:
+l1_val = 18.4
+l2_val = 149.0
+l3_val = 120.3
+l4_val = 87.8
+l5_val = 23.0
+lambda1_val = 110.8
+lambda5_val = 10.0
+
+
+def inverse_kinematics(x_target, y_target, z_target, phi_deg=0.0, elbow_up=True, reverse_base=False):
+    """
+    Oblicza kinematykę odwrotną dla robota 5-DOF.
+    
+    Argumenty:
+    x_target, y_target, z_target: Współrzędne celu (mm)
+    phi_deg: Kąt orientacji końcówki (stopnie)
+    elbow_up: Konfiguracja łokcia (True = łokieć w górze, False = łokieć w dole)
+    reverse_base: Konfiguracja podstawy (True = baza odwrócona o 180 stopni)
+    
+    Zwraca:
+    Tuple (th1, th2, th3, th4) w radianach lub None, jeśli nieosiągalne.
+    """
     print(f"\n{'='*60}")
     print(f"KINEMATYKA ODWROTNA - Obliczanie kątów")
     print(f"{'='*60}")
@@ -158,60 +185,93 @@ def inverse_kinematics(x_target, y_target, z_target, phi_deg=0.0, elbow_up=True)
     print(f"Orientacja φ={phi_deg:.2f}°")
     
     # --- KROK 1: θ1 (obrót podstawy) ---
-    if math.sqrt(x_target**2 + y_target**2) < 0.01:
-        th1 = 0.0 
+    R_xy = math.sqrt(x_target**2 + y_target**2)
+    MIN_R_THRESHOLD = 0.01 
+    
+    if R_xy < MIN_R_THRESHOLD:
+        # Stabilizacja dla celów bliskich osi Z
+        th1 = 0.0
     else:
         th1 = math.atan2(y_target, x_target)
-    
-    print(f"\n[Krok 1] θ1 = {math.degrees(th1):.2f}°")
+
+    # Logika dla opcjonalnego odwrócenia podstawy
+    if reverse_base:
+        th1 = th1 + math.pi 
+        # Normalizacja kąta do zakresu (-pi, pi]
+        if th1 > math.pi:
+            th1 -= 2 * math.pi 
+        elif th1 <= -math.pi:
+            th1 += 2 * math.pi
+            
+    print(f"\n[Krok 1] θ1 = {math.degrees(th1):.2f}° (Odwrócona baza: {reverse_base})")
     
     # --- KROK 2: Przejście do płaszczyzny R-Z ---
-    R = math.sqrt(x_target**2 + y_target**2)
+    R = R_xy
     Z = z_target
     print(f"[Krok 2] Rzut R-Z: R={R:.2f}, Z={Z:.2f}")
+
+    # KOREKTA DLA ODWRÓCONEJ BAZY: Użyj -R, jeśli baza jest odwrócona
+    R_ik = -R if reverse_base else R
     
     # --- KROK 3: Parametry dla IK 3-DOF (tylko θ2, θ3, θ4) ---
-    L1 = l2_val  # 149.006
-    L2 = l3_val  # 120.3
-    L3 = math.sqrt((l4_val + l5_val)**2 + lambda5_val**2) # 111.3
+    L1 = l2_val  # Ramię 1 (od przegubu 2 do 3)
+    L2 = l3_val  # Ramię 2 (od przegubu 3 do 4)
+    # L3 to efektywna długość od przegubu 4 do końcówki (TCP)
+    L3 = math.sqrt((l4_val + l5_val)**2 + lambda5_val**2) 
     
     print(f"[Krok 3] Łańcuch 3-DOF: L1={L1:.1f}, L2={L2:.1f}, L3={L3:.1f}")
     
-    # Pozycja "nadgarstka" (punkt przed l4)
+    # Kąt korekcyjny dla L3 (wynikający z offsetu lambda5_val)
     phi_rad = math.radians(phi_deg)
     phi_corr = phi_rad + math.atan2(lambda5_val, l4_val + l5_val)
     print(f"[Krok 3] phi_rad={math.degrees(phi_rad):.2f}, phi_corr={math.degrees(phi_corr):.2f}")
 
-    R_wrist = R - l1_val - L3 * math.cos(phi_corr)
+    # Obliczenie pozycji "nadgarstka" (punktu przegubu 4)
+    # Używamy skorygowanego R_ik
+    R_wrist = R_ik - l1_val - L3 * math.cos(phi_corr)
     Z_wrist = Z - lambda1_val - L3 * math.sin(phi_corr)
     
     print(f"[Krok 3] Nadgarstek: R_w={R_wrist:.2f}, Z_w={Z_wrist:.2f}")
 
     
-    # --- KROK 4: Rozwiązanie dla θ2, θ3 ---
-    D = math.sqrt(R_wrist**2 + Z_wrist**2)
+    # --- KROK 4: Rozwiązanie dla θ2, θ3 (Solver 2-DOF) ---
+    # Używamy wartości bezwzględnej R_wrist, aby solver 2D zawsze działał poprawnie
+    R_abs = abs(R_wrist)
+    
+    # Odległość od przegubu 2 do nadgarstka (przegubu 4)
+    D = math.sqrt(R_abs**2 + Z_wrist**2) 
     print(f"[Krok 4] Odległość do nadgarstka D={D:.2f} mm")
     
+    # Sprawdzenie osiągalności
     if D > (L1 + L2) or D < abs(L1 - L2):
-        print(f"[BŁĄD] Nieosiągalne! Wymagane: {abs(L1-L2):.1f} <= D <= {L1+L2:.1f}")
+        print(f"[BŁĄD] Nieosiągalne! Wymagane: {abs(L1-L2):.1f} <= D ({D:.1f}) <= {L1+L2:.1f}")
         return None
     
+    # Twierdzenie cosinusów do znalezienia θ3
     cos_th3 = (D**2 - L1**2 - L2**2) / (2 * L1 * L2)
-    cos_th3 = np.clip(cos_th3, -1.0, 1.0)
+    cos_th3 = np.clip(cos_th3, -1.0, 1.0) # Zabezpieczenie numeryczne
     
     th3_ik = math.acos(cos_th3) if elbow_up else -math.acos(cos_th3)
     
-    alpha = math.atan2(Z_wrist, R_wrist)
-    beta = math.atan2(L2 * math.sin(th3_ik), L1 + L2 * math.cos(th3_ik))
+    # Obliczenie θ2
+    alpha = math.atan2(Z_wrist, R_abs) # Kąt do nadgarstka
+    beta = math.atan2(L2 * math.sin(th3_ik), L1 + L2 * math.cos(th3_ik)) # Kąt wynikający z th3
     th2 = alpha - beta
+    
+    # POPRAWIONA KOREKTA: Stosuj tylko w trybie odwróconej bazy
+    if R_wrist < 0 and reverse_base:
+        th2 = math.pi - th2
+        th3_ik = -th3_ik
     
     print(f"[Krok 4] θ2={math.degrees(th2):.2f}°, θ3_ik={math.degrees(th3_ik):.2f}°")
     
     # --- KROK 5: θ4 ---
+    # Kąt orientacji jest sumą kątów poprzednich przegubów
     th4_ik = phi_rad - th2 - th3_ik
     print(f"[Krok 5] θ4_ik={math.degrees(th4_ik):.2f}°")
     
     # --- KROK 6: Mapowanie D-H ---
+    # Dopasowanie znaków do konwencji D-H (jeśli th3 i th4 są ujemne w modelu)
     th3 = -th3_ik
     th4 = -th4_ik
     
@@ -219,7 +279,7 @@ def inverse_kinematics(x_target, y_target, z_target, phi_deg=0.0, elbow_up=True)
     print(f"  θ1={math.degrees(th1):7.2f}°, θ2={math.degrees(th2):7.2f}°")
     print(f"  θ3={math.degrees(th3):7.2f}°, θ4={math.degrees(th4):7.2f}°")
     
-    # Normalizacja
+    # Normalizacja końcowa (opcjonalna, ale dobra praktyka)
     th1 = math.atan2(math.sin(th1), math.cos(th1))
     th2 = math.atan2(math.sin(th2), math.cos(th2))
     th3 = math.atan2(math.sin(th3), math.cos(th3))
@@ -315,7 +375,7 @@ def main():
         return
     
     # --- OBLICZANIE KINEMATYKI ODWROTNEJ ---
-    result = inverse_kinematics(x_target, y_target, z_target, phi_deg, elbow_up)
+    result = inverse_kinematics(x_target, y_target, z_target, phi_deg, elbow_up, False)
     
     if result is None:
         print("\n✗ Nie udało się znaleźć rozwiązania IK.")
