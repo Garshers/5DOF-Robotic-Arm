@@ -249,7 +249,7 @@ void readEncoders() {
             for (int i = 0; i < 5; i++) {
                 // Prosta symulacja: powolne podążanie za targetAngles
                 float error = targetAngles[i] - currentAngles[i];
-                float velocity = constrain(error * 2.0, -5.0, 5.0);  // max 5°/s
+                float velocity = constrain(error * 2.0, -20.0, 20.0);  // max 5°/s
                 currentAngles[i] += velocity * dt;
                 
                 // Aktualizacja rotation count

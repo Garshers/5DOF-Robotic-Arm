@@ -7,6 +7,10 @@ import serial
 import serial.tools.list_ports
 import time
 import threading
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from mpl_toolkits.mplot3d import Axes3D
+from matplotlib.figure import Figure
 
 # =====================================================================
 # KOMUNIKACJA SERIAL Z ESP-32
@@ -298,6 +302,52 @@ def solve_ik_for_cartesian(x_target, y_target, z_target, phi_deg, current_angles
     
     return best_solution, best_name
 
+def get_joint_positions(th1_val, th2_val, th3_val, th4_val, alpha5_val=0.0):
+    """
+    Oblicza pozycje kartezjańskie (X, Y, Z) dla każdego przegubu.
+    Używa istniejących funkcji symbolicznych (RotZ, TransZ) i ewaluuje je.
+    """
+    # Parametry
+    alpha1_val = np.pi / 2
+    alpha4_val = -np.pi / 2
+    
+    # Macierze transformacji (używamy symbolicznych funkcji, które już istnieją)
+    # Zgodnie z definicją w forward_kinematics
+    A1_m = RotZ(th1_val) * TransZ(lambda1_val) * TransX(l1_val) * RotX(alpha1_val)
+    A2_m = RotZ(th2_val) * TransX(l2_val)
+    A3_m = RotZ(-th3_val) * TransX(l3_val)
+    A4_m = RotZ(-th4_val) * TransX(l4_val) * RotX(alpha4_val)
+    A5_m = TransZ(lambda5_val) * TransX(l5_val) * RotX(alpha5_val)
+
+    # Macierze skumulowane (jako obiekty SymPy)
+    T_Base = sp.Matrix([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
+    T_J1_base = T_Base * TransZ(lambda1_val)  # Góra podstawy, J1
+    
+    T_J2 = A1_m                             # Pozycja J2 (łokieć)
+    T_J3 = T_J2 * A2_m                      # Pozycja J3
+    T_J4 = T_J3 * A3_m                      # Pozycja J4 (nadgarstek)
+    T_TCP = T_J4 * A4_m * A5_m              # Pozycja TCP (zgodnie z FK)
+    
+    # Funkcja pomocnicza do ewaluacji macierzy SymPy do pozycji [x, y, z]
+    def get_pos(sym_matrix):
+        # Ewaluuj macierz symboliczną do numpy array
+        num_matrix = np.array(sym_matrix.evalf().tolist()).astype(float)
+        # Zwróć wektor pozycji (X, Y, Z)
+        return num_matrix[0:3, 3]
+
+    # Lista 6 punktów dla wykresu
+    # ['Base', 'J1', 'J2', 'J3', 'J4', 'TCP']
+    positions = [
+        get_pos(T_Base),        # P0: Base (0,0,0)
+        get_pos(T_J1_base),     # P1: J1 (góra podstawy)
+        get_pos(T_J2),          # P2: J2 (łokieć)
+        get_pos(T_J3),          # P3: J3
+        get_pos(T_J4),          # P4: J4 (nadgarstek)
+        get_pos(T_TCP)          # P5: TCP
+    ]
+    
+    return positions
+
 # =====================================================================
 # GUI APPLICATION
 # =====================================================================
@@ -306,24 +356,37 @@ class RobotControlGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Robot Control Interface")
-        self.root.geometry("900x700")
+        self.root.geometry("1400x700")
         
         self.robot = RobotSerial()
         self.robot.set_gui_callback(self.update_position_display)
         
         self.setup_ui()
         
+        # Uruchom aktualizację wizualizacji 3D
+        self.update_3d_visualization()
+        
         # Auto-connect przy starcie
         self.root.after(500, self.connect_robot)
         
     def setup_ui(self):
-        # Główny frame
+        # Główny frame z dwiema kolumnami
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         
+        # Lewa kolumna - kontrolki
+        left_frame = ttk.Frame(main_frame)
+        left_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 5))
+        
+        # Prawa kolumna - wizualizacja 3D
+        right_frame = ttk.Frame(main_frame)
+        right_frame.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(5, 0))
+        
+        # === LEWA KOLUMNA ===
+        
         # Status połączenia
-        status_frame = ttk.LabelFrame(main_frame, text="Status połączenia", padding="10")
-        status_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        status_frame = ttk.LabelFrame(left_frame, text="Status połączenia", padding="10")
+        status_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=5)
         
         self.status_label = ttk.Label(status_frame, text="Rozłączony", foreground="red")
         self.status_label.grid(row=0, column=0, padx=5)
@@ -331,8 +394,8 @@ class RobotControlGUI:
         ttk.Button(status_frame, text="Połącz", command=self.connect_robot).grid(row=0, column=1, padx=5)
         
         # Aktualna pozycja
-        position_frame = ttk.LabelFrame(main_frame, text="Aktualna pozycja", padding="10")
-        position_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        position_frame = ttk.LabelFrame(left_frame, text="Aktualna pozycja", padding="10")
+        position_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=5)
         
         self.pos_labels = {}
         for i, axis in enumerate(['X (baza)', 'Y (ramię L2)', 'Z (ramię L3)', 'E (nadgarstek)']):
@@ -341,13 +404,13 @@ class RobotControlGUI:
             self.pos_labels[axis].grid(row=i, column=1, sticky=tk.W, padx=10)
         
         # Pozycja docelowa
-        target_frame = ttk.LabelFrame(main_frame, text="Pozycja docelowa [mm]", padding="10")
-        target_frame.grid(row=1, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5, padx=5)
+        target_frame = ttk.LabelFrame(left_frame, text="Pozycja docelowa [mm]", padding="10")
+        target_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=5)
         
         ttk.Label(target_frame, text="X:").grid(row=0, column=0, sticky=tk.W, pady=5)
         self.x_entry = ttk.Entry(target_frame, width=15)
         self.x_entry.grid(row=0, column=1, padx=5)
-        self.x_entry.insert(0, "0")
+        self.x_entry.insert(0, "-87.5")
         
         ttk.Label(target_frame, text="Y:").grid(row=1, column=0, sticky=tk.W, pady=5)
         self.y_entry = ttk.Entry(target_frame, width=15)
@@ -357,43 +420,157 @@ class RobotControlGUI:
         ttk.Label(target_frame, text="Z:").grid(row=2, column=0, sticky=tk.W, pady=5)
         self.z_entry = ttk.Entry(target_frame, width=15)
         self.z_entry.grid(row=2, column=1, padx=5)
-        self.z_entry.insert(0, "200")
+        self.z_entry.insert(0, "372.5")
         
         ttk.Label(target_frame, text="Orientacja φ [°]:").grid(row=3, column=0, sticky=tk.W, pady=5)
         self.phi_entry = ttk.Entry(target_frame, width=15)
         self.phi_entry.grid(row=3, column=1, padx=5)
-        self.phi_entry.insert(0, "0")
+        self.phi_entry.insert(0, "135")
         
         ttk.Button(target_frame, text="WYŚLIJ POZYCJĘ", command=self.send_position, 
                    style='Accent.TButton').grid(row=4, column=0, columnspan=2, pady=15, sticky=(tk.W, tk.E))
         
         # Kąty docelowe (wynik IK)
-        angles_frame = ttk.LabelFrame(main_frame, text="Kąty docelowe (wynik IK)", padding="10")
-        angles_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        angles_frame = ttk.LabelFrame(left_frame, text="Kąty docelowe (wynik IK)", padding="10")
+        angles_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=5)
         
         self.angle_labels = {}
         for i, axis in enumerate(['θ1 (X)', 'θ2 (Y)', 'θ3 (Z)', 'θ4 (E)']):
-            ttk.Label(angles_frame, text=axis + ":").grid(row=0, column=i*2, sticky=tk.W, padx=5)
+            ttk.Label(angles_frame, text=axis + ":").grid(row=i//2, column=(i%2)*2, sticky=tk.W, padx=5, pady=2)
             self.angle_labels[axis] = ttk.Label(angles_frame, text="0.00°", font=('Arial', 10))
-            self.angle_labels[axis].grid(row=0, column=i*2+1, sticky=tk.W, padx=5)
+            self.angle_labels[axis].grid(row=i//2, column=(i%2)*2+1, sticky=tk.W, padx=5, pady=2)
         
         # Log
-        log_frame = ttk.LabelFrame(main_frame, text="Log komunikacji", padding="10")
-        log_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        log_frame = ttk.LabelFrame(left_frame, text="Log komunikacji", padding="10")
+        log_frame.grid(row=4, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
         
-        self.log_text = tk.Text(log_frame, height=15, width=80)
+        self.log_text = tk.Text(log_frame, height=12, width=50)
         self.log_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         
         scrollbar = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
         scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
         self.log_text['yscrollcommand'] = scrollbar.set
         
+        # === PRAWA KOLUMNA - WIZUALIZACJA 3D ===
+        
+        viz_frame = ttk.LabelFrame(right_frame, text="Wizualizacja 3D", padding="10")
+        viz_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # Utworzenie wykresu matplotlib
+        self.fig = Figure(figsize=(7, 6), dpi=100)
+        self.ax = self.fig.add_subplot(111, projection='3d')
+        
+        self.canvas = FigureCanvasTkAgg(self.fig, master=viz_frame)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        
         # Konfiguracja grid weights
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
-        main_frame.columnconfigure(0, weight=1)
+        main_frame.columnconfigure(0, weight=0)
         main_frame.columnconfigure(1, weight=1)
-        main_frame.rowconfigure(3, weight=1)
+        main_frame.rowconfigure(0, weight=1)
+        left_frame.rowconfigure(4, weight=1)
+        right_frame.rowconfigure(0, weight=1)
+    
+    def setup_3d_plot(self):
+        """Konfiguracja podstawowych parametrów wykresu 3D"""
+        self.ax.set_xlabel('X [mm]')
+        self.ax.set_ylabel('Y [mm]')
+        self.ax.set_zlabel('Z [mm]')
+        self.ax.set_title('Pozycja robota')
+        
+        # Ustaw zakresy osi
+        max_reach = l2_val + l3_val + l4_val + l5_val
+        self.ax.set_xlim([-max_reach, max_reach])
+        self.ax.set_ylim([-max_reach, max_reach])
+        self.ax.set_zlim([0, max_reach])
+        
+        # Kąt widzenia
+        self.ax.view_init(elev=20, azim=45)
+        
+    def update_3d_visualization(self):
+        """Aktualizacja wizualizacji 3D robota"""
+        try:
+            # Pobierz aktualne kąty
+            current_pos = self.robot.get_current_angles()
+            th1 = math.radians(current_pos[0])
+            th2 = math.radians(current_pos[1])
+            th3 = math.radians(current_pos[2])
+            th4 = math.radians(current_pos[3])
+            
+            # Pobierz pozycje przegubów
+            positions = get_joint_positions(th1, th2, th3, th4)
+            
+            # Wyczyść wykres
+            self.ax.clear()
+            
+            # Konfiguracja osi
+            self.ax.set_xlabel('X [mm]')
+            self.ax.set_ylabel('Y [mm]')
+            self.ax.set_zlabel('Z [mm]')
+            self.ax.set_title('Pozycja robota')
+            
+            # Ustaw zakresy osi
+            max_reach = l2_val + l3_val + l4_val + l5_val
+            self.ax.set_xlim([-max_reach, max_reach])
+            self.ax.set_ylim([-max_reach, max_reach])
+            self.ax.set_zlim([0, max_reach])
+            
+            # Kąt widzenia
+            self.ax.view_init(elev=20, azim=45)
+            
+            # Rysuj podstawę (cylinder)
+            theta = np.linspace(0, 2*np.pi, 20)
+            z_base = np.linspace(0, lambda1_val, 2)
+            Theta, Z_base = np.meshgrid(theta, z_base)
+            X_base = 30 * np.cos(Theta)
+            Y_base = 30 * np.sin(Theta)
+            self.ax.plot_surface(X_base, Y_base, Z_base, alpha=0.3, color='gray')
+            
+            # Rysuj ramiona robota
+            x_coords = [pos[0] for pos in positions]
+            y_coords = [pos[1] for pos in positions]
+            z_coords = [pos[2] for pos in positions]
+            
+            # Linie łączące przeguby
+            self.ax.plot(x_coords, y_coords, z_coords, 'o-', linewidth=4, 
+                        markersize=10, color='blue', label='Robot', markerfacecolor='lightblue')
+            
+            # Podświetl końcówkę
+            self.ax.scatter([x_coords[-1]], [y_coords[-1]], [z_coords[-1]], 
+                          c='red', s=150, marker='o', label='Efektor', edgecolors='darkred', linewidths=2)
+            
+            # Oznaczenia przegubów
+            labels = ['Base', 'J1', 'J2', 'J3', 'J4', 'TCP']
+            for i, pos in enumerate(positions):
+                self.ax.text(pos[0], pos[1], pos[2], f'  {labels[i]}', fontsize=8)
+            
+            # Dodaj siatkę płaszczyzny XY (na wysokości 0)
+            grid_size = 100
+            grid_range = np.arange(-300, 301, grid_size)
+            X_grid, Y_grid = np.meshgrid(grid_range, grid_range)
+            Z_grid = np.zeros_like(X_grid)
+            self.ax.plot_wireframe(X_grid, Y_grid, Z_grid, alpha=0.1, color='gray', linewidth=0.5)
+            
+            # Osie układu współrzędnych
+            axis_length = 100
+            self.ax.quiver(0, 0, 0, axis_length, 0, 0, color='red', arrow_length_ratio=0.1, linewidth=2, label='X')
+            self.ax.quiver(0, 0, 0, 0, axis_length, 0, color='green', arrow_length_ratio=0.1, linewidth=2, label='Y')
+            self.ax.quiver(0, 0, 0, 0, 0, axis_length, color='blue', arrow_length_ratio=0.1, linewidth=2, label='Z')
+            
+            self.ax.legend(loc='upper right')
+            
+            # Odśwież canvas
+            self.canvas.draw()
+            
+        except Exception as e:
+            # Loguj błąd tylko raz
+            if not hasattr(self, '_viz_error_logged'):
+                self.log(f"Błąd wizualizacji 3D: {e}")
+                self._viz_error_logged = True
+        
+        # Zaplanuj kolejną aktualizację za 200ms
+        self.root.after(200, self.update_3d_visualization)
         
     def log(self, message):
         """Dodaj wiadomość do logu"""
