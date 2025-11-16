@@ -1,6 +1,9 @@
 #include <Arduino.h>
 #include <Wire.h>
 
+// ==================== Tryb symulacji ====================
+#define SIMULATION_MODE true  // false = prawdziwe enkodery
+
 // ==================== Podstawowe ustawienia systemowe =====================
 #define BAUD 115200
 
@@ -234,21 +237,49 @@ void calculateTargetRaw(int axisIndex, float targetArmAngle) {
 }
 
 void readEncoders() {
-    for (int i = 0; i < 5; i++) {
-        uint16_t rawAngle = getEncoderRawAngle(ENCODER_CHANNEL[i]);
+    #if SIMULATION_MODE
+        // SYMULACJA
+        static uint32_t lastUpdate = 0;
+        uint32_t now = millis();
         
-        if (rawAngle == 0xFFFF) { continue; }// Błąd odczytu - pomijamy aktualizację
-        
-        // Korekta o offset zerowy
-        int16_t rawAngleAdjusted = rawAngle - ENCODER_ZPOS[i];
-        rawAngleAdjusted = ((rawAngleAdjusted % 4096) + 4096) % 4096;
-        
-        // Aktualizacja licznika obrotów
-        updateRotationCount(i, rawAngleAdjusted);
-        
-        // Obliczenie kąta ramienia
-        currentAngles[i] = getArmAngle(rawAngleAdjusted, rotationCount[i], ENCODER_LEVER[i]);
-    }
+        if (now - lastUpdate > 50) {  // Aktualizacja co 50ms
+            float dt = (now - lastUpdate) / 1000.0;
+            lastUpdate = now;
+            
+            for (int i = 0; i < 5; i++) {
+                // Prosta symulacja: powolne podążanie za targetAngles
+                float error = targetAngles[i] - currentAngles[i];
+                float velocity = constrain(error * 2.0, -5.0, 5.0);  // max 5°/s
+                currentAngles[i] += velocity * dt;
+                
+                // Aktualizacja rotation count
+                rotationCount[i] = (int)(currentAngles[i] / 360.0);
+                
+                // Przeliczenie currentAngles na lastRawAngle
+                float totalEncoderAngle = currentAngles[i] * ENCODER_LEVER[i];
+                float remainingAngle = fmod(totalEncoderAngle, 360.0);
+                if (remainingAngle < 0) remainingAngle += 360.0;
+                
+                // Konwersja na raw angle (0-4095)
+                int16_t rawAngleAdjusted = (int16_t)(remainingAngle / angleConst);
+                lastRawAngle[i] = (rawAngleAdjusted + ENCODER_ZPOS[i]) % 4096;
+            }
+        }
+    #else
+        // PRAWDZIWE ENKODERY
+        for (int i = 0; i < 5; i++) {
+            uint16_t rawAngle = getEncoderRawAngle(ENCODER_CHANNEL[i]);
+            
+            if (rawAngle == 0xFFFF) { continue; }
+            
+            int16_t rawAngleAdjusted = rawAngle - ENCODER_ZPOS[i];
+            rawAngleAdjusted = ((rawAngleAdjusted % 4096) + 4096) % 4096;
+            
+            updateRotationCount(i, rawAngleAdjusted);
+            
+            currentAngles[i] = getArmAngle(rawAngleAdjusted, rotationCount[i], ENCODER_LEVER[i]);
+        }
+    #endif
 }
 
 void controlMotorsToTarget() {
