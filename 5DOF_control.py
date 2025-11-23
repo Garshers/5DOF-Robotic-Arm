@@ -370,10 +370,16 @@ def solve_ik_for_cartesian(x_target, y_target, z_target, phi_deg, current_angles
             sol = inverse_kinematics(R_target, Z_target, th1_input, phi, elbow_up, reverse_base)
             
             if sol:
-                # Weryfikacja ograniczeń (Limity + Powierzchnia)
                 if check_constraints(*sol):
-                    config_cost = calculate_configuration_cost(sol, current_angles)
-                    all_solutions.append((config_cost, sol, f"{name}, φ={phi}°"))
+                    mech_cost = calculate_configuration_cost(sol, current_angles)
+
+                    # Dodanie kosztu preferencji orientacji (odchylenie od 180st)
+                    orientation_penalty = 0.0
+                    if phi_deg is None:
+                        orientation_penalty = abs(phi) * 10
+                    
+                    total_cost = mech_cost + orientation_penalty
+                    all_solutions.append((total_cost, sol, f"{name}, φ={phi}°"))
 
     if not all_solutions:
         return None, "BRAK ROZWIĄZANIA (Ograniczenia lub Zasięg)"
@@ -512,7 +518,7 @@ class RobotControlGUI:
         ttk.Label(target_frame, text="Orientacja φ [°]:").grid(row=3, column=0, sticky=tk.W, pady=5)
         self.phi_entry = ttk.Entry(target_frame, width=15)
         self.phi_entry.grid(row=3, column=1, padx=5)
-        self.phi_entry.insert(0, "135")
+        self.phi_entry.insert(0, "0")
         
         # Checkbox automatycznej orientacji
         self.auto_phi_var = tk.BooleanVar(value=True)
