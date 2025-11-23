@@ -441,7 +441,7 @@ class RobotControlGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Robot Control Interface")
-        self.root.geometry("1400x700")
+        self.root.geometry("1400x850")
         
         self.robot = RobotSerial()
         self.robot.set_gui_callback(self.update_position_display)
@@ -450,6 +450,17 @@ class RobotControlGUI:
         self.plot_artists = []
         # Przechowuje maksymalny zasięg do resetowania widoku
         self.max_reach = l2_val + l3_val + l4_val + l5_val
+        
+        # Tryb sterowania: 'position' lub 'angles'
+        self.control_mode = tk.StringVar(value='position')
+        
+        # Timer dla ciągłego wysyłania kątów
+        self.angle_send_timer = None
+        self.angle_send_active = False
+        
+        # Flagi dla ostrzeżeń o kolizjach
+        self._collision_warning_shown = False
+        self._last_collision_state = False
         
         self.setup_ui()
         
@@ -486,9 +497,20 @@ class RobotControlGUI:
         
         ttk.Button(status_frame, text="Połącz", command=self.connect_robot).grid(row=0, column=1, padx=5)
         
+        # Wybór trybu sterowania
+        mode_frame = ttk.LabelFrame(left_frame, text="Tryb sterowania", padding="10")
+        mode_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=5)
+        
+        ttk.Radiobutton(mode_frame, text="Sterowanie pozycją (XYZ)", 
+                       variable=self.control_mode, value='position',
+                       command=self.switch_control_mode).grid(row=0, column=0, sticky=tk.W, pady=2)
+        ttk.Radiobutton(mode_frame, text="Sterowanie kątami (ciągłe)", 
+                       variable=self.control_mode, value='angles',
+                       command=self.switch_control_mode).grid(row=1, column=0, sticky=tk.W, pady=2)
+        
         # Aktualna pozycja
         position_frame = ttk.LabelFrame(left_frame, text="Aktualna pozycja", padding="10")
-        position_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=5)
+        position_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=5)
         
         self.pos_labels = {}
         for i, axis in enumerate(['X (baza)', 'Y (ramię L2)', 'Z (ramię L3)', 'E (nadgarstek)']):
@@ -496,41 +518,72 @@ class RobotControlGUI:
             self.pos_labels[axis] = ttk.Label(position_frame, text="0.00°", font=('Arial', 12, 'bold'))
             self.pos_labels[axis].grid(row=i, column=1, sticky=tk.W, padx=10)
         
-        # Pozycja docelowa
-        target_frame = ttk.LabelFrame(left_frame, text="Pozycja docelowa [mm]", padding="10")
-        target_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=5)
+        # Sterowanie kątami (suwaki)
+        self.angle_control_frame = ttk.LabelFrame(left_frame, text="Sterowanie kątami [°]", padding="10")
+        self.angle_control_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=5)
         
-        ttk.Label(target_frame, text="X:").grid(row=0, column=0, sticky=tk.W, pady=5)
-        self.x_entry = ttk.Entry(target_frame, width=15)
+        # Oblicz limity w stopniach
+        angle_limit_deg = math.degrees(JOINT_CONST)
+        
+        self.angle_sliders = {}
+        self.angle_value_labels = {}
+        
+        joint_names = [
+            ('th1', 'θ1 (X - Baza)'),
+            ('th2', 'θ2 (Y - Ramię L2)'),
+            ('th3', 'θ3 (Z - Ramię L3)'),
+            ('th4', 'θ4 (E - Nadgarstek)')
+        ]
+        
+        for i, (key, label) in enumerate(joint_names):
+            ttk.Label(self.angle_control_frame, text=label).grid(row=i, column=0, sticky=tk.W, pady=5)
+            
+            slider = tk.Scale(self.angle_control_frame, from_=-angle_limit_deg, to=angle_limit_deg,
+                            orient=tk.HORIZONTAL, resolution=0.1, length=250,
+                            command=lambda val, k=key: self.on_angle_slider_change(k, val))
+            slider.set(0.0)
+            slider.grid(row=i, column=1, padx=5, pady=5)
+            self.angle_sliders[key] = slider
+            
+            value_label = ttk.Label(self.angle_control_frame, text="0.0°", font=('Arial', 10, 'bold'))
+            value_label.grid(row=i, column=2, padx=5)
+            self.angle_value_labels[key] = value_label
+        
+        # Pozycja docelowa
+        self.target_frame = ttk.LabelFrame(left_frame, text="Pozycja docelowa [mm]", padding="10")
+        self.target_frame.grid(row=4, column=0, sticky=(tk.W, tk.E), pady=5)
+        
+        ttk.Label(self.target_frame, text="X:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        self.x_entry = ttk.Entry(self.target_frame, width=15)
         self.x_entry.grid(row=0, column=1, padx=5)
         self.x_entry.insert(0, "-87.5")
         
-        ttk.Label(target_frame, text="Y:").grid(row=1, column=0, sticky=tk.W, pady=5)
-        self.y_entry = ttk.Entry(target_frame, width=15)
+        ttk.Label(self.target_frame, text="Y:").grid(row=1, column=0, sticky=tk.W, pady=5)
+        self.y_entry = ttk.Entry(self.target_frame, width=15)
         self.y_entry.grid(row=1, column=1, padx=5)
         self.y_entry.insert(0, "0")
         
-        ttk.Label(target_frame, text="Z:").grid(row=2, column=0, sticky=tk.W, pady=5)
-        self.z_entry = ttk.Entry(target_frame, width=15)
+        ttk.Label(self.target_frame, text="Z:").grid(row=2, column=0, sticky=tk.W, pady=5)
+        self.z_entry = ttk.Entry(self.target_frame, width=15)
         self.z_entry.grid(row=2, column=1, padx=5)
         self.z_entry.insert(0, "372.5")
 
-        ttk.Label(target_frame, text="Orientacja φ [°]:").grid(row=3, column=0, sticky=tk.W, pady=5)
-        self.phi_entry = ttk.Entry(target_frame, width=15)
+        ttk.Label(self.target_frame, text="Orientacja φ [°]:").grid(row=3, column=0, sticky=tk.W, pady=5)
+        self.phi_entry = ttk.Entry(self.target_frame, width=15)
         self.phi_entry.grid(row=3, column=1, padx=5)
         self.phi_entry.insert(0, "0")
         
         # Checkbox automatycznej orientacji
         self.auto_phi_var = tk.BooleanVar(value=True)
         self.auto_phi_check = ttk.Checkbutton(
-            target_frame, 
+            self.target_frame, 
             text="Orientacja automatyczna (optymalizacja przemysłowa)",
             variable=self.auto_phi_var,
             command=self.toggle_phi_entry
         )
         self.auto_phi_check.grid(row=4, column=0, columnspan=2, pady=5, sticky=tk.W)
         
-        ttk.Button(target_frame, text="WYŚLIJ POZYCJĘ", command=self.send_position, 
+        ttk.Button(self.target_frame, text="WYŚLIJ POZYCJĘ", command=self.send_position, 
                    style='Accent.TButton').grid(row=5, column=0, columnspan=2, pady=15, sticky=(tk.W, tk.E))
         
         # Początkowy stan (automatyczna orientacja włączona)
@@ -538,7 +591,7 @@ class RobotControlGUI:
         
         # Kąty docelowe (wynik IK)
         angles_frame = ttk.LabelFrame(left_frame, text="Kąty docelowe (wynik IK)", padding="10")
-        angles_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=5)
+        angles_frame.grid(row=5, column=0, sticky=(tk.W, tk.E), pady=5)
         
         self.angle_labels = {}
         for i, axis in enumerate(['θ1 (X)', 'θ2 (Y)', 'θ3 (Z)', 'θ4 (E)']):
@@ -548,7 +601,7 @@ class RobotControlGUI:
         
         # Log
         log_frame = ttk.LabelFrame(left_frame, text="Log komunikacji", padding="10")
-        log_frame.grid(row=4, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        log_frame.grid(row=6, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
         
         self.log_text = tk.Text(log_frame, height=12, width=50)
         self.log_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
@@ -583,8 +636,11 @@ class RobotControlGUI:
         main_frame.columnconfigure(0, weight=0)
         main_frame.columnconfigure(1, weight=1)
         main_frame.rowconfigure(0, weight=1)
-        left_frame.rowconfigure(4, weight=1)
+        left_frame.rowconfigure(6, weight=1)
         right_frame.rowconfigure(0, weight=1)
+        
+        # Inicjalizacja trybu sterowania
+        self.switch_control_mode()
     
     def setup_3d_plot(self):
         """
@@ -732,7 +788,7 @@ class RobotControlGUI:
             self.log(message)
     
     def send_position(self):
-        """Oblicz IK i wyślij do robota"""
+        """Oblicz IK, zweryfikuj kolizje ostatnich stawów i wyślij do robota"""
         try:
             # Pobierz wartości
             x_target = float(self.x_entry.get())
@@ -743,11 +799,7 @@ class RobotControlGUI:
             else:
                 phi_deg = float(self.phi_entry.get())
             
-            self.log(f"Obliczanie IK dla pozycji: X={x_target}, Y={y_target}, Z={z_target}, phi={phi_deg}")
-            
-            # DEBUG: Oblicz R i Z
-            R_target = math.sqrt(x_target**2 + y_target**2)
-            self.log(f"DEBUG: R_target={R_target:.2f}, Z_target={z_target:.2f}")
+            self.log(f"Obliczanie IK dla pozycji: X={x_target}, Y={y_target}, Z={z_target}")
             
             # Pobierz aktualną pozycję
             current_pos = self.robot.get_current_angles()
@@ -762,9 +814,23 @@ class RobotControlGUI:
                 return
             
             th1, th2, th3, th4 = solution
+
+            # WALIDACJA GEOMETRYCZNA (Czy ostatnie stawy są poniżej osi Z=0)
+            positions = get_joint_positions(th1, th2, th3, th4)
+            z_wrist = positions[3][2] # Środek nadgarstka (Joint 4 / Wrist)
+            z_tip = positions[4][2] # Końcówka robota (TCP / Tip)
+            
+            if z_wrist < -0.01 or z_tip < -0.01:
+                self.log(f"BLOKADA: Wykryto kolizję! Wrist Z={z_wrist:.2f}, Tip Z={z_tip:.2f}")
+                messagebox.showerror("Naruszenie strefy bezpiecznej", 
+                    f"Nie można wykonać ruchu!\n\n"
+                    f"Rozwiązanie IK prowadzi do kolizji z podłożem:\n"
+                    f"- Nadgarstek Z: {z_wrist:.2f} mm\n"
+                    f"- Końcówka Z: {z_tip:.2f} mm\n\n"
+                    f"Operacja przerwana.")
+                return
             
             self.log(f"Wybrano konfigurację: {config_name}")
-            self.log(f"Kąty: th1={math.degrees(th1):.2f}, th2={math.degrees(th2):.2f}, th3={math.degrees(th3):.2f}, th4={math.degrees(th4):.2f}")
             
             # Aktualizuj wyświetlane kąty
             self.angle_labels['θ1 (X)'].config(text=f"{math.degrees(th1):.2f}°")
@@ -772,36 +838,14 @@ class RobotControlGUI:
             self.angle_labels['θ3 (Z)'].config(text=f"{math.degrees(th3):.2f}°")
             self.angle_labels['θ4 (E)'].config(text=f"{math.degrees(th4):.2f}°")
             
-            # Weryfikacja FK
-            A_calculated = forward_kinematics(th1, th2, th3, th4, 0.0)
-            x_calc, y_calc, z_calc = A_calculated[0, 3], A_calculated[1, 3], A_calculated[2, 3]
-            error_x = abs(x_target - x_calc)
-            error_y = abs(y_target - y_calc)
-            error_z = abs(z_target - z_calc)
-            error_total = math.sqrt(error_x**2 + error_y**2 + error_z**2)
-            
-            self.log(f"Weryfikacja FK:")
-            self.log(f"  Cel:    X={x_target:.2f}, Y={y_target:.2f}, Z={z_target:.2f}")
-            self.log(f"  Wynik:  X={x_calc:.2f}, Y={y_calc:.2f}, Z={z_calc:.2f}")
-            self.log(f"  Błąd:   dX={error_x:.2f}, dY={error_y:.2f}, dZ={error_z:.2f}, total={error_total:.4f}mm")
-            
-            if error_total > 10.0:
-                self.log(f"UWAGA: Duży błąd weryfikacji FK ({error_total:.2f}mm)!")
-                response = messagebox.askyesno("Duży błąd FK", 
-                    f"Błąd weryfikacji wynosi {error_total:.2f}mm.\nCzy mimo to wysłać komendy do robota?")
-                if not response:
-                    return
-            elif error_total < 0.1:
-                self.log("Weryfikacja POZYTYWNA (błąd < 0.1mm)")
-            
             # Wyślij do robota
             success, message = self.robot.send_target_angles(th1, th2, th3, th4)
             if success:
                 self.log(message)
-                messagebox.showinfo("Sukces", "Komendy wysłane do robota")
+                self.log("✓ Pozycja wysłana pomyślnie")
             else:
                 self.log(message)
-                messagebox.showerror("Błąd", message)
+                messagebox.showerror("Błąd komunikacji", message)
                 
         except ValueError as e:
             messagebox.showerror("Błąd", "Wprowadź poprawne wartości liczbowe")
@@ -809,11 +853,143 @@ class RobotControlGUI:
         except Exception as e:
             messagebox.showerror("Błąd", f"Wystąpił błąd: {e}")
             self.log(f"BŁĄD: {e}")
-            import traceback
-            self.log(traceback.format_exc())
+    
+    def on_angle_slider_change(self, joint_key, value):
+        """Callback dla zmiany wartości suwaka"""
+        angle = float(value)
+        self.angle_value_labels[joint_key].config(text=f"{angle:.1f}°")
+        
+        # Sprawdź kolizję w czasie rzeczywistym
+        th1 = math.radians(self.angle_sliders['th1'].get())
+        th2 = math.radians(self.angle_sliders['th2'].get())
+        th3 = math.radians(self.angle_sliders['th3'].get())
+        th4 = math.radians(self.angle_sliders['th4'].get())
+        
+        # Oblicz pozycje stawów
+        positions = get_joint_positions(th1, th2, th3, th4)
+        
+        # Sprawdź czy któryś staw jest pod stołem (Z < 0)
+        collision_detected = False
+        min_z = float('inf')
+        
+        for i, pos in enumerate(positions):
+            if pos[2] < 0:
+                collision_detected = True
+                min_z = min(min_z, pos[2])
+        
+        # Zmień kolor etykiety wartości w zależności od kolizji
+        if collision_detected:
+            self.angle_value_labels[joint_key].config(foreground='red')
+            # Pokaż ostrzeżenie w logach (tylko przy pierwszej detekcji)
+            if not hasattr(self, '_last_collision_state') or not self._last_collision_state:
+                self.log(f"⚠️ KOLIZJA: Staw znajduje się {abs(min_z):.1f}mm POD stołem!")
+            self._last_collision_state = True
+        else:
+            self.angle_value_labels[joint_key].config(foreground='green')
+            # Zaloguj usunięcie kolizji
+            if hasattr(self, '_last_collision_state') and self._last_collision_state:
+                self.log("✓ Kolizja usunięta - pozycja bezpieczna")
+            self._last_collision_state = False
+    
+    def switch_control_mode(self):
+        """Przełącza między trybem sterowania pozycją a kątami"""
+        mode = self.control_mode.get()
+        
+        if mode == 'position':
+            # Pokaż kontrolki pozycji, ukryj suwaki kątów
+            self.target_frame.grid()
+            self.angle_control_frame.grid_remove()
+            
+            # Zatrzymaj ciągłe wysyłanie
+            self.stop_continuous_send()
+            
+            self.log("Przełączono na tryb sterowania pozycją (XYZ)")
+            
+        elif mode == 'angles':
+            # Pobierz aktualne kąty z robota i ustaw suwaki
+            current_pos = self.robot.get_current_angles()
+            self.angle_sliders['th1'].set(current_pos[0])
+            self.angle_sliders['th2'].set(current_pos[1])
+            self.angle_sliders['th3'].set(current_pos[2])
+            self.angle_sliders['th4'].set(current_pos[3])
+            
+            # Zaktualizuj etykiety wartości
+            self.angle_value_labels['th1'].config(text=f"{current_pos[0]:.1f}°")
+            self.angle_value_labels['th2'].config(text=f"{current_pos[1]:.1f}°")
+            self.angle_value_labels['th3'].config(text=f"{current_pos[2]:.1f}°")
+            self.angle_value_labels['th4'].config(text=f"{current_pos[3]:.1f}°")
+            
+            # Ukryj kontrolki pozycji, pokaż suwaki kątów
+            self.target_frame.grid_remove()
+            self.angle_control_frame.grid()
+            
+            # Uruchom ciągłe wysyłanie
+            self.start_continuous_send()
+            
+            self.log("Przełączono na tryb sterowania kątami (ciągłe)")
+            self.log(f"Załadowano aktualne kąty: θ1={current_pos[0]:.1f}°, θ2={current_pos[1]:.1f}°, θ3={current_pos[2]:.1f}°, θ4={current_pos[3]:.1f}°")
+    
+    def start_continuous_send(self):
+        """Rozpoczyna ciągłe wysyłanie kątów do robota"""
+        self.angle_send_active = True
+        self.send_angles_continuously()
+    
+    def stop_continuous_send(self):
+        """Zatrzymuje ciągłe wysyłanie kątów"""
+        self.angle_send_active = False
+        if self.angle_send_timer:
+            self.root.after_cancel(self.angle_send_timer)
+            self.angle_send_timer = None
+    
+    def send_angles_continuously(self):
+        """Wysyła aktualne wartości kątów z suwaków do robota w sposób ciągły, blokując kolizje."""
+        if not self.angle_send_active:
+            return
+        
+        try:
+            # Pobierz wartości z suwaków (w stopniach)
+            th1_deg = self.angle_sliders['th1'].get()
+            th2_deg = self.angle_sliders['th2'].get()
+            th3_deg = self.angle_sliders['th3'].get()
+            th4_deg = self.angle_sliders['th4'].get()
+            
+            # Konwersja na radiany
+            th1 = math.radians(th1_deg)
+            th2 = math.radians(th2_deg)
+            th3 = math.radians(th3_deg)
+            th4 = math.radians(th4_deg)
+            
+            # Czy jakikolwiek punkt jest pod stołem (Z < 0)
+            positions = get_joint_positions(th1, th2, th3, th4)
+            min_z = np.min(positions[:, 2])
+            
+            if min_z < 0:
+                # Wykryto kolizję - BLOKADA TRANSMISJI
+                if not hasattr(self, '_collision_warning_shown') or not self._collision_warning_shown:
+                    self.log(f"CRITICAL: Wykryto kolizję (Z = {min_z:.2f} mm). Ruch zablokowany.")
+                    self._collision_warning_shown = True
+                
+                # Nie wysyłamy danych do Serial, tylko planujemy kolejne sprawdzenie
+                self.angle_send_timer = self.root.after(100, self.send_angles_continuously)
+                return
+
+            # Jeśli brak kolizji, zresetuj flagę ostrzeżenia
+            if hasattr(self, '_collision_warning_shown') and self._collision_warning_shown:
+                self.log("✓ Strefa bezpieczna. Wznowiono transmisję.")
+                self._collision_warning_shown = False
+            
+            # Wyślij do robota (Safety Check pozytywny)
+            success, message = self.robot.send_target_angles(th1, th2, th3, th4)
+            
+        except Exception as e:
+            self.log(f"Błąd pętli sterowania: {e}")
+        
+        # Zaplanuj następne wysłanie za 100ms
+        self.angle_send_timer = self.root.after(100, self.send_angles_continuously)
     
     def on_closing(self):
         """Zamknięcie aplikacji"""
+        self.stop_continuous_send()
         self.robot.close()
         self.root.destroy()
 
