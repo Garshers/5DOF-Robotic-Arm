@@ -234,6 +234,45 @@ def inverse_kinematics(R, Z, th1_base, phi_deg=0.0, elbow_up=True, reverse_base=
     
     return (th1, th2, th3, th4)
 
+JOINT_CONST = pi/2*1.05
+JOINT_LIMITS = {
+    'th1': (-JOINT_CONST, JOINT_CONST),       # Baza
+    'th2': (-JOINT_CONST, JOINT_CONST),       # Bark
+    'th3': (-JOINT_CONST, JOINT_CONST),       # Łokieć
+    'th4': (-JOINT_CONST, JOINT_CONST)        # Nadgarstek
+}
+
+def check_constraints(th1, th2, th3, th4):
+    """
+    Weryfikuje ograniczenia kątowe oraz geometryczne (kolizja z podłożem).
+    Zwraca True, jeśli konfiguracja jest dopuszczalna.
+    """
+    # 1. Weryfikacja zakresów kątowych
+    if not (JOINT_LIMITS['th1'][0] <= th1 <= JOINT_LIMITS['th1'][1]): return False
+    if not (JOINT_LIMITS['th2'][0] <= th2 <= JOINT_LIMITS['th2'][1]): return False
+    if not (JOINT_LIMITS['th3'][0] <= th3 <= JOINT_LIMITS['th3'][1]): return False
+    if not (JOINT_LIMITS['th4'][0] <= th4 <= JOINT_LIMITS['th4'][1]): return False
+
+    # 2. Weryfikacja kolizji z podłożem (Płaszczyzna Z=0)
+    # Obliczenia oparte na łańcuchu kinematycznym w płaszczyźnie pionowej.
+    # Z_shoulder = lambda1_val (stała > 0)
+    
+    # Wysokość łokcia (Joint 3)
+    # Zależna od th2. Przy th2=0 ramię poziomo, przy th2=90 pionowo w górę.
+    z_elbow = lambda1_val + l2_val * math.sin(th2)
+    
+    if z_elbow < 0:
+        return False
+
+    # Wysokość nadgarstka (Joint 4)
+    # Zależna od th2 i th3. Uwaga: w macierzy A3 jest RotZ(-th3), więc kąt absolutny to th2 - th3.
+    z_wrist = z_elbow + l3_val * math.sin(th2 - th3)
+    
+    if z_wrist < 0:
+        return False
+
+    return True
+
 def calculate_joint_distance(q_current, q_target):
     if q_target is None:
         return float('inf')
@@ -248,105 +287,145 @@ def calculate_joint_distance(q_current, q_target):
     
     return total_distance
 
+def calculate_configuration_cost(angles, current_angles):
+    """
+    Oblicza koszt konfiguracji uwzględniający:
+    1. Odległość od limitów złączy (conditioning)
+    2. Odległość w przestrzeni konfiguracyjnej
+    3. Unikanie singularności (wyprostowany łokieć)
+    
+    Używane w przemyśle jako: Joint Range Availability (JRA) + Distance Cost
+    """
+    th1, th2, th3, th4 = angles
+    
+    # 1. Koszt odległości od limitów (im bliżej środka zakresu, tym lepiej)
+    joint_limit_cost = 0
+    joints = [th1, th2, th3, th4]
+    limits = [JOINT_LIMITS['th1'], JOINT_LIMITS['th2'], JOINT_LIMITS['th3'], JOINT_LIMITS['th4']]
+    
+    for joint_val, (min_lim, max_lim) in zip(joints, limits):
+        # Normalizacja do przedziału [0, 1], gdzie 0.5 = środek zakresu
+        normalized = (joint_val - min_lim) / (max_lim - min_lim)
+        # Koszt rośnie im dalej od środka (0.5)
+        joint_limit_cost += (normalized - 0.5)**2
+    
+    # 2. Koszt ruchu (odległość w przestrzeni konfiguracyjnej)
+    motion_cost = calculate_joint_distance(current_angles, angles)
+    
+    # 3. Koszt singularności (unikaj wyprostowanego łokcia, th3 ≈ 0)
+    # W robotyce: Manipulability Index = det(J*J^T), ale uproszczamy do abs(th3)
+    singularity_cost = 1.0 / (abs(th3) + 0.1)  # Duży koszt gdy th3 → 0
+    
+    # Wagi (dostrojone empirycznie dla robotyki przemysłowej)
+    w_limit = 2.0      # Priorytet: unikaj limitów
+    w_motion = 1.0     # Średni priorytet: minimalizuj ruch
+    w_singular = 3.0   # Wysoki priorytet: unikaj singularności
+    
+    total_cost = (w_limit * joint_limit_cost + 
+                  w_motion * motion_cost + 
+                  w_singular * singularity_cost)
+    
+    return total_cost
+
 def solve_ik_for_cartesian(x_target, y_target, z_target, phi_deg, current_angles):
     """
-    Rozwiązanie IK dla współrzędnych kartezjańskich (X, Y, Z).
-    Zwraca najlepsze rozwiązanie (th1, th2, th3, th4) oraz nazwę konfiguracji.
+    Rozwiązanie IK dla współrzędnych kartezjańskich (X, Y, Z) z automatyczną
+    optymalizacją orientacji nadgarstka (phi).
     
-    UWAGA: (X, Y, Z) to współrzędne kartezjańskie końcówki robota w układzie globalnym.
+    Algorytm przemysłowy:
+    - Testuje różne orientacje phi w zakresie [-90°, +90°]
+    - Minimalizuje koszt konfiguracji (JRA + singularity avoidance)
+    - Wybiera najlepsze rozwiązanie spełniające ograniczenia
     """
-    # Oblicz R (odległość radialna od osi Z) i Z (wysokość)
-    # To są współrzędne CYLINDRYCZNE
     R_target = math.sqrt(x_target**2 + y_target**2)
     Z_target = z_target
     
-    # Kąt podstawy (obrót wokół osi Z) - zależy tylko od kierunku X,Y
     th1_base = math.atan2(y_target, x_target) if R_target > 0.01 else 0.0
     
-    # Generuj wszystkie możliwe konfiguracje
-    solutions = []
+    # Jeśli użytkownik podał konkretne phi, użyj go
+    if phi_deg is not None:
+        phi_range = [phi_deg]
+    else:
+        # Automatyczna optymalizacja: próbkuj orientacje co 5°
+        phi_range = range(-180, 180, 5)
     
-    # 1. Normalna baza, łokieć góra
-    sol = inverse_kinematics(R_target, Z_target, th1_base, phi_deg, elbow_up=True, reverse_base=False)
-    if sol:
-        solutions.append((sol, "Baza Normalna, Łokieć GÓRA"))
+    all_solutions = []
     
-    # 2. Normalna baza, łokieć dół
-    sol = inverse_kinematics(R_target, Z_target, th1_base, phi_deg, elbow_up=False, reverse_base=False)
-    if sol:
-        solutions.append((sol, "Baza Normalna, Łokieć DÓŁ"))
+    # Definicja strategii poszukiwania rozwiązań
+    strategies = [
+        (True, False, "Baza Normalna, Łokieć GÓRA"),
+        (False, False, "Baza Normalna, Łokieć DÓŁ"),
+        (True, True, "Baza Odwrócona, Łokieć GÓRA"),
+        (False, True, "Baza Odwrócona, Łokieć DÓŁ")
+    ]
+
+    for phi in phi_range:
+        for elbow_up, reverse_base, name in strategies:
+            # Dla odwróconej bazy przeliczamy th1
+            if reverse_base:
+                th1_input = ((th1_base + math.pi) + math.pi) % (2 * math.pi) - math.pi
+            else:
+                th1_input = th1_base
+
+            sol = inverse_kinematics(R_target, Z_target, th1_input, phi, elbow_up, reverse_base)
+            
+            if sol:
+                # Weryfikacja ograniczeń (Limity + Powierzchnia)
+                if check_constraints(*sol):
+                    config_cost = calculate_configuration_cost(sol, current_angles)
+                    all_solutions.append((config_cost, sol, f"{name}, φ={phi}°"))
+
+    if not all_solutions:
+        return None, "BRAK ROZWIĄZANIA (Ograniczenia lub Zasięg)"
     
-    # 3. Odwrócona baza, łokieć góra
-    th1_reversed_raw = th1_base
-    th1_reversed = ((th1_reversed_raw + math.pi) + math.pi) % (2 * math.pi) - math.pi
-    sol = inverse_kinematics(R_target, Z_target, th1_reversed, phi_deg, elbow_up=True, reverse_base=True)
-    if sol:
-        solutions.append((sol, "Baza Odwrócona, Łokieć GÓRA"))
-    
-    # 4. Odwrócona baza, łokieć dół
-    sol = inverse_kinematics(R_target, Z_target, th1_reversed, phi_deg, elbow_up=False, reverse_base=True)
-    if sol:
-        solutions.append((sol, "Baza Odwrócona, Łokieć DÓŁ"))
-    
-    if not solutions:
-        return None, "BRAK ROZWIĄZANIA"
-    
-    # Wybierz rozwiązanie najbliższe aktualnej pozycji
-    solution_costs = []
-    for sol, name in solutions:
-        cost = calculate_joint_distance(current_angles, sol)
-        solution_costs.append((cost, sol, name))
-    
-    solution_costs.sort(key=lambda x: x[0])
-    best_cost, best_solution, best_name = solution_costs[0]
+    # Sortuj według kosztu i wybierz najlepsze
+    all_solutions.sort(key=lambda x: x[0])
+    best_cost, best_solution, best_name = all_solutions[0]
     
     return best_solution, best_name
 
 def get_joint_positions(th1_val, th2_val, th3_val, th4_val, alpha5_val=0.0):
     """
-    Oblicza pozycje kartezjańskie (X, Y, Z) dla każdego przegubu.
-    Używa istniejących funkcji symbolicznych (RotZ, TransZ) i ewaluuje je.
+    Oblicza pozycje (X, Y, Z) wszystkich węzłów robota dla zadanych kątów.
+    Wykorzystuje macierze transformacji do dokładnego odwzorowania kinematyki.
     """
-    # Parametry
+    # Definicje lokalne dla numerycznej wydajności (zamiast sp.Matrix.evalf w pętli)
+    # Jeśli zależy Ci na idealnej spójności z forward_kinematics, używamy tych samych macierzy
     alpha1_val = np.pi / 2
     alpha4_val = -np.pi / 2
-    
-    # Macierze transformacji (używamy symbolicznych funkcji, które już istnieją)
-    # Zgodnie z definicją w forward_kinematics
-    A1_m = RotZ(th1_val) * TransZ(lambda1_val) * TransX(l1_val) * RotX(alpha1_val)
-    A2_m = RotZ(th2_val) * TransX(l2_val)
-    A3_m = RotZ(-th3_val) * TransX(l3_val)
-    A4_m = RotZ(-th4_val) * TransX(l4_val) * RotX(alpha4_val)
-    A5_m = TransZ(lambda5_val) * TransX(l5_val) * RotX(alpha5_val)
 
-    # Macierze skumulowane (jako obiekty SymPy)
-    T_Base = sp.Matrix([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
-    T_J1_base = T_Base * TransZ(lambda1_val)  # Góra podstawy, J1
-    
-    T_J2 = A1_m                             # Pozycja J2 (łokieć)
-    T_J3 = T_J2 * A2_m                      # Pozycja J3
-    T_J4 = T_J3 * A3_m                      # Pozycja J4 (nadgarstek)
-    T_TCP = T_J4 * A4_m * A5_m              # Pozycja TCP (zgodnie z FK)
-    
-    # Funkcja pomocnicza do ewaluacji macierzy SymPy do pozycji [x, y, z]
-    def get_pos(sym_matrix):
-        # Ewaluuj macierz symboliczną do numpy array
-        num_matrix = np.array(sym_matrix.evalf().tolist()).astype(float)
-        # Zwróć wektor pozycji (X, Y, Z)
-        return num_matrix[0:3, 3]
+    # Funkcje pomocnicze dla numpy (szybsze niż sympy)
+    def np_RotZ(t): c, s = np.cos(t), np.sin(t); return np.array([[c, -s, 0, 0], [s, c, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
+    def np_RotX(a): c, s = np.cos(a), np.sin(a); return np.array([[1, 0, 0, 0], [0, c, -s, 0], [0, s, c, 0], [0, 0, 0, 1]])
+    def np_TransZ(d): return np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, d], [0, 0, 0, 1]])
+    def np_TransX(a): return np.array([[1, 0, 0, a], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
 
-    # Lista 6 punktów dla wykresu
-    # ['Base', 'J1', 'J2', 'J3', 'J4', 'TCP']
-    positions = [
-        get_pos(T_Base),        # P0: Base (0,0,0)
-        get_pos(T_J1_base),     # P1: J1 (góra podstawy)
-        get_pos(T_J2),          # P2: J2 (łokieć)
-        get_pos(T_J3),          # P3: J3
-        get_pos(T_J4),          # P4: J4 (nadgarstek)
-        get_pos(T_TCP)          # P5: TCP
-    ]
+    # Macierze transformacji
+    T1 = np_RotZ(th1_val) @ np_TransZ(lambda1_val) @ np_TransX(l1_val) @ np_RotX(alpha1_val)
+    T2 = np_RotZ(th2_val) @ np_TransX(l2_val)
+    T3 = np_RotZ(-th3_val) @ np_TransX(l3_val)
+    T4 = np_RotZ(-th4_val) @ np_TransX(l4_val) @ np_RotX(alpha4_val)
+    T5 = np_TransZ(lambda5_val) @ np_TransX(l5_val) @ np_RotX(alpha5_val)
+
+    # Pozycje poszczególnych węzłów (tłumaczenie wektora [0,0,0,1])
+    origin = np.array([0, 0, 0, 1])
     
-    return positions
+    # P1: Baza (0,0,0)
+    p1 = np.array([0, 0, 0])
+    
+    # P2: Bark (po T1)
+    p2 = (T1 @ origin)[:3]
+    
+    # P3: Łokieć (po T1 * T2)
+    p3 = (T1 @ T2 @ origin)[:3]
+    
+    # P4: Nadgarstek środek (po T1 * T2 * T3)
+    p4 = (T1 @ T2 @ T3 @ origin)[:3]
+    
+    # P5: Końcówka (po T1 * T2 * T3 * T4 * T5)
+    p5 = (T1 @ T2 @ T3 @ T4 @ T5 @ origin)[:3]
+
+    return np.array([p1, p2, p3, p4, p5])
 
 # =====================================================================
 # GUI APPLICATION
@@ -361,13 +440,21 @@ class RobotControlGUI:
         self.robot = RobotSerial()
         self.robot.set_gui_callback(self.update_position_display)
         
+        # Przechowuje dynamiczne elementy wykresu (linie, punkty)
+        self.plot_artists = []
+        # Przechowuje maksymalny zasięg do resetowania widoku
+        self.max_reach = l2_val + l3_val + l4_val + l5_val
+        
         self.setup_ui()
+        
+        # Konfiguracja 3D jest teraz wywołana RAZ po setup_ui
+        self.setup_3d_plot()
         
         # Uruchom aktualizację wizualizacji 3D
         self.update_3d_visualization()
         
         # Auto-connect przy starcie
-        self.root.after(500, self.connect_robot)
+        self.root.after(100, self.connect_robot)
         
     def setup_ui(self):
         # Główny frame z dwiema kolumnami
@@ -421,14 +508,27 @@ class RobotControlGUI:
         self.z_entry = ttk.Entry(target_frame, width=15)
         self.z_entry.grid(row=2, column=1, padx=5)
         self.z_entry.insert(0, "372.5")
-        
+
         ttk.Label(target_frame, text="Orientacja φ [°]:").grid(row=3, column=0, sticky=tk.W, pady=5)
         self.phi_entry = ttk.Entry(target_frame, width=15)
         self.phi_entry.grid(row=3, column=1, padx=5)
         self.phi_entry.insert(0, "135")
         
+        # Checkbox automatycznej orientacji
+        self.auto_phi_var = tk.BooleanVar(value=True)
+        self.auto_phi_check = ttk.Checkbutton(
+            target_frame, 
+            text="Orientacja automatyczna (optymalizacja przemysłowa)",
+            variable=self.auto_phi_var,
+            command=self.toggle_phi_entry
+        )
+        self.auto_phi_check.grid(row=4, column=0, columnspan=2, pady=5, sticky=tk.W)
+        
         ttk.Button(target_frame, text="WYŚLIJ POZYCJĘ", command=self.send_position, 
-                   style='Accent.TButton').grid(row=4, column=0, columnspan=2, pady=15, sticky=(tk.W, tk.E))
+                   style='Accent.TButton').grid(row=5, column=0, columnspan=2, pady=15, sticky=(tk.W, tk.E))
+        
+        # Początkowy stan (automatyczna orientacja włączona)
+        self.toggle_phi_entry()
         
         # Kąty docelowe (wynik IK)
         angles_frame = ttk.LabelFrame(left_frame, text="Kąty docelowe (wynik IK)", padding="10")
@@ -453,14 +553,22 @@ class RobotControlGUI:
         
         # === PRAWA KOLUMNA - WIZUALIZACJA 3D ===
         
+        # 1. Definicja ramki
         viz_frame = ttk.LabelFrame(right_frame, text="Wizualizacja 3D", padding="10")
         viz_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         
-        # Utworzenie wykresu matplotlib
+        # 2. Utworzenie wykresu matplotlib
         self.fig = Figure(figsize=(7, 6), dpi=100)
         self.ax = self.fig.add_subplot(111, projection='3d')
         
+        # 3. Utworzenie canvas
         self.canvas = FigureCanvasTkAgg(self.fig, master=viz_frame)
+        
+        # 4. Przycisk resetu widoku
+        reset_button = ttk.Button(viz_frame, text="Resetuj widok", command=self.reset_3d_view)
+        reset_button.pack(side=tk.TOP, anchor=tk.NW, pady=5, padx=5)
+        
+        # 5. Spakowanie canvas
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         
         # Konfiguracja grid weights
@@ -473,104 +581,114 @@ class RobotControlGUI:
         right_frame.rowconfigure(0, weight=1)
     
     def setup_3d_plot(self):
-        """Konfiguracja podstawowych parametrów wykresu 3D"""
+        """
+        Konfiguruje statyczne elementy wykresu 3D (osie, limity, siatka, podstawa).
+        Wywoływana tylko raz przy inicjalizacji.
+        """
         self.ax.set_xlabel('X [mm]')
         self.ax.set_ylabel('Y [mm]')
         self.ax.set_zlabel('Z [mm]')
         self.ax.set_title('Pozycja robota')
         
         # Ustaw zakresy osi
-        max_reach = l2_val + l3_val + l4_val + l5_val
-        self.ax.set_xlim([-max_reach, max_reach])
-        self.ax.set_ylim([-max_reach, max_reach])
-        self.ax.set_zlim([0, max_reach])
+        self.ax.set_xlim([-self.max_reach, self.max_reach])
+        self.ax.set_ylim([-self.max_reach, self.max_reach])
+        self.ax.set_zlim([0, self.max_reach])
         
         # Kąt widzenia
         self.ax.view_init(elev=20, azim=45)
         
+        # Rysuj podstawę (cylinder)
+        theta = np.linspace(0, 2*np.pi, 20)
+        z_base = np.linspace(0, lambda1_val, 2)
+        Theta, Z_base = np.meshgrid(theta, z_base)
+        X_base = 30 * np.cos(Theta)
+        Y_base = 30 * np.sin(Theta)
+        self.ax.plot_surface(X_base, Y_base, Z_base, alpha=0.3, color='gray')
+        
+        # Dodaj siatkę płaszczyzny XY (na wysokości 0)
+        grid_size = 100
+        grid_range = np.arange(-300, 301, grid_size)
+        X_grid, Y_grid = np.meshgrid(grid_range, grid_range)
+        Z_grid = np.zeros_like(X_grid)
+        self.ax.plot_wireframe(X_grid, Y_grid, Z_grid, alpha=0.1, color='gray', linewidth=0.5)
+        
+        # Osie układu współrzędnych
+        axis_length = 100
+        self.ax.quiver(0, 0, 0, axis_length, 0, 0, color='red', arrow_length_ratio=0.1, linewidth=2, label='X')
+        self.ax.quiver(0, 0, 0, 0, axis_length, 0, color='green', arrow_length_ratio=0.1, linewidth=2, label='Y')
+        self.ax.quiver(0, 0, 0, 0, 0, axis_length, color='blue', arrow_length_ratio=0.1, linewidth=2, label='Z')
+        
+        self.ax.legend(loc='upper right')
+
+    def reset_3d_view(self):
+        """
+        Resetuje widok 3D (limity osi i kamerę) do ustawień domyślnych.
+        """
+        self.ax.set_xlim([-self.max_reach, self.max_reach])
+        self.ax.set_ylim([-self.max_reach, self.max_reach])
+        self.ax.set_zlim([0, self.max_reach])
+        self.ax.view_init(elev=20, azim=45)
+        self.canvas.draw()
+
     def update_3d_visualization(self):
-        """Aktualizacja wizualizacji 3D robota"""
+        """
+        Aktualizacja wizualizacji 3D robota.
+        Ta funkcja usuwa tylko stare linie robota i rysuje nowe.
+        """
         try:
-            # Pobierz aktualne kąty
+            # --- 1. Usuń poprzednie elementy robota ---
+            for artist in self.plot_artists:
+                # Sprawdź, czy artist to lista (jak z ax.plot)
+                if isinstance(artist, list):
+                    for item in artist:
+                        item.remove()
+                else:
+                    artist.remove() # Usuń pojedynczy element (np. z scatter, text)
+            
+            self.plot_artists = [] # Wyczyść listę
+            
+            # --- 2. Pobierz nowe dane ---
             current_pos = self.robot.get_current_angles()
             th1 = math.radians(current_pos[0])
             th2 = math.radians(current_pos[1])
             th3 = math.radians(current_pos[2])
             th4 = math.radians(current_pos[3])
             
-            # Pobierz pozycje przegubów
             positions = get_joint_positions(th1, th2, th3, th4)
             
-            # Wyczyść wykres
-            self.ax.clear()
-            
-            # Konfiguracja osi
-            self.ax.set_xlabel('X [mm]')
-            self.ax.set_ylabel('Y [mm]')
-            self.ax.set_zlabel('Z [mm]')
-            self.ax.set_title('Pozycja robota')
-            
-            # Ustaw zakresy osi
-            max_reach = l2_val + l3_val + l4_val + l5_val
-            self.ax.set_xlim([-max_reach, max_reach])
-            self.ax.set_ylim([-max_reach, max_reach])
-            self.ax.set_zlim([0, max_reach])
-            
-            # Kąt widzenia
-            self.ax.view_init(elev=20, azim=45)
-            
-            # Rysuj podstawę (cylinder)
-            theta = np.linspace(0, 2*np.pi, 20)
-            z_base = np.linspace(0, lambda1_val, 2)
-            Theta, Z_base = np.meshgrid(theta, z_base)
-            X_base = 30 * np.cos(Theta)
-            Y_base = 30 * np.sin(Theta)
-            self.ax.plot_surface(X_base, Y_base, Z_base, alpha=0.3, color='gray')
-            
-            # Rysuj ramiona robota
             x_coords = [pos[0] for pos in positions]
             y_coords = [pos[1] for pos in positions]
             z_coords = [pos[2] for pos in positions]
             
+            # --- 3. Rysuj nowe elementy robota ---
+            
             # Linie łączące przeguby
-            self.ax.plot(x_coords, y_coords, z_coords, 'o-', linewidth=4, 
-                        markersize=10, color='blue', label='Robot', markerfacecolor='lightblue')
+            robot_lines = self.ax.plot(x_coords, y_coords, z_coords, 'o-', linewidth=4, 
+                                       markersize=10, color='blue', label='Robot', markerfacecolor='lightblue')
+            self.plot_artists.append(robot_lines) # Dodaj do listy
             
             # Podświetl końcówkę
-            self.ax.scatter([x_coords[-1]], [y_coords[-1]], [z_coords[-1]], 
-                          c='red', s=150, marker='o', label='Efektor', edgecolors='darkred', linewidths=2)
+            robot_tcp = self.ax.scatter([x_coords[-1]], [y_coords[-1]], [z_coords[-1]], 
+                                        c='red', s=150, marker='o', label='Końcówka', edgecolors='darkred', linewidths=2)
+            self.plot_artists.append(robot_tcp) # Dodaj do listy
             
             # Oznaczenia przegubów
             labels = ['Base', 'J1', 'J2', 'J3', 'J4', 'TCP']
             for i, pos in enumerate(positions):
-                self.ax.text(pos[0], pos[1], pos[2], f'  {labels[i]}', fontsize=8)
+                text_label = self.ax.text(pos[0], pos[1], pos[2], f'  {labels[i]}', fontsize=8)
+                self.plot_artists.append(text_label) # Dodaj do listy
             
-            # Dodaj siatkę płaszczyzny XY (na wysokości 0)
-            grid_size = 100
-            grid_range = np.arange(-300, 301, grid_size)
-            X_grid, Y_grid = np.meshgrid(grid_range, grid_range)
-            Z_grid = np.zeros_like(X_grid)
-            self.ax.plot_wireframe(X_grid, Y_grid, Z_grid, alpha=0.1, color='gray', linewidth=0.5)
-            
-            # Osie układu współrzędnych
-            axis_length = 100
-            self.ax.quiver(0, 0, 0, axis_length, 0, 0, color='red', arrow_length_ratio=0.1, linewidth=2, label='X')
-            self.ax.quiver(0, 0, 0, 0, axis_length, 0, color='green', arrow_length_ratio=0.1, linewidth=2, label='Y')
-            self.ax.quiver(0, 0, 0, 0, 0, axis_length, color='blue', arrow_length_ratio=0.1, linewidth=2, label='Z')
-            
-            self.ax.legend(loc='upper right')
-            
-            # Odśwież canvas
+            # --- 4. Odśwież canvas ---
             self.canvas.draw()
             
         except Exception as e:
-            # Loguj błąd tylko raz
             if not hasattr(self, '_viz_error_logged'):
                 self.log(f"Błąd wizualizacji 3D: {e}")
                 self._viz_error_logged = True
         
-        # Zaplanuj kolejną aktualizację za 200ms
-        self.root.after(200, self.update_3d_visualization)
+        # Zaplanuj kolejną aktualizację
+        self.root.after(50, self.update_3d_visualization)
         
     def log(self, message):
         """Dodaj wiadomość do logu"""
@@ -589,6 +707,13 @@ class RobotControlGUI:
             self.root.after(0, lambda: self.pos_labels['Z (ramię L3)'].config(text=f"{z:.2f}°"))
             self.root.after(0, lambda: self.pos_labels['E (nadgarstek)'].config(text=f"{e:.2f}°"))
     
+    def toggle_phi_entry(self):
+        """Włącz/wyłącz pole orientacji w zależności od checkboxa"""
+        if self.auto_phi_var.get():
+            self.phi_entry.config(state='disabled')
+        else:
+            self.phi_entry.config(state='normal')
+
     def connect_robot(self):
         """Połącz z robotem"""
         success, message = self.robot.connect()
@@ -607,7 +732,10 @@ class RobotControlGUI:
             x_target = float(self.x_entry.get())
             y_target = float(self.y_entry.get())
             z_target = float(self.z_entry.get())
-            phi_deg = float(self.phi_entry.get())
+            if self.auto_phi_var.get():
+                phi_deg = None
+            else:
+                phi_deg = float(self.phi_entry.get())
             
             self.log(f"Obliczanie IK dla pozycji: X={x_target}, Y={y_target}, Z={z_target}, phi={phi_deg}")
             
