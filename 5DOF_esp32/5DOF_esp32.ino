@@ -54,7 +54,7 @@ const unsigned long YA_SYNC_CHECK_INTERVAL = 500; // Sprawdzanie co 500ms
 const float ANGLE_TOLERANCE = 0.5; // Tolerancja osiągnięcia celu [°]
 const unsigned int STEP_DELAY = 1000; // Opóźnienie między krokami [µs]
 const unsigned long ENCODER_READ_INTERVAL = 50;
-const unsigned long PYTHON_SEND_INTERVAL = 500;
+const unsigned long PYTHON_SEND_INTERVAL = 50;
 
 unsigned long lastEncoderRead = 0;
 unsigned long lastPythonSend = 0;
@@ -249,7 +249,7 @@ void readEncoders() {
             for (int i = 0; i < 5; i++) {
                 // Prosta symulacja: powolne podążanie za targetAngles
                 float error = targetAngles[i] - currentAngles[i];
-                float velocity = constrain(error * 2.0, -20.0, 20.0);  // max 5°/s
+                float velocity = constrain(error * 2.0, -20.0, 20.0);  // max 20°/s
                 currentAngles[i] += velocity * dt;
                 
                 // Aktualizacja rotation count
