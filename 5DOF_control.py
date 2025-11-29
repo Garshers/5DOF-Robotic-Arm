@@ -590,11 +590,25 @@ class RobotControlGUI:
         position_frame = ttk.LabelFrame(left_frame, text="Aktualna pozycja", padding="10")
         position_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=5)
         
+        # Wiersz 0: Kąty (istniejące)
         self.pos_labels = {}
         for i, axis in enumerate(['X', 'Y', 'Z', 'E', 'A']):
             ttk.Label(position_frame, text=axis + ":").grid(row=0, column=i, sticky=tk.W, pady=2)
             self.pos_labels[axis] = ttk.Label(position_frame, text="0.00°", font=('Arial', 10))
             self.pos_labels[axis].grid(row=0, column=i, sticky=tk.W, padx=10)
+
+        # Wiersz 1: Separator
+        ttk.Separator(position_frame, orient='horizontal').grid(row=1, column=0, columnspan=5, sticky='ew', pady=5)
+
+        # Wiersz 2: Pozycja XYZ Efektora (TCP)
+        self.tcp_labels = {}
+        tcp_axes = ['TCP_X', 'TCP_Y', 'TCP_Z']
+        for i, axis in enumerate(tcp_axes):
+            # Wyświetlanie etykiet TCP w szerszych odstępach
+            col_idx = i * 2 
+            ttk.Label(position_frame, text=axis.replace("TCP_", "") + " [mm]:").grid(row=2, column=col_idx, sticky=tk.W, pady=2)
+            self.tcp_labels[axis] = ttk.Label(position_frame, text="0.00", font=('Arial', 10, 'bold'), foreground="#377df0")
+            self.tcp_labels[axis].grid(row=2, column=col_idx+1, sticky=tk.W, padx=5)
 
         # Kąty docelowe (wynik IK)
         self.angles_frame = ttk.LabelFrame(left_frame, text="Kąty docelowe (wynik IK)", padding="10")
@@ -867,11 +881,34 @@ class RobotControlGUI:
         
         if angles:
             x, y, z, e, a = angles
+            # Aktualizacja etykiet kątowych (istniejąca logika)
             self.root.after(0, lambda: self.pos_labels['X'].config(text=f"{x:.2f}°"))
             self.root.after(0, lambda: self.pos_labels['Y'].config(text=f"{y:.2f}°"))
             self.root.after(0, lambda: self.pos_labels['Z'].config(text=f"{z:.2f}°"))
             self.root.after(0, lambda: self.pos_labels['E'].config(text=f"{e:.2f}°"))
             self.root.after(0, lambda: self.pos_labels['A'].config(text=f"{a:.2f}°"))
+
+            # Obliczanie Kinematyki Prostej (FK) dla wyświetlenia TCP
+            try:
+                # 1. Konwersja kątów na radiany (zakładamy mapowanie: X->th1, Y->th2, Z->th3, E->th4)
+                th1_rad = math.radians(x)
+                th2_rad = math.radians(y)
+                th3_rad = math.radians(z)
+                th4_rad = math.radians(e)
+
+                # 2. Wywołanie funkcji FK (tej samej, co do rysowania 3D)
+                positions = get_joint_positions(th1_rad, th2_rad, th3_rad, th4_rad)
+                
+                # 3. Ostatni element tablicy positions to współrzędne końcówki (TCP)
+                tcp_pos = positions[-1] 
+
+                # 4. Aktualizacja GUI
+                self.root.after(0, lambda: self.tcp_labels['TCP_X'].config(text=f"{tcp_pos[0]:.2f}"))
+                self.root.after(0, lambda: self.tcp_labels['TCP_Y'].config(text=f"{tcp_pos[1]:.2f}"))
+                self.root.after(0, lambda: self.tcp_labels['TCP_Z'].config(text=f"{tcp_pos[2]:.2f}"))
+            except Exception as err:
+                # Zabezpieczenie przed błędami matematycznymi, aby nie "zamrozić" GUI
+                print(f"[GUI ERROR] Błąd obliczania TCP: {err}")
     
     def toggle_phi_entry(self):
         """Włącz/wyłącz pole orientacji w zależności od checkboxa"""
