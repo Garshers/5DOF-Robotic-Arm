@@ -942,7 +942,7 @@ class RobotControlGUI:
             success, message = self.robot.send_target_angles(th1, th2, th3, th4)
             if success:
                 self.log(message)
-                self.log("✓ Pozycja wysłana pomyślnie")
+                self.log("Pozycja wysłana pomyślnie")
             else:
                 self.log(message)
                 messagebox.showerror("Błąd komunikacji", message)
@@ -988,7 +988,7 @@ class RobotControlGUI:
             self.angle_value_labels[joint_key].config(foreground='green')
             # Zaloguj usunięcie kolizji
             if hasattr(self, '_last_collision_state') and self._last_collision_state:
-                self.log("✓ Kolizja usunięta - pozycja bezpieczna")
+                self.log("Kolizja usunięta - pozycja bezpieczna")
             self._last_collision_state = False
     
     def switch_control_mode(self):
@@ -1053,45 +1053,51 @@ class RobotControlGUI:
             return
         
         try:
-            # Pobierz wartości z suwaków (w stopniach)
+            # --- 1. SZYBKA PĘTLA: Pobieranie danych i sprawdzanie bezpieczeństwa ---
             th1_deg = self.angle_sliders['th1'].get()
             th2_deg = self.angle_sliders['th2'].get()
             th3_deg = self.angle_sliders['th3'].get()
             th4_deg = self.angle_sliders['th4'].get()
             
-            # Konwersja na radiany
             th1 = math.radians(th1_deg)
             th2 = math.radians(th2_deg)
             th3 = math.radians(th3_deg)
             th4 = math.radians(th4_deg)
             
-            # Czy jakikolwiek punkt jest pod stołem (Z < 0)
+            # Sprawdzenie kolizji (wykonywane w każdym obiegu pętli, np. co 50ms)
             positions = get_joint_positions(th1, th2, th3, th4)
             min_z = np.min(positions[:, 2])
             
             if min_z < 0:
-                # Wykryto kolizję - BLOKADA TRANSMISJI
                 if not hasattr(self, '_collision_warning_shown') or not self._collision_warning_shown:
                     self.log(f"CRITICAL: Wykryto kolizję (Z = {min_z:.2f} mm). Ruch zablokowany.")
                     self._collision_warning_shown = True
                 
-                # Nie wysyłamy danych do Serial, tylko planujemy kolejne sprawdzenie
-                self.angle_send_timer = self.root.after(100, self.send_angles_continuously)
+                # Przy kolizji sprawdzamy ponownie szybko (50ms), ale nie wysyłamy
+                self.angle_send_timer = self.root.after(50, self.send_angles_continuously)
                 return
 
-            # Jeśli brak kolizji, zresetuj flagę ostrzeżenia
             if hasattr(self, '_collision_warning_shown') and self._collision_warning_shown:
                 self.log("✓ Strefa bezpieczna. Wznowiono transmisję.")
                 self._collision_warning_shown = False
             
-            # Wyślij do robota (Safety Check pozytywny)
-            success, message = self.robot.send_target_angles(th1, th2, th3, th4)
+            # --- 2. WOLNA PĘTLA: Transmisja danych (Rate Limiting) ---
+            import time
+            current_time = time.time()
+            if not hasattr(self, '_last_send_time'):
+                self._last_send_time = 0
+
+            # Wysyłaj tylko jeśli minęło 200ms od ostatniego wysłania
+            if current_time - self._last_send_time >= 0.2:
+                success, message = self.robot.send_target_angles(th1, th2, th3, th4)
+                if success:
+                    self._last_send_time = current_time
             
         except Exception as e:
             self.log(f"Błąd pętli sterowania: {e}")
         
-        # Zaplanuj następne wysłanie za 100ms
-        self.angle_send_timer = self.root.after(100, self.send_angles_continuously)
+        # Pętla główna działa szybko (50ms), aby płynnie wykrywać kolizje
+        self.angle_send_timer = self.root.after(50, self.send_angles_continuously)
     
     def on_closing(self):
         """Zamknięcie aplikacji"""

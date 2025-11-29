@@ -3,9 +3,9 @@
 #include <AccelStepper.h>
 
 // ==================== Tryb symulacji ====================
-#define SIMULATION_MODE false  // false = prawdziwe enkodery
+#define SIMULATION_MODE false
 
-// ==================== Podstawowe ustawienia systemowe =====================
+// ==================== Podstawowe ustawienia ====================
 #define BAUD 115200
 
 // ======================= Piny silników ======================
@@ -31,7 +31,7 @@ AccelStepper motorE(AccelStepper::DRIVER, STEP_E, DIR_E);
 #define LIMIT_Z_PIN 34
 #define LIMIT_E_PIN 35
 
-// ===================== Konfiguracja enkoderów I2C ======================
+// ===================== Konfiguracja I2C ======================
 #define SDA_PIN 21
 #define SCL_PIN 22
 
@@ -40,217 +40,72 @@ const int AS5600_ADDR = 0x36;
 const int AS5600_RAW_ANGLE_HIGH = 0x0C;
 
 const bool ENCODER_INVERT[] = {true, false, true, true, false}; // [E, Z, Y, A, X]
-const uint8_t ENCODER_CHANNEL[] = {4, 5, 6, 7, 3}; // [E, Z, Y, A, X]
-const float ENCODER_LEVER[] = {2.0, 3.6, 4.5, 4.5, 4.0}; // Przełożenia
-uint16_t ENCODER_ZPOS[] = {0, 0, 0, 0, 0}; // Raw angle w pozycji startowej
-int16_t rotationCount[] = {0, 0, 0, 0, 0}; // Liczniki obrotów
-uint16_t lastRawAngle[] = {0, 0, 0, 0, 0}; // Poprzednie odczyty
-const float angleConst = 360.0 / 4096.0; // Przelicznik raw->stopnie
+const uint8_t ENCODER_CHANNEL[] = {4, 5, 6, 7, 3};
+const float ENCODER_LEVER[] = {2.0, 3.6, 4.5, 4.5, 4.0};
 
-// ===================== Kąty startowe (pozycja początkowa robota) ======================
-// Fizyczne kąty stawów w pozycji startowej
+// ===================== Zmienne współdzielone (z mutex) ======================
+SemaphoreHandle_t xMutex;
+
+// Chronione przez mutex
+volatile float currentAngles[5] = {0.0, 0.0, 0.0, 0.0, 0.0}; // [E, Z, Y, A, X]
+volatile float targetAngles[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+volatile bool newTargetAvailable = false;
+
+// Dane enkoderów (tylko rdzeń 0)
+uint16_t ENCODER_ZPOS[] = {0, 0, 0, 0, 0};
+int16_t rotationCount[] = {0, 0, 0, 0, 0};
+uint16_t lastRawAngle[] = {0, 0, 0, 0, 0};
+const float angleConst = 360.0 / 4096.0;
+
+// ===================== Kąty startowe ======================
 const float START_ANGLES[5] = {90.0, 90.0, 135.0, 135.0, 0.0}; // [E, Z, Y, A, X]
 
-// ===================== Zmienne sterowania pozycyjnego ======================
-float currentAngles[5] = {0.0, 0.0, 0.0, 0.0, 0.0}; // [E, Z, Y, A, X] - aktualne kąty fizyczne
-float targetAngles[5] = {0.0, 0.0, 0.0, 0.0, 0.0}; // [E, Z, Y, A, X] - docelowe kąty fizyczne
-int32_t targetRawAngles[5] = {0, 0, 0, 0, 0}; // Docelowe raw angle z uwzględnieniem obrotów
-unsigned long lastStepTime[5] = {0, 0, 0, 0, 0};
-
-// ===================== Odwrócenie kierunku dla wybranych osi ======================
-// true = odwrócony kierunek, false = normalny kierunek
-const bool AXIS_INVERT[] = {false, true, false, true, false}; // [E, Z, Y, A, X]
-
-// ===================== Synchronizacja Y i A ======================
-const float YA_SYNC_TOLERANCE = 1.0; // Maksymalna różnica między Y i A [°]
-unsigned long lastYASync = 0;
-const unsigned long YA_SYNC_CHECK_INTERVAL = 500; // Sprawdzanie co 500ms
-
 // ===================== Parametry sterowania ======================
-const float ANGLE_TOLERANCE = 0.5; // Tolerancja osiągnięcia celu [°]
-const unsigned int STEP_DELAY = 1000; // Opóźnienie między krokami [µs]
+const bool AXIS_INVERT[] = {false, true, false, true, false};
+const float ANGLE_TOLERANCE = 0.05;
 const unsigned long ENCODER_READ_INTERVAL = 50;
 const unsigned long PYTHON_SEND_INTERVAL = 50;
 
-unsigned long lastEncoderRead = 0;
-unsigned long lastPythonSend = 0;
+// ================== Parametry silnika krokowego ==================
+const float STEPS_PER_REV = 200.0;  // Silnik 1.8 stopnia
+const float MICROSTEPS = 1.0;//16.0;      // Ustawienie sterownika
+const float STEPS_PER_MOTOR_REV = STEPS_PER_REV * MICROSTEPS; // 3200 kroków/obrót silnika
 
-// ===================== Zmienne komunikacji Serial ======================
+// Bufory komunikacji (tylko rdzeń 0)
 String serialBuffer = "";
 
 // =========================================================================
-// --------------------------------- SETUP ---------------------------------
+// ----------------------------- RDZEŃ 0 -----------------------------------
+// ---------------------- KOMUNIKACJA I ENKODERY ---------------------------
 // =========================================================================
 
-void setup() {
-    Serial.begin(BAUD);
-    Wire.begin(SDA_PIN, SCL_PIN);
-    Wire.setClock(400000); // I2C Fast Mode
+void communicationTask(void *parameter) {
+    unsigned long lastEncoderRead = 0;
+    unsigned long lastPythonSend = 0;
     
-    // Konfiguracja pinów silników
-    pinMode(STEP_X, OUTPUT);
-    pinMode(DIR_X, OUTPUT);
-    pinMode(STEP_Y, OUTPUT);
-    pinMode(DIR_Y, OUTPUT);
-    pinMode(STEP_A, OUTPUT);
-    pinMode(DIR_A, OUTPUT);
-    pinMode(STEP_Z, OUTPUT);
-    pinMode(DIR_Z, OUTPUT);
-    pinMode(STEP_E, OUTPUT);
-    pinMode(DIR_E, OUTPUT);
-
-    // Konfiguracja krańcówek
-    pinMode(LIMIT_X_PIN, INPUT_PULLUP);
-    pinMode(LIMIT_Y_PIN, INPUT_PULLUP);
-    pinMode(LIMIT_Z_PIN, INPUT_PULLUP);
-    pinMode(LIMIT_E_PIN, INPUT_PULLUP);
-
-    delay(500);
+    Serial.println("✓ Rdzeń 0: Task komunikacyjny uruchomiony");
     
-    Serial.println("=== Inicjalizacja ESP32 - Sterowanie enkoderowe ===");
-    
-    const char* axisNames[] = {"E", "Z", "Y", "A", "X"};
-    
-    // Wyświetlenie kątów startowych
-    Serial.println("Kąty startowe (fizyczne):");
-    Serial.printf("  E=%.1f° Z=%.1f° Y=%.1f° A=%.1f° X=%.1f°\n",
-                  START_ANGLES[0], START_ANGLES[1], START_ANGLES[2], START_ANGLES[3], START_ANGLES[4]);
-    
-    // Odczyt pozycji zerowych enkoderów (w pozycji startowej)
-    Serial.println("Kalibracja enkoderów w pozycji startowej...");
-    for(int i = 0; i < 5; i++) {
-        uint16_t rawReading = getEncoderRawAngle(ENCODER_CHANNEL[i]);
+    while (true) {
+        unsigned long now = millis();
         
-        if(rawReading == 0xFFFF) {
-            Serial.printf("❌ BŁĄD: Enkoder %s (kanał %d) nie odpowiada!\n", 
-                          axisNames[i], ENCODER_CHANNEL[i]);
-            ENCODER_ZPOS[i] = 0;
-        } else {
-            // Zapisujemy surowy odczyt jako pozycję zerową (startową)
-            ENCODER_ZPOS[i] = rawReading;
-            Serial.printf("✓ Enkoder %s: raw=%d (start=%.1f°)\n", 
-                          axisNames[i], ENCODER_ZPOS[i], START_ANGLES[i]);
+        // ===== Odczyt komend z Pythona =====
+        readSerialCommands();
+        
+        // ===== Odczyt enkoderów =====
+        if (now - lastEncoderRead >= ENCODER_READ_INTERVAL) {
+            lastEncoderRead = now;
+            readEncoders();
         }
         
-        lastRawAngle[i] = ENCODER_ZPOS[i];
-        rotationCount[i] = 0; // Startujemy z licznikiem obrotów = 0
-        
-        // Ustawienie początkowych kątów jako kąty startowe
-        currentAngles[i] = START_ANGLES[i];
-        targetAngles[i] = START_ANGLES[i];
-    }
-    
-    // Obliczenie początkowych targetRawAngles (pozycja startowa)
-    for(int i = 0; i < 5; i++) {
-        calculateTargetRaw(i, START_ANGLES[i]);
-    }
-    
-    Serial.println("✓ Inicjalizacja zakończona. Oczekiwanie na ramki z Pythona...");
-}
-
-// =========================================================================
-// --------------------------------- LOOP ----------------------------------
-// =========================================================================
-
-void testMotor(AccelStepper& motor, const char* motorName, 
-               long steps, float maxSpeed, float acceleration, 
-               bool returnToZero = true, int delayAfter = 1000) {
-    
-    Serial.printf("=== TEST: Silnik %s ===\n", motorName);
-    Serial.printf("Parametry: %ld kroków, %.0f kr/s, %.0f kr/s²\n", 
-                  steps, maxSpeed, acceleration);
-    
-    // Konfiguracja parametrów ruchu
-    motor.setMaxSpeed(maxSpeed);
-    motor.setAcceleration(acceleration);
-    
-    long startPos = motor.currentPosition();
-    long targetPos = startPos + steps;
-    
-    // ===== Ruch do celu =====
-    Serial.printf(" -> Ruch z pozycji %ld do %ld\n", startPos, targetPos);
-    motor.moveTo(targetPos);
-    
-    unsigned long startTime = millis();
-    long lastReportPos = startPos;
-    
-    while (motor.distanceToGo() != 0) {
-        motor.run();
-        
-        // Raportuj postęp co 10 kroków
-        long currentPos = motor.currentPosition();
-        if (abs(currentPos - lastReportPos) >= 10) {
-            Serial.printf("   Pozycja: %ld / %ld\n", currentPos, targetPos);
-            lastReportPos = currentPos;
-        }
-    }
-    
-    unsigned long duration = millis() - startTime;
-    Serial.printf(" -> Osiągnięto pozycję: %ld (czas: %lu ms)\n", 
-                  motor.currentPosition(), duration);
-    
-    if (delayAfter > 0) {
-        Serial.printf(" -> Czekam %d ms...\n", delayAfter);
-        delay(delayAfter);
-    }
-    
-    // ===== Opcjonalny powrót =====
-    if (returnToZero) {
-        Serial.printf(" -> Powrót do pozycji startowej (%ld)\n", startPos);
-        motor.moveTo(startPos);
-        
-        startTime = millis();
-        lastReportPos = motor.currentPosition();
-        
-        while (motor.distanceToGo() != 0) {
-            motor.run();
-            
-            long currentPos = motor.currentPosition();
-            if (abs(currentPos - lastReportPos) >= 10) {
-                Serial.printf("   Pozycja: %ld / %ld\n", currentPos, startPos);
-                lastReportPos = currentPos;
-            }
+        // ===== Wysyłanie pozycji do Pythona =====
+        if (now - lastPythonSend >= PYTHON_SEND_INTERVAL) {
+            lastPythonSend = now;
+            sendPositionToPython();
         }
         
-        duration = millis() - startTime;
-        Serial.printf(" -> Osiągnięto pozycję: %ld (czas: %lu ms)\n", 
-                      motor.currentPosition(), duration);
-    }
-    
-    Serial.printf("=== KONIEC TESTU: %s ===\n\n", motorName);
-}
-
-void loop() {
-    unsigned long now = millis();
-    
-    // Odczyt komend z Pythona przez Serial
-    readSerialCommands();
-    
-    // Odczyt enkoderów i aktualizacja pozycji
-    if (now - lastEncoderRead >= ENCODER_READ_INTERVAL) {
-        lastEncoderRead = now;
-        readEncoders();
-    }
-    
-    // Sprawdzenie synchronizacji Y i A
-    if (now - lastYASync >= YA_SYNC_CHECK_INTERVAL) {
-        lastYASync = now;
-        //checkYASync();
-    }
-    
-    // TESTOWANIE
-    testMotor(motorX, "X", 100, 500, 200, true, 1000);
-    
-    // Wysyłanie aktualnych pozycji do Pythona
-    if (now - lastPythonSend >= PYTHON_SEND_INTERVAL) {
-        lastPythonSend = now;
-        sendPositionToPython();
+        vTaskDelay(1); // Oddanie czasu procesorowi (1ms)
     }
 }
-
-// =========================================================================
-// -------------------------- FUNKCJE GŁÓWNE -------------------------------
-// =========================================================================
 
 void readSerialCommands() {
     while (Serial.available() > 0) {
@@ -267,14 +122,20 @@ void readSerialCommands() {
     }
 }
 
-void parsePythonCommand(String cmd){
-    // Format: X12.34,Y45.67,Z78.90,E12.34
-    // Kąty od Pythona są RELATYWNE względem pozycji startowej (0 = pozycja startowa)
+void parsePythonCommand(String cmd) {
     cmd.trim();
     
     int startIdx = 0;
     bool validCommand = false;
+    float newTargets[5];
     
+    // Kopiuj aktualne cele
+    if (xSemaphoreTake(xMutex, portMAX_DELAY)) {
+        memcpy(newTargets, (void*)targetAngles, sizeof(newTargets));
+        xSemaphoreGive(xMutex);
+    }
+    
+    // Parsowanie
     while (startIdx < cmd.length()) {
         int commaIdx = cmd.indexOf(',', startIdx);
         String axisData;
@@ -292,79 +153,59 @@ void parsePythonCommand(String cmd){
         char axis = axisData.charAt(0);
         float relativeAngle = axisData.substring(1).toFloat();
         
-        // Konwersja: kąt relatywny -> kąt fizyczny (absolutny)
         switch (axis) {
             case 'X': case 'x':
-                targetAngles[4] = relativeAngle + START_ANGLES[4]; // Indeks 4 = X
-                calculateTargetRaw(4, targetAngles[4]);
+                newTargets[4] = relativeAngle + START_ANGLES[4];
                 validCommand = true;
                 break;
-            case 'Y': case 'y': // Y kontroluje ramię A (L2)
-                targetAngles[3] = relativeAngle + START_ANGLES[3];
-                targetAngles[2] = relativeAngle + START_ANGLES[2]; // Y i A synchronicznie
-                calculateTargetRaw(2, targetAngles[2]);
-                calculateTargetRaw(3, targetAngles[3]);
+            case 'Y': case 'y':
+                newTargets[3] = relativeAngle + START_ANGLES[3];
+                newTargets[2] = relativeAngle + START_ANGLES[2];
                 validCommand = true;
                 break;
-            case 'Z': case 'z': // Z kontroluje ramię Z (L3)
-                targetAngles[1] = relativeAngle + START_ANGLES[1];
-                calculateTargetRaw(1, targetAngles[1]);
+            case 'Z': case 'z':
+                newTargets[1] = relativeAngle + START_ANGLES[1];
                 validCommand = true;
                 break;
-            case 'E': case 'e': // E kontroluje nadgarstek
-                targetAngles[0] = relativeAngle + START_ANGLES[0];
-                calculateTargetRaw(0, targetAngles[0]);
+            case 'E': case 'e':
+                newTargets[0] = relativeAngle + START_ANGLES[0];
                 validCommand = true;
                 break;
         }
     }
     
+    // Zapisz nowe cele (chronione mutexem)
     if (validCommand) {
-        Serial.println("✓ Otrzymano nowe kąty docelowe (fizyczne):");
+        if (xSemaphoreTake(xMutex, portMAX_DELAY)) {
+            memcpy((void*)targetAngles, newTargets, sizeof(newTargets));
+            newTargetAvailable = true;
+            xSemaphoreGive(xMutex);
+        }
+        
+        Serial.println("✓ Nowe kąty docelowe:");
         Serial.printf("   E=%.2f° Z=%.2f° Y=%.2f° X=%.2f°\n", 
-                      targetAngles[0], targetAngles[1], targetAngles[3], targetAngles[4]);
+                      newTargets[0], newTargets[1], newTargets[3], newTargets[4]);
     }
-}
-
-void calculateTargetRaw(int axisIndex, float targetPhysicalAngle) {
-    float angleDifference = targetPhysicalAngle - START_ANGLES[axisIndex];
-    
-    if (ENCODER_INVERT[axisIndex]) {
-        angleDifference = -angleDifference;
-    }
-
-    float encoderAngleDifference = angleDifference * ENCODER_LEVER[axisIndex];
-    
-    // Rozbicie na pełne obroty i kąt w aktualnym obrocie
-    int32_t fullRotations = (int32_t)floor(encoderAngleDifference / 360.0);
-    float remainingAngle = encoderAngleDifference - (fullRotations * 360.0);
-    
-    // Przeliczenie na raw angle (0-4095)
-    int32_t rawInRotation = (int32_t)(remainingAngle / angleConst);
-    
-    // Dodanie offsetu zerowego
-    rawInRotation = (rawInRotation + ENCODER_ZPOS[axisIndex]) % 4096;
-    
-    // Całkowity raw angle (z obrotami)
-    targetRawAngles[axisIndex] = (fullRotations * 4096) + rawInRotation;
 }
 
 void sendPositionToPython() {
-    // Format: <E12.34,Z45.67,Y78.90,X0.00>
-    // (Python otrzymuje <90,90,135,0> gdy robot jest w pozycji startowej)
+    float angles[5];
+    
+    // Bezpieczne skopiowanie danych
+    if (xSemaphoreTake(xMutex, portMAX_DELAY)) {
+        memcpy(angles, (void*)currentAngles, sizeof(angles));
+        xSemaphoreGive(xMutex);
+    }
+    
     String frame = "<";
-    frame += "E" + String(currentAngles[0], 2) + ",";
-    frame += "Z" + String(currentAngles[1], 2) + ",";
-    frame += "Y" + String(currentAngles[3], 2) + ","; // Wysyłamy kąt A jako Y
-    frame += "X" + String(currentAngles[4], 2);
+    frame += "E" + String(angles[0], 2) + ",";
+    frame += "Z" + String(angles[1], 2) + ",";
+    frame += "Y" + String(angles[3], 2) + ",";
+    frame += "X" + String(angles[4], 2);
     frame += ">";
     
     Serial.println(frame);
 }
-
-// =========================================================================
-// -------------------------- FUNKCJE ENKODERÓW ----------------------------
-// =========================================================================
 
 void readEncoders() {
     #if SIMULATION_MODE
@@ -372,61 +213,263 @@ void readEncoders() {
         static uint32_t lastUpdate = 0;
         uint32_t now = millis();
         
-        if (now - lastUpdate > 50) {  // Aktualizacja co 50ms
+        if (now - lastUpdate > 50) {
             float dt = (now - lastUpdate) / 1000.0;
             lastUpdate = now;
             
+            float tempCurrent[5], tempTarget[5];
+            
+            if (xSemaphoreTake(xMutex, portMAX_DELAY)) {
+                memcpy(tempCurrent, (void*)currentAngles, sizeof(tempCurrent));
+                memcpy(tempTarget, (void*)targetAngles, sizeof(tempTarget));
+                xSemaphoreGive(xMutex);
+            }
+            
             for (int i = 0; i < 5; i++) {
-                // Prosta symulacja: powolne podążanie za targetAngles
-                float error = targetAngles[i] - currentAngles[i];
-                float velocity = constrain(error * 2.0, -20.0, 20.0);  // max 20°/s
-                currentAngles[i] += velocity * dt;
-                
-                // Przeliczenie na raw angle z obrotami
-                float angleDifference = currentAngles[i] - START_ANGLES[i];
-                float encoderAngleDifference = angleDifference * ENCODER_LEVER[i];
-                
-                rotationCount[i] = (int32_t)(encoderAngleDifference / 360.0);
-                float remainingAngle = fmod(encoderAngleDifference, 360.0);
-                if (remainingAngle < 0) remainingAngle += 360.0;
-                
-                // Konwersja na raw angle (0-4095)
-                uint16_t rawAngleAdjusted = (uint16_t)(remainingAngle / angleConst);
-                lastRawAngle[i] = (rawAngleAdjusted + ENCODER_ZPOS[i]) % 4096;
+                float error = tempTarget[i] - tempCurrent[i];
+                float velocity = constrain(error * 2.0, -20.0, 20.0);
+                tempCurrent[i] += velocity * dt;
+            }
+            
+            if (xSemaphoreTake(xMutex, portMAX_DELAY)) {
+                memcpy((void*)currentAngles, tempCurrent, sizeof(tempCurrent));
+                xSemaphoreGive(xMutex);
             }
         }
     #else
         // PRAWDZIWE ENKODERY
+        float tempAngles[5];
+        
         for (int i = 0; i < 5; i++) {
             uint16_t rawAngle = getEncoderRawAngle(ENCODER_CHANNEL[i]);
             
-            if (rawAngle == 0xFFFF) { continue; }
+            if (rawAngle == 0xFFFF) { 
+                tempAngles[i] = currentAngles[i]; // Zachowaj ostatnią wartość
+                continue; 
+            }
             
-            // Aktualizacja licznika obrotów (wykrycie przejścia przez zero)
             updateRotationCount(i, rawAngle);
             
-            // Obliczenie całkowitego raw angle (z obrotami)
             int32_t totalRawAngle = rawAngle + (rotationCount[i] * 4096);
-            
-            // Obliczenie różnicy od pozycji startowej
             int32_t rawDifference = totalRawAngle - ENCODER_ZPOS[i];
-            
-            // Przeliczenie różnicy raw angle na kąt enkodera (w stopniach)
             float encoderAngleDifference = (rawDifference / 4096.0) * 360.0;
             
-            // Uwzględnienie kierunku inkrementacji przed przełożeniem
             if (ENCODER_INVERT[i]) {
                 encoderAngleDifference = -encoderAngleDifference;
             }
-
-            // Przeliczenie na kąt fizyczny ramienia (przez przełożenie)
-            float armAngleDifference = encoderAngleDifference / ENCODER_LEVER[i];
             
-            // Kąt fizyczny = kąt startowy + różnica
-            currentAngles[i] = START_ANGLES[i] + armAngleDifference;
+            float armAngleDifference = encoderAngleDifference / ENCODER_LEVER[i];
+            tempAngles[i] = START_ANGLES[i] + armAngleDifference;
+        }
+        
+        // Aktualizacja chronionej zmiennej
+        if (xSemaphoreTake(xMutex, portMAX_DELAY)) {
+            memcpy((void*)currentAngles, tempAngles, sizeof(tempAngles));
+            xSemaphoreGive(xMutex);
         }
     #endif
 }
+
+// =========================================================================
+// ----------------------------- RDZEŃ 1 -----------------------------------
+// ------------------------ STEROWANIE SILNIKAMI ---------------------------
+// =========================================================================
+
+void motorControlTask(void *parameter) {
+    long targetSteps[5] = {0, 0, 0, 0, 0};
+    float localTargetAngles[5];
+    float localCurrentAngles[5];
+    float stepsPerDegree[5];
+    
+    // Niezależne timery dla każdej osi w celu uniknięcia oscylacji
+    unsigned long lastAxisCorrectionTime[5] = {0, 0, 0, 0, 0};
+    const unsigned long CORRECTION_INTERVAL = 200; 
+    
+    // Wskaźniki na obiekty silników
+    AccelStepper* motors[5] = {&motorE, &motorZ, &motorY, &motorA, &motorX};
+
+    // Konfiguracja silników
+    float baseSpeed = 200;
+    float baseAcceleration = 100;
+    
+    for(int i=0; i<5; i++) {
+        motors[i]->setMaxSpeed(baseSpeed * ENCODER_LEVER[i]);
+        motors[i]->setAcceleration(baseAcceleration * ENCODER_LEVER[i]);
+        stepsPerDegree[i] = (STEPS_PER_MOTOR_REV * ENCODER_LEVER[i]) / 360.0;
+    }
+    
+    Serial.println("✓ Rdzeń 1: Task sterowania z absolutną korekcją (moveTo) uruchomiony");
+    
+    while (true) {
+        unsigned long currentMillis = millis();
+
+        // ===== 1. Pobieranie danych (Setpoints & Feedback) =====
+        bool hasNewTarget = false;
+        if (xSemaphoreTake(xMutex, 10 / portTICK_PERIOD_MS)) {
+            if (newTargetAvailable) {
+                memcpy(localTargetAngles, (void*)targetAngles, sizeof(localTargetAngles));
+                newTargetAvailable = false;
+                hasNewTarget = true;
+            }
+            // Aktualizacja sprzężenia zwrotnego pozycji
+            memcpy(localCurrentAngles, (void*)currentAngles, sizeof(localCurrentAngles));
+            xSemaphoreGive(xMutex);
+        }
+        
+        // ===== 2. Sterowanie w pętli zamkniętej (Real-time Closed Loop) =====
+        // Algorytm typu P (Proporcjonalny) korygujący pozycję na podstawie uchybu enkodera
+        for (int i = 0; i < 5; i++) {
+            // Obliczenie uchybu: e(t) = wartość_zadana - wartość_mierzona
+            float error = localTargetAngles[i] - localCurrentAngles[i];
+
+            // Weryfikacja strefy nieczułości (deadband)
+            // Ruch jest inicjowany tylko, gdy błąd przekracza zdefiniowaną tolerancję
+            if (abs(error) > ANGLE_TOLERANCE) {
+                
+                // Przeliczenie uchybu kątowego na kroki (Gain układu)
+                long stepsCorrection = (long)(error * stepsPerDegree[i]);
+
+                // Korekta kierunku (zgodnie z macierzą AXIS_INVERT)
+                if (AXIS_INVERT[i]) {
+                    stepsCorrection = -stepsCorrection;
+                }
+
+                // Aktualizacja wartości zadanej sterownika (Control Variable)
+                // Mechanizm: "Gdzie jesteś teraz (według sterownika) + brakująca odległość (według enkodera)"
+                // To eliminuje problem gubienia kroków, wymuszając ruch do skutku.
+                motors[i]->moveTo(motors[i]->currentPosition() + stepsCorrection);
+                
+                // Opcjonalnie: Reset timera korekcji, jeśli używasz interwałów czasowych
+                lastAxisCorrectionTime[i] = currentMillis;
+            }
+        }
+        
+        // ===== 3. Wykonanie kroków (Motion Profiling) =====
+        for(int i=0; i<5; i++) {
+            motors[i]->run();
+        }
+        
+        vTaskDelay(1); 
+    }
+}
+
+long calculateMotorSteps(int axisIndex, float targetAxisAngle) {
+    // 1. Oblicz różnicę kątową względem pozycji startowej
+    float angleDifference = targetAxisAngle - START_ANGLES[axisIndex];
+    
+    // 2. Uwzględnij odwrócenie kierunku
+    if (AXIS_INVERT[axisIndex]) {
+        angleDifference = -angleDifference;
+    }
+    
+    // 3. Oblicz liczbę obrotów OSI
+    float axisRevolutions = angleDifference / 360.0;
+    
+    // 4. Oblicz liczbę obrotów SILNIKA (uwzględniając przekładnię)
+    // Jeśli oś robi 1 obrót, silnik musi zrobić GEAR_RATIO obrotów
+    float motorRevolutions = axisRevolutions * ENCODER_LEVER[axisIndex];
+    
+    // 5. Przelicz na obrót silnika
+    long totalSteps = (long)(motorRevolutions * STEPS_PER_MOTOR_REV);
+    
+    return totalSteps;
+}
+
+// =========================================================================
+// ------------------------------ SETUP I LOOP------------------------------
+// =========================================================================
+
+void setup() {
+    Serial.begin(BAUD);
+    Wire.begin(SDA_PIN, SCL_PIN);
+    Wire.setClock(400000);
+    
+    // Konfiguracja pinów
+    pinMode(STEP_X, OUTPUT);
+    pinMode(DIR_X, OUTPUT);
+    pinMode(STEP_Y, OUTPUT);
+    pinMode(DIR_Y, OUTPUT);
+    pinMode(STEP_A, OUTPUT);
+    pinMode(DIR_A, OUTPUT);
+    pinMode(STEP_Z, OUTPUT);
+    pinMode(DIR_Z, OUTPUT);
+    pinMode(STEP_E, OUTPUT);
+    pinMode(DIR_E, OUTPUT);
+    
+    pinMode(LIMIT_X_PIN, INPUT_PULLUP);
+    pinMode(LIMIT_Y_PIN, INPUT_PULLUP);
+    pinMode(LIMIT_Z_PIN, INPUT_PULLUP);
+    pinMode(LIMIT_E_PIN, INPUT_PULLUP);
+    
+    delay(500);
+    
+    Serial.println("=== ESP32 Dual-Core Robot Control ===");
+    
+    // Utworzenie mutexu
+    xMutex = xSemaphoreCreateMutex();
+    if (xMutex == NULL) {
+        Serial.println("❌ BŁĄD: Nie można utworzyć mutexu!");
+        while(1);
+    }
+    
+    // Kalibracja enkoderów
+    Serial.println("Kalibracja enkoderów...");
+    const char* axisNames[] = {"E", "Z", "Y", "A", "X"};
+    
+    for(int i = 0; i < 5; i++) {
+        uint16_t rawReading = getEncoderRawAngle(ENCODER_CHANNEL[i]);
+        
+        if(rawReading == 0xFFFF) {
+            Serial.printf("❌ BŁĄD: Enkoder %s nie odpowiada!\n", axisNames[i]);
+            ENCODER_ZPOS[i] = 0;
+        } else {
+            ENCODER_ZPOS[i] = rawReading;
+            Serial.printf("✓ Enkoder %s: raw=%d (start=%.1f°)\n", 
+                          axisNames[i], ENCODER_ZPOS[i], START_ANGLES[i]);
+        }
+        
+        lastRawAngle[i] = ENCODER_ZPOS[i];
+        rotationCount[i] = 0;
+        currentAngles[i] = START_ANGLES[i];
+        targetAngles[i] = START_ANGLES[i];
+    }
+    
+    // Uruchomienie tasków na osobnych rdzeniach
+    Serial.println("Uruchamianie tasków...");
+    
+    // Task komunikacyjny na rdzeniu 0 (ten sam co loop())
+    xTaskCreatePinnedToCore(
+        communicationTask,   // Funkcja
+        "Communication",     // Nazwa
+        10000,              // Stack size (bajty)
+        NULL,               // Parametr
+        1,                  // Priorytet
+        NULL,               // Handle
+        0                   // Rdzeń 0
+    );
+    
+    // Task sterowania na rdzeniu 1
+    xTaskCreatePinnedToCore(
+        motorControlTask,
+        "MotorControl",
+        10000,
+        NULL,
+        2,                  // Wyższy priorytet
+        NULL,
+        1                   // Rdzeń 1
+    );
+    
+    Serial.println("✓ System uruchomiony!");
+}
+
+void loop() {
+    // Loop może pozostać pusty - wszystko dzieje się w taskach
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+}
+
+// =========================================================================
+// ------------------------ FUNKCJE ENKODERÓW ------------------------------
+// =========================================================================
 
 bool selectI2CChannel(uint8_t channel) {
     Wire.beginTransmission(PCA9548A_ADDR);
@@ -455,42 +498,36 @@ bool readAS5600Raw(uint16_t &angle) {
 
 uint16_t getEncoderRawAngle(uint8_t channel) {
     if (!selectI2CChannel(channel)) {
+        Serial.print(F("Error: Failed to select I2C Mux ch: "));
+        Serial.println(channel);
         return 0xFFFF;
     }
-
+    
     if (!isAS5600Available()) {
+        Serial.print(F("Error: AS5600 sensor not found ch: "));
+        Serial.println(channel);
         return 0xFFFF;
     }
-
+    
     uint16_t angle;
     if (!readAS5600Raw(angle)) {
+        Serial.print(F("Error: Failed to read data on ch: "));
+        Serial.println(channel);
         return 0xFFFF;
     }
-
+    
     return angle;
 }
 
 void updateRotationCount(int axisIndex, uint16_t currentRaw) {
     uint16_t lastRaw = lastRawAngle[axisIndex];
     
-    // Wykrycie przejścia 4095->0 (obrót w przód)
     if (lastRaw > 3000 && currentRaw < 1000) {
         rotationCount[axisIndex]++;
     }
-    // Wykrycie przejścia 0->4095 (obrót w tył)
     else if (lastRaw < 1000 && currentRaw > 3000) {
         rotationCount[axisIndex]--;
     }
     
     lastRawAngle[axisIndex] = currentRaw;
-}
-
-// =========================================================================
-// --------------------------- FUNKCJE POMOCNICZE --------------------------
-// =========================================================================
-
-void stepPulse(int stepPin) {
-    digitalWrite(stepPin, HIGH);
-    delayMicroseconds(5);
-    digitalWrite(stepPin, LOW);
 }
