@@ -21,7 +21,7 @@ class RobotSerial:
         self.ser = None
         self.port = port
         self.baudrate = baudrate
-        self.current_angles = [0.0, 0.0, 0.0, 0.0]  # [X, Y, Z, E]
+        self.current_angles = [0.0, 0.0, 0.0, 0.0, 0.0]  # [X, Y, Z, E, A]
         self.running = False
         self.read_thread = None
         self.lock = threading.Lock()
@@ -87,6 +87,7 @@ class RobotSerial:
                                     elif axis == 'Y': self.current_angles[1] = angle
                                     elif axis == 'Z': self.current_angles[2] = angle
                                     elif axis == 'E': self.current_angles[3] = angle
+                                    elif axis == 'A': self.current_angles[4] = angle
                                 except ValueError:
                                     pass
                         
@@ -252,10 +253,10 @@ def inverse_kinematics(R, Z, th1_base, phi_deg=0.0, elbow_up=True, reverse_base=
     
     return (th1, th2, th3, th4)
 
-JOINT_CONST = pi/2*1.05
+JOINT_CONST = pi/2
 JOINT_LIMITS = {
     'th1': (-JOINT_CONST, JOINT_CONST),       # Baza
-    'th2': (-JOINT_CONST, JOINT_CONST),       # Bark
+    'th2': (0           , JOINT_CONST * 1.5), # Bark
     'th3': (-JOINT_CONST, JOINT_CONST),       # Łokieć
     'th4': (-JOINT_CONST, JOINT_CONST)        # Nadgarstek
 }
@@ -590,7 +591,7 @@ class RobotControlGUI:
         position_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=5)
         
         self.pos_labels = {}
-        for i, axis in enumerate(['X', 'Y', 'Z', 'E']):
+        for i, axis in enumerate(['X', 'Y', 'Z', 'E', 'A']):
             ttk.Label(position_frame, text=axis + ":").grid(row=0, column=i, sticky=tk.W, pady=2)
             self.pos_labels[axis] = ttk.Label(position_frame, text="0.00°", font=('Arial', 10))
             self.pos_labels[axis].grid(row=0, column=i, sticky=tk.W, padx=10)
@@ -609,9 +610,6 @@ class RobotControlGUI:
         self.angle_control_frame = ttk.LabelFrame(left_frame, text="Sterowanie kątami [°]", padding="10")
         self.angle_control_frame.grid(row=4, column=0, sticky=(tk.W, tk.E), pady=5)
         
-        # Oblicz limity w stopniach
-        angle_limit_deg = math.degrees(JOINT_CONST)
-        
         self.angle_sliders = {}
         self.angle_value_labels = {}
         
@@ -625,8 +623,13 @@ class RobotControlGUI:
         for i, (key, label) in enumerate(joint_names):
             ttk.Label(self.angle_control_frame, text=label).grid(row=i, column=0, sticky=tk.W, pady=5)
             
+            # Pobranie konkretnych limitów (min, max) dla danego stawu ze słownika
+            limit_min_rad, limit_max_rad = JOINT_LIMITS[key]
+
             # tk.Scale nie obsługuje stylów ttk, musimy ustawić kolory ręcznie
-            slider = tk.Scale(self.angle_control_frame, from_=-angle_limit_deg, to=angle_limit_deg,
+            slider = tk.Scale(self.angle_control_frame, 
+                            from_=math.degrees(limit_min_rad), # Dolny limit w stopniach
+                            to=math.degrees(limit_max_rad),    # Górny limit w stopniach
                             orient=tk.HORIZONTAL, resolution=0.1, length=250,
                             bg=COLOR_FRAME_BG, fg=COLOR_TEXT, 
                             troughcolor=COLOR_BG, highlightthickness=0, # Usunięcie obramowania fokusu
@@ -863,11 +866,12 @@ class RobotControlGUI:
             self.root.after(0, lambda: self.log(log_message))
         
         if angles:
-            x, y, z, e = angles
+            x, y, z, e, a = angles
             self.root.after(0, lambda: self.pos_labels['X'].config(text=f"{x:.2f}°"))
             self.root.after(0, lambda: self.pos_labels['Y'].config(text=f"{y:.2f}°"))
             self.root.after(0, lambda: self.pos_labels['Z'].config(text=f"{z:.2f}°"))
             self.root.after(0, lambda: self.pos_labels['E'].config(text=f"{e:.2f}°"))
+            self.root.after(0, lambda: self.pos_labels['A'].config(text=f"{a:.2f}°"))
     
     def toggle_phi_entry(self):
         """Włącz/wyłącz pole orientacji w zależności od checkboxa"""
@@ -903,7 +907,7 @@ class RobotControlGUI:
             
             # Pobierz aktualną pozycję
             current_pos = self.robot.get_current_angles()
-            current_angles = tuple(math.radians(angle) for angle in current_pos)
+            current_angles = tuple(math.radians(angle) for angle in current_pos[:4])
             
             # Rozwiąż IK
             solution, config_name = solve_ik_for_cartesian(x_target, y_target, z_target, phi_deg, current_angles)

@@ -22,7 +22,7 @@
 
 AccelStepper motorX(AccelStepper::DRIVER, STEP_X, DIR_X);
 AccelStepper motorY(AccelStepper::DRIVER, STEP_Y, DIR_Y);
-AccelStepper motorA(AccelStepper::DRIVER, STEP_Z, DIR_Z);
+AccelStepper motorA(AccelStepper::DRIVER, STEP_A, DIR_A);
 AccelStepper motorZ(AccelStepper::DRIVER, STEP_Z, DIR_Z);
 AccelStepper motorE(AccelStepper::DRIVER, STEP_E, DIR_E);
 
@@ -61,7 +61,7 @@ const float angleConst = 360.0 / 4096.0;
 const float START_ANGLES[5] = {90.0, 90.0, 135.0, 135.0, 0.0}; // [E, Z, Y, A, X]
 
 // ===================== Parametry sterowania ======================
-const bool AXIS_INVERT[] = {false, true, false, true, false};
+const bool AXIS_INVERT[] = {false, false, false, false, false};
 const float ANGLE_TOLERANCE = 0.05;
 const unsigned long ENCODER_READ_INTERVAL = 50;
 const unsigned long PYTHON_SEND_INTERVAL = 50;
@@ -155,20 +155,20 @@ void parsePythonCommand(String cmd) {
         
         switch (axis) {
             case 'X': case 'x':
-                newTargets[4] = relativeAngle + START_ANGLES[4];
+                newTargets[4] = relativeAngle;
                 validCommand = true;
                 break;
             case 'Y': case 'y':
-                newTargets[3] = relativeAngle + START_ANGLES[3];
-                newTargets[2] = relativeAngle + START_ANGLES[2];
+                newTargets[3] = relativeAngle;
+                newTargets[2] = relativeAngle;
                 validCommand = true;
                 break;
             case 'Z': case 'z':
-                newTargets[1] = relativeAngle + START_ANGLES[1];
+                newTargets[1] = relativeAngle;
                 validCommand = true;
                 break;
             case 'E': case 'e':
-                newTargets[0] = relativeAngle + START_ANGLES[0];
+                newTargets[0] = relativeAngle;
                 validCommand = true;
                 break;
         }
@@ -200,7 +200,8 @@ void sendPositionToPython() {
     String frame = "<";
     frame += "E" + String(angles[0], 2) + ",";
     frame += "Z" + String(angles[1], 2) + ",";
-    frame += "Y" + String(angles[3], 2) + ",";
+    frame += "Y" + String(angles[2], 2) + ",";
+    frame += "A" + String(angles[3], 2) + ",";
     frame += "X" + String(angles[4], 2);
     frame += ">";
     
@@ -317,29 +318,40 @@ void motorControlTask(void *parameter) {
         }
         
         // ===== 2. Sterowanie w pętli zamkniętej (Real-time Closed Loop) =====
-        // Algorytm typu P (Proporcjonalny) korygujący pozycję na podstawie uchybu enkodera
         for (int i = 0; i < 5; i++) {
+            // Pomiń niezależne obliczenia dla osi A (indeks 3), która jest Slavem
+            if (i == 3) continue;
+
             // Obliczenie uchybu: e(t) = wartość_zadana - wartość_mierzona
             float error = localTargetAngles[i] - localCurrentAngles[i];
 
             // Weryfikacja strefy nieczułości (deadband)
-            // Ruch jest inicjowany tylko, gdy błąd przekracza zdefiniowaną tolerancję
             if (abs(error) > ANGLE_TOLERANCE) {
                 
-                // Przeliczenie uchybu kątowego na kroki (Gain układu)
                 long stepsCorrection = (long)(error * stepsPerDegree[i]);
 
-                // Korekta kierunku (zgodnie z macierzą AXIS_INVERT)
                 if (AXIS_INVERT[i]) {
                     stepsCorrection = -stepsCorrection;
                 }
 
-                // Aktualizacja wartości zadanej sterownika (Control Variable)
-                // Mechanizm: "Gdzie jesteś teraz (według sterownika) + brakująca odległość (według enkodera)"
-                // To eliminuje problem gubienia kroków, wymuszając ruch do skutku.
+                // Aplikacja ruchu dla silnika bieżącego (w tym Mastera Y)
                 motors[i]->moveTo(motors[i]->currentPosition() + stepsCorrection);
                 
-                // Opcjonalnie: Reset timera korekcji, jeśli używasz interwałów czasowych
+                // --- LOGIKA MASTER-SLAVE DLA OSI A (Z AUTOKOREKCJĄ) ---
+                if (i == 2) {
+                    // Weryfikacja: Zamiast kopiować ruch Y, obliczamy uchyb bezpośrednio dla A.
+                    // Cel jest ten sam (localTargetAngles[2]), ale pozycja startowa A może być inna.
+                    float errorA = localTargetAngles[2] - localCurrentAngles[3];
+                    
+                    long stepsCorrectionA = (long)(errorA * stepsPerDegree[3]);
+
+                    if (AXIS_INVERT[3]) {
+                        stepsCorrectionA = -stepsCorrectionA;
+                    }
+
+                    motors[3]->moveTo(motors[3]->currentPosition() + stepsCorrectionA);
+                }
+                
                 lastAxisCorrectionTime[i] = currentMillis;
             }
         }
