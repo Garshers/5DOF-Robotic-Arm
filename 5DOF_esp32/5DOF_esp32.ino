@@ -47,9 +47,9 @@ const float ENCODER_LEVER[] = {2.0, 3.6, 4.5, 4.5, 4.0};
 SemaphoreHandle_t xMutex;
 
 // Chronione przez mutex
-volatile float currentAngles[5] = {0.0, 0.0, 0.0, 0.0, 0.0}; // [E, Z, Y, A, X]
-volatile float targetAngles[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
-volatile bool newTargetAvailable = false;
+volatile float currentAngles[5] = {90.0, 90.0, 135.0, 135.0, 0.0};
+volatile float targetAngles[5] = {90.0, 90.0, 135.0, 135.0, 0.0};
+volatile bool newTargetAvailable = true;
 
 // Dane enkoderów (tylko rdzeń 0)
 uint16_t ENCODER_ZPOS[] = {0, 0, 0, 0, 0};
@@ -68,7 +68,7 @@ const unsigned long PYTHON_SEND_INTERVAL = 50;
 
 // ================== Parametry silnika krokowego ==================
 const float STEPS_PER_REV = 200.0;  // Silnik 1.8 stopnia
-const float MICROSTEPS = 1.0;//16.0;      // Ustawienie sterownika
+const float MICROSTEPS = 16.0;//16.0;      // Ustawienie sterownika
 const float STEPS_PER_MOTOR_REV = STEPS_PER_REV * MICROSTEPS; // 3200 kroków/obrót silnika
 
 // Bufory komunikacji (tylko rdzeń 0)
@@ -290,8 +290,8 @@ void motorControlTask(void *parameter) {
     AccelStepper* motors[5] = {&motorE, &motorZ, &motorY, &motorA, &motorX};
 
     // Konfiguracja silników
-    float baseSpeed = 200;
-    float baseAcceleration = 100;
+    float baseSpeed = 50.0 * MICROSTEPS;
+    float baseAcceleration = baseSpeed / 4.0;
     
     for(int i=0; i<5; i++) {
         motors[i]->setMaxSpeed(baseSpeed * ENCODER_LEVER[i]);
@@ -334,17 +334,17 @@ void motorControlTask(void *parameter) {
                     stepsCorrection = -stepsCorrection;
                 }
 
-                // Aplikacja ruchu dla silnika bieżącego (w tym Mastera Y)
+                // Aplikacja ruchu dla silnika bieżącego
                 motors[i]->moveTo(motors[i]->currentPosition() + stepsCorrection);
                 
-                // --- LOGIKA MASTER-SLAVE DLA OSI A (Z AUTOKOREKCJĄ) ---
+                // --- LOGIKA MASTER-SLAVE DLA OSI A (Z DETEKCJĄ DESYNCHRONIZACJI) ---
                 if (i == 2) {
-                    // Weryfikacja: Zamiast kopiować ruch Y, obliczamy uchyb bezpośrednio dla A.
-                    // Cel jest ten sam (localTargetAngles[2]), ale pozycja startowa A może być inna.
+                    // Obliczenie uchybu dla A z detekcją desynchronizacji
                     float errorA = localTargetAngles[2] - localCurrentAngles[3];
-                    
-                    long stepsCorrectionA = (long)(errorA * stepsPerDegree[3]);
+                    float syncDeviation = localCurrentAngles[2] - localCurrentAngles[3]; 
+                    long stepsCorrectionA = (long)((errorA + syncDeviation) * stepsPerDegree[3]);
 
+                    // Aplikacja ruchu dla A
                     if (AXIS_INVERT[3]) {
                         stepsCorrectionA = -stepsCorrectionA;
                     }
