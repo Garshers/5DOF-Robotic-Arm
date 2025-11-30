@@ -465,6 +465,7 @@ class RobotControlGUI:
         self.root.geometry("1400x800")
 
         self.last_gui_update_time = 0.0
+        self.last_tcp_pos = np.array([0.0, 0.0, 0.0])
         
         self.robot = RobotSerial()
         self.robot.set_gui_callback(self.update_position_display)
@@ -834,6 +835,7 @@ class RobotControlGUI:
             th4 = math.radians(current_pos[3])
             
             positions = get_joint_positions(th1, th2, th3, th4)
+            self.last_tcp_pos = positions[-1]
             
             x_coords = [pos[0] for pos in positions]
             y_coords = [pos[1] for pos in positions]
@@ -896,28 +898,13 @@ class RobotControlGUI:
                 self.root.after(0, lambda: self.pos_labels['Z'].config(text=f"{z:.2f}°"))
                 self.root.after(0, lambda: self.pos_labels['E'].config(text=f"{e:.2f}°"))
                 self.root.after(0, lambda: self.pos_labels['A'].config(text=f"{a:.2f}°"))
-
-                # Obliczanie Kinematyki Prostej (FK) dla wyświetlenia TCP
-                try:
-                    # 1. Konwersja kątów na radiany (zakładamy mapowanie: X->th1, Y->th2, Z->th3, E->th4)
-                    th1_rad = math.radians(x)
-                    th2_rad = math.radians(y)
-                    th3_rad = math.radians(z)
-                    th4_rad = math.radians(e)
-
-                    # 2. Wywołanie funkcji FK (tej samej, co do rysowania 3D)
-                    positions = get_joint_positions(th1_rad, th2_rad, th3_rad, th4_rad)
-                    
-                    # 3. Ostatni element tablicy positions to współrzędne końcówki (TCP)
-                    tcp_pos = positions[-1] 
-
-                    # 4. Aktualizacja GUI
-                    self.root.after(0, lambda: self.tcp_labels['TCP_X'].config(text=f"{tcp_pos[0]:.2f}"))
-                    self.root.after(0, lambda: self.tcp_labels['TCP_Y'].config(text=f"{tcp_pos[1]:.2f}"))
-                    self.root.after(0, lambda: self.tcp_labels['TCP_Z'].config(text=f"{tcp_pos[2]:.2f}"))
-                except Exception as err:
-                    # Zabezpieczenie przed błędami matematycznymi, aby nie "zamrozić" GUI
-                    print(f"[GUI ERROR] Błąd obliczania TCP: {err}")
+                
+                # Aktualizacja GUI TCP
+                tcp_pos = self.last_tcp_pos
+                
+                self.root.after(0, lambda: self.tcp_labels['TCP_X'].config(text=f"{tcp_pos[0]:.2f}"))
+                self.root.after(0, lambda: self.tcp_labels['TCP_Y'].config(text=f"{tcp_pos[1]:.2f}"))
+                self.root.after(0, lambda: self.tcp_labels['TCP_Z'].config(text=f"{tcp_pos[2]:.2f}"))
     
     def toggle_phi_entry(self):
         """Włącz/wyłącz pole orientacji w zależności od checkboxa"""
