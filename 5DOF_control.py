@@ -1,6 +1,6 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
-from tkinter.filedialog import asksaveasfilename
+from tkinter.filedialog import asksaveasfilename, askopenfilename
 import json
 import sympy as sp
 import numpy as np
@@ -458,7 +458,7 @@ def get_joint_positions(th1_val, th2_val, th3_val, th4_val, alpha5_val=0.0):
 # GUI APPLICATION
 # =====================================================================
 
-
+POSITION_TOLERANCE = 5.0 # Tolerancja osiągnięcia pozycji [mm]
 
 class RobotControlGUI:
     def __init__(self, root):
@@ -467,65 +467,60 @@ class RobotControlGUI:
         self.root.geometry("1400x800")
 
         self.last_gui_update_time = 0.0
+        # Ostatnia pozycja TCP odczytana z robota (używana do weryfikacji)
         self.last_tcp_pos = np.array([0.0, 0.0, 0.0])
         
         self.robot = RobotSerial()
         self.robot.set_gui_callback(self.update_position_display)
         
-        # Przechowuje dynamiczne elementy wykresu (linie, punkty)
+        # Elementy wizualizacji 3D
         self.plot_artists = []
-        # Przechowuje maksymalny zasięg do resetowania widoku
         self.max_reach = l2_val + l3_val + l4_val + l5_val
         
-        # Tryb sterowania: 'position' lub 'angles'
         self.control_mode = tk.StringVar(value='position')
         
-        # Timer dla ciągłego wysyłania kątów
+        # Flagi i timery dla sterowania kątami
         self.angle_send_timer = None
         self.angle_send_active = False
-        
-        # Flagi dla ostrzeżeń o kolizjach
         self._collision_warning_shown = False
         self._last_collision_state = False
         
-        # === NOWE: Funkcjonalność sekwencji ruchów ===
-        self.sequence_data = []  # Lista przechowująca punkty w formacie dict
-        self.sequence_list_frame = None  # Właściwa ramka, w której będą kafelki punktów
-        self.canvas_window_seq = None # ID okna dla wewnętrznego canvasu sekwencji
-        # ============================================
+        # === Dane i stan sekwencji ===
+        self.is_connected = False
+        self.sequence_data = []  
+        self.sequence_list_frame = None
+        self.canvas_window_seq = None
+        
+        # Stan odtwarzania sekwencji
+        self.current_sequence_index = 0
+        self.sequence_playing = False
+        self.sequence_timer = None
+        self.play_button = None 
+        # Docelowa pozycja XYZ dla weryfikacji sprzętowej
+        self.target_xyz = None 
+        # =============================
 
         self.setup_ui()
-        
-        # Konfiguracja 3D jest teraz wywołana RAZ po setup_ui
         self.setup_3d_plot()
-        
-        # Uruchom aktualizację wizualizacji 3D
         self.update_3d_visualization()
-
-        # Auto-connect przy starcie
         self.root.after(100, self.connect_robot)
 
     def setup_ui(self):
-        # 1. Definicja palety kolorów (Zmienne)
-        COLOR_BG = "#2f3347"        # Tło główne
-        COLOR_FRAME_BG = "#262a3e"    # Tło ramek/paneli/inputów
-        COLOR_BORDER = "#565a6c"      # Ramki Obramówka (szara)
-        COLOR_TEXT = "#c4cad0"        # Tekst (jasny szaroniebieski)
-        COLOR_ACCENT = "#101122"      # Akcent dla przycisków/aktywnych elementów
-        COLOR_BUTTON = "#377df0"      # Przycisk (niebieski)
+        # Definicja palety kolorów
+        COLOR_BG = "#2f3347"
+        COLOR_FRAME_BG = "#262a3e"
+        COLOR_BORDER = "#565a6c"
+        COLOR_TEXT = "#c4cad0"
+        COLOR_ACCENT = "#101122"
+        COLOR_BUTTON = "#377df0"
+        COLOR_STOP = "#cb0000" 
+        COLOR_PLAY = "#008000" 
 
-        # 2. Konfiguracja stylu TTK
+        # Konfiguracja stylu TTK
         style = ttk.Style()
         style.theme_use('clam')
-        
-        # Konfiguracja ogólna
-        style.configure(".", 
-                        background=COLOR_BG, 
-                        foreground=COLOR_TEXT, 
-                        fieldbackground=COLOR_FRAME_BG,
-                        darkcolor=COLOR_FRAME_BG, 
-                        lightcolor=COLOR_FRAME_BG,
-                        bordercolor=COLOR_BORDER)
+        style.configure(".", background=COLOR_BG, foreground=COLOR_TEXT, fieldbackground=COLOR_FRAME_BG,
+                        darkcolor=COLOR_FRAME_BG, lightcolor=COLOR_FRAME_BG, bordercolor=COLOR_BORDER)
         style.configure("TLabelframe", background=COLOR_FRAME_BG, bordercolor=COLOR_BORDER, lightcolor=COLOR_BORDER, 
                         darkcolor=COLOR_BORDER, borderwidth=1, relief="solid")
         style.configure("TLabelframe.Label", background=COLOR_FRAME_BG, foreground=COLOR_TEXT) 
@@ -533,38 +528,29 @@ class RobotControlGUI:
         style.configure("TEntry", fieldbackground=COLOR_FRAME_BG, foreground=COLOR_TEXT, insertcolor=COLOR_TEXT, bordercolor=COLOR_BORDER)
         style.configure("TButton", background=COLOR_BUTTON, foreground=COLOR_TEXT, bordercolor=COLOR_BORDER)
         style.map("TButton", background=[('active', COLOR_ACCENT)])
+        style.configure("Play.TButton", background=COLOR_PLAY, foreground="white", bordercolor=COLOR_BORDER)
+        style.map("Play.TButton", background=[('active', '#004d00')])
+        style.configure("Stop.TButton", background=COLOR_STOP, foreground="white", bordercolor=COLOR_BORDER)
+        style.map("Stop.TButton", background=[('active', '#8c0000')])
         style.configure("TRadiobutton", background=COLOR_FRAME_BG, foreground=COLOR_TEXT, indicatorbackground=COLOR_TEXT)
         style.map("TRadiobutton", background=[('active', COLOR_FRAME_BG)])
         style.configure("TCheckbutton", background=COLOR_FRAME_BG, foreground=COLOR_TEXT, indicatorbackground=COLOR_TEXT)
         style.map("TCheckbutton", background=[('active', COLOR_FRAME_BG)])
-
-        # ========================================================================================
         
-        # Główny frame z dwiema kolumnami
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         
-        # ===================================== LEWA KOLUMNA: MECHANIZM PRZEWIJANIA =====================================
-        
-        # 1. Tworzenie Canvas (zastępuje left_frame)
+        # === LEWA KOLUMNA: MECHANIZM PRZEWIJANIA ===
         scroll_canvas = tk.Canvas(main_frame, borderwidth=0, background=COLOR_BG, highlightthickness=0)
         scroll_canvas.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 5))
-        
-        # 2. Tworzenie Scrollbar
         vscrollbar = ttk.Scrollbar(main_frame, orient="vertical", command=scroll_canvas.yview)
         vscrollbar.grid(row=0, column=0, sticky=tk.E + tk.N + tk.S) 
-        
-        # 3. Konfiguracja Canvas i Scrollbar
         scroll_canvas.configure(yscrollcommand=vscrollbar.set)
         
-        # 4. Ramka wewnętrzna, która będzie przewijana (Gdzie będą umieszczone wszystkie kontrolki)
         self.content_frame = tk.Frame(scroll_canvas, bg=COLOR_BG) 
         self.content_frame.grid_columnconfigure(0, weight=1) 
-
-        # 5. Tworzenie okna w Canvas zawierającego ramkę content_frame
         self.canvas_window = scroll_canvas.create_window((0, 0), window=self.content_frame, anchor="nw", width=1) 
 
-        # 6. Bind (powiązanie) zdarzeń:
         self.content_frame.bind(
             "<Configure>",
             lambda e: scroll_canvas.configure(scrollregion=scroll_canvas.bbox("all"))
@@ -575,16 +561,15 @@ class RobotControlGUI:
             
         scroll_canvas.bind("<Configure>", resize_content)
 
-        # ===================================== Prawa kolumna - wizualizacja 3D =====================================
+        # Prawa kolumna - wizualizacja 3D
         right_frame = ttk.Frame(main_frame)
         right_frame.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(5, 0))
         
-        # ===================================== LEWA KOLUMNA (Elementy wewnątrz self.content_frame) =====================================
+        # === WIDŻETY LEWEJ KOLUMNY (wewnątrz self.content_frame) ===
         
         # Status połączenia (row 0)
         status_frame = ttk.LabelFrame(self.content_frame, text="Status połączenia", padding="5")
         status_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=5, padx=5)
-        
         self.status_label = ttk.Label(status_frame, text="Rozłączony", foreground="red")
         self.status_label.grid(row=0, column=0, sticky=tk.W)
         ttk.Button(status_frame, text="Połącz", command=self.connect_robot).grid(row=0, column=1, padx=5)
@@ -592,7 +577,6 @@ class RobotControlGUI:
         # Wybór trybu sterowania (row 1)
         mode_frame = ttk.LabelFrame(self.content_frame, text="Tryb sterowania", padding="10")
         mode_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=5, padx=5)
-        
         ttk.Radiobutton(mode_frame, text="Sterowanie pozycją (XYZ)", variable=self.control_mode, value='position',
                         command=self.switch_control_mode).grid(row=0, column=0, sticky=tk.W, pady=2)
         ttk.Radiobutton(mode_frame, text="Sterowanie kątami (ciągłe)", variable=self.control_mode, value='angles',
@@ -601,15 +585,12 @@ class RobotControlGUI:
         # Aktualna pozycja (row 2)
         position_frame = ttk.LabelFrame(self.content_frame, text="Aktualna pozycja", padding="10")
         position_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=5, padx=5)
-        
         self.pos_labels = {}
         for i, axis in enumerate(['X', 'Y', 'Z', 'E', 'A']):
             ttk.Label(position_frame, text=axis + ":").grid(row=0, column=i, sticky=tk.W, pady=2)
             self.pos_labels[axis] = ttk.Label(position_frame, text="0.00°", font=('Arial', 10))
             self.pos_labels[axis].grid(row=0, column=i, sticky=tk.W, padx=10)
-
         ttk.Separator(position_frame, orient='horizontal').grid(row=1, column=0, columnspan=5, sticky='ew', pady=5)
-
         self.tcp_labels = {}
         tcp_axes = ['TCP_X', 'TCP_Y', 'TCP_Z']
         for i, axis in enumerate(tcp_axes):
@@ -621,7 +602,6 @@ class RobotControlGUI:
         # Kąty docelowe (wynik IK) (row 3)
         self.angles_frame = ttk.LabelFrame(self.content_frame, text="Kąty docelowe (wynik IK)", padding="10")
         self.angles_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=5, padx=5)
-        
         self.angle_labels = {}
         for i, axis in enumerate(['θ1 (X)', 'θ2 (Y)', 'θ3 (Z)', 'θ4 (E)']):
             ttk.Label(self.angles_frame, text=axis + ":").grid(row=0, column=i*2, sticky=tk.E, padx=5, pady=2)
@@ -631,13 +611,9 @@ class RobotControlGUI:
         # Sterowanie kątami (suwaki) (row 4)
         self.angle_control_frame = ttk.LabelFrame(self.content_frame, text="Sterowanie kątami [°]", padding="10")
         self.angle_control_frame.grid(row=4, column=0, sticky=(tk.W, tk.E), pady=5, padx=5)
-        
-        self.angle_sliders = {}
-        self.angle_value_labels = {}
-        
+        self.angle_sliders = {}; self.angle_value_labels = {}
         joint_names = [('th1', 'θ1 (X - Baza)'), ('th2', 'θ2 (Y - Ramię L2)'), 
                        ('th3', 'θ3 (Z - Ramię L3)'), ('th4', 'θ4 (E - Nadgarstek)')]
-        
         for i, (key, label) in enumerate(joint_names):
             ttk.Label(self.angle_control_frame, text=label).grid(row=i, column=0, sticky=tk.W, pady=5)
             limit_min_rad, limit_max_rad = JOINT_LIMITS[key]
@@ -651,119 +627,63 @@ class RobotControlGUI:
             value_label = ttk.Label(self.angle_control_frame, text="0.0°", font=('Arial', 10, 'bold'))
             value_label.grid(row=i, column=2, padx=5)
             self.angle_value_labels[key] = value_label
-            
-        # Przycisk dodawania punktu z trybu kątów (NOWE)
-        self.add_angle_point_button = ttk.Button(self.angle_control_frame, 
-                                                 text="DODAJ AKTUALNE KĄTY (do sekwencji)", 
-                                                 command=self.add_current_angles_to_sequence, 
-                                                 style='TButton')
+        self.add_angle_point_button = ttk.Button(self.angle_control_frame, text="DODAJ AKTUALNE KĄTY (do sekwencji)", 
+                                                 command=self.add_current_angles_to_sequence, style='TButton')
         self.add_angle_point_button.grid(row=len(joint_names), column=0, columnspan=3, pady=5, sticky=(tk.W, tk.E))
         
         # Pozycja docelowa (row 5)
         self.target_frame = ttk.LabelFrame(self.content_frame, text="Pozycja docelowa [mm]", padding="10")
         self.target_frame.grid(row=5, column=0, sticky=(tk.W, tk.E), pady=5, padx=5)
-        
-        ttk.Label(self.target_frame, text="X:").grid(row=0, column=0, sticky=tk.W, pady=5)
-        self.x_entry = ttk.Entry(self.target_frame, width=15)
-        self.x_entry.grid(row=0, column=1, padx=5)
-        self.x_entry.insert(0, "-87.5")
-        
-        ttk.Label(self.target_frame, text="Y:").grid(row=1, column=0, sticky=tk.W, pady=5)
-        self.y_entry = ttk.Entry(self.target_frame, width=15)
-        self.y_entry.grid(row=1, column=1, padx=5)
-        self.y_entry.insert(0, "0")
-        
-        ttk.Label(self.target_frame, text="Z:").grid(row=2, column=0, sticky=tk.W, pady=5)
-        self.z_entry = ttk.Entry(self.target_frame, width=15)
-        self.z_entry.grid(row=2, column=1, padx=5)
-        self.z_entry.insert(0, "372.5")
-
-        ttk.Label(self.target_frame, text="Orientacja φ [°]:").grid(row=3, column=0, sticky=tk.W, pady=5)
-        self.phi_entry = ttk.Entry(self.target_frame, width=15)
-        self.phi_entry.grid(row=3, column=1, padx=5)
-        self.phi_entry.insert(0, "0")
-        
-        # Checkbox automatycznej orientacji
+        ttk.Label(self.target_frame, text="X:").grid(row=0, column=0, sticky=tk.W, pady=5); self.x_entry = ttk.Entry(self.target_frame, width=15); self.x_entry.grid(row=0, column=1, padx=5); self.x_entry.insert(0, "-87.5")
+        ttk.Label(self.target_frame, text="Y:").grid(row=1, column=0, sticky=tk.W, pady=5); self.y_entry = ttk.Entry(self.target_frame, width=15); self.y_entry.grid(row=1, column=1, padx=5); self.y_entry.insert(0, "0")
+        ttk.Label(self.target_frame, text="Z:").grid(row=2, column=0, sticky=tk.W, pady=5); self.z_entry = ttk.Entry(self.target_frame, width=15); self.z_entry.grid(row=2, column=1, padx=5); self.z_entry.insert(0, "372.5")
+        ttk.Label(self.target_frame, text="Orientacja φ [°]:").grid(row=3, column=0, sticky=tk.W, pady=5); self.phi_entry = ttk.Entry(self.target_frame, width=15); self.phi_entry.grid(row=3, column=1, padx=5); self.phi_entry.insert(0, "0")
         self.auto_phi_var = tk.BooleanVar(value=True)
         self.auto_phi_check = ttk.Checkbutton(self.target_frame, text="Orientacja automatyczna (optymalizacja przemysłowa)",
                                               variable=self.auto_phi_var, command=self.toggle_phi_entry)
         self.auto_phi_check.grid(row=4, column=0, columnspan=2, pady=5, sticky=tk.W)
-        
         ttk.Button(self.target_frame, text="WYŚLIJ POZYCJĘ", command=self.send_position, style='TButton').grid(row=5, column=0, columnspan=2, pady=5, sticky=(tk.W, tk.E))
-                   
-        # Przycisk dodawania punktu do sekwencji z walidacją IK (NOWE)
         ttk.Button(self.target_frame, text="DODAJ PUNKT (do sekwencji) [Walidacja IK]", 
                    command=self.add_point_to_sequence, style='TButton').grid(row=6, column=0, columnspan=2, pady=5, sticky=(tk.W, tk.E))
-        
         self.toggle_phi_entry()
         
-        # Ramka zapisu sekwencji z możliwością przewijania (row 7)
+        # Ramka zapisu sekwencji (row 7)
         self._create_sequence_frame(self.content_frame, 7) 
         
-        # Log - Manualna konfiguracja kolorów dla widgetu tk.Text (row 8)
+        # Log (row 8)
         log_frame = ttk.LabelFrame(self.content_frame, text="Log komunikacji", padding="10")
         log_frame.grid(row=8, column=0, sticky=(tk.W, tk.E), pady=5, padx=5)
-        
         self.log_text = tk.Text(log_frame, height=10, width=50, bg=COLOR_FRAME_BG, fg=COLOR_TEXT, 
                                 insertbackground=COLOR_TEXT, selectbackground=COLOR_ACCENT,
                                 highlightbackground=COLOR_BORDER, highlightthickness=1)
         self.log_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        
         scrollbar = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
         scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
         self.log_text['yscrollcommand'] = scrollbar.set
-        
-        log_frame.grid_columnconfigure(0, weight=1)
-        log_frame.grid_rowconfigure(0, weight=1)
+        log_frame.grid_columnconfigure(0, weight=1); log_frame.grid_rowconfigure(0, weight=1)
 
-        # ===================================== KONIEC LEWEJ KOLUMNY =====================================
-        
-        # Definicja ramki wizualizacji (Prawa Kolumna)
+        # === WIZUALIZACJA 3D ===
         viz_frame = ttk.LabelFrame(right_frame, text="Wizualizacja 3D", padding="10")
         viz_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        
-        # Utworzenie wykresu matplotlib z dostosowaniem kolorów
         self.fig = Figure(figsize=(7, 6), dpi=100, facecolor=COLOR_BG) 
         self.ax = self.fig.add_subplot(111, projection='3d')
-        
-        # Dostosowanie kolorów osi wykresu
-        self.ax.set_facecolor(COLOR_BG)   
-        self.ax.tick_params(axis='x', colors=COLOR_TEXT)
-        self.ax.tick_params(axis='y', colors=COLOR_TEXT)
-        self.ax.tick_params(axis='z', colors=COLOR_TEXT)
-        self.ax.xaxis.label.set_color(COLOR_TEXT)
-        self.ax.yaxis.label.set_color(COLOR_TEXT)
-        self.ax.zaxis.label.set_color(COLOR_TEXT)
-        
-        self.ax.xaxis.set_pane_color((0.14, 0.16, 0.24, 1.0)) 
-        self.ax.yaxis.set_pane_color((0.14, 0.16, 0.24, 1.0))
-        self.ax.zaxis.set_pane_color((0.14, 0.16, 0.24, 1.0))
-        
-        # Utworzenie canvas
+        LABEL_COLOR = COLOR_TEXT
+        self.ax.set_facecolor(COLOR_BG); self.ax.tick_params(axis='x', colors=LABEL_COLOR); self.ax.tick_params(axis='y', colors=LABEL_COLOR); self.ax.tick_params(axis='z', colors=LABEL_COLOR)
+        self.ax.xaxis.label.set_color(LABEL_COLOR); self.ax.yaxis.label.set_color(LABEL_COLOR); self.ax.zaxis.label.set_color(LABEL_COLOR)
+        self.ax.xaxis.set_pane_color((0.14, 0.16, 0.24, 1.0)); self.ax.yaxis.set_pane_color((0.14, 0.16, 0.24, 1.0)); self.ax.zaxis.set_pane_color((0.14, 0.16, 0.24, 1.0))
         self.canvas = FigureCanvasTkAgg(self.fig, master=viz_frame)
-        
-        # Przycisk resetu widoku
-        reset_button = ttk.Button(viz_frame, text="Resetuj widok", command=self.reset_3d_view)
-        reset_button.pack(side=tk.TOP, anchor=tk.NW, pady=5, padx=5)
-        
-        # Spakowanie canvas (ustawienie tła widgetu canvas)
-        self.canvas.get_tk_widget().config(bg=COLOR_BG)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        reset_button = ttk.Button(viz_frame, text="Resetuj widok", command=self.reset_3d_view); reset_button.pack(side=tk.TOP, anchor=tk.NW, pady=5, padx=5)
+        self.canvas.get_tk_widget().config(bg=COLOR_BG); self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         
         # Konfiguracja grid weights
-        self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=1)
-        # Zmiana: Lewa kolumna (0) na 3, Prawa (1) na 7 (dla rozszerzenia lewej)
-        main_frame.columnconfigure(0, weight=3) 
-        main_frame.columnconfigure(1, weight=7) 
-        main_frame.rowconfigure(0, weight=1)
-        right_frame.rowconfigure(0, weight=1)
+        self.root.columnconfigure(0, weight=1); self.root.rowconfigure(0, weight=1)
+        main_frame.columnconfigure(0, weight=3); main_frame.columnconfigure(1, weight=7) 
+        main_frame.rowconfigure(0, weight=1); right_frame.rowconfigure(0, weight=1)
         
-        # Inicjalizacja trybu sterowania
         self.switch_control_mode()
 
     def setup_3d_plot(self):
-        """Konfiguruje statyczne elementy wykresu 3D."""
+        """Konfiguruje statyczne elementy wykresu 3D (osie, limity, siatka, podstawa)."""
         LABEL_COLOR = "#c4cad0"
         self.ax.set_xlabel('X [mm]', color=LABEL_COLOR)
         self.ax.set_ylabel('Y [mm]', color=LABEL_COLOR)
@@ -776,15 +696,18 @@ class RobotControlGUI:
         
         self.ax.view_init(elev=20, azim=45)
         
+        # Dodanie siatki płaszczyzny XY
         grid_size = 100
         grid_range = np.arange(-300, 301, grid_size)
         X_grid, Y_grid = np.meshgrid(grid_range, grid_range)
         Z_grid = np.zeros_like(X_grid)
         self.ax.plot_wireframe(X_grid, Y_grid, Z_grid, alpha=0.1, color='gray', linewidth=0.5)
         
+        # Osie układu współrzędnych
         axis_length = 100
         self.ax.quiver(0, 0, 0, axis_length, 0, 0, color='red', arrow_length_ratio=0.1, linewidth=2, label='X')
         self.ax.quiver(0, 0, 0, 0, axis_length, 0, color='green', arrow_length_ratio=0.1, linewidth=2, label='Y')
+        # Poprawiona linia: usunięto nadmiarowy argument pozycyjny '0'
         self.ax.quiver(0, 0, 0, 0, 0, axis_length, color='blue', arrow_length_ratio=0.1, linewidth=2, label='Z')
         
         self.ax.legend(loc='upper right')
@@ -798,9 +721,8 @@ class RobotControlGUI:
         self.canvas.draw()
 
     def update_3d_visualization(self):
-        """Aktualizacja wizualizacji 3D robota."""
+        """Aktualizacja wizualizacji 3D robota na podstawie aktualnych kątów."""
         LABEL_COLOR = "#c4cad0"
-
         try:
             for artist in self.plot_artists:
                 if isinstance(artist, list):
@@ -812,26 +734,20 @@ class RobotControlGUI:
             self.plot_artists = []
             
             current_pos = self.robot.get_current_angles()
-            th1 = math.radians(current_pos[0])
-            th2 = math.radians(current_pos[1])
-            th3 = math.radians(current_pos[2])
-            th4 = math.radians(current_pos[3])
+            th1 = math.radians(current_pos[0]); th2 = math.radians(current_pos[1])
+            th3 = math.radians(current_pos[2]); th4 = math.radians(current_pos[3])
             
             positions = get_joint_positions(th1, th2, th3, th4)
             self.last_tcp_pos = positions[-1]
             
-            x_coords = [pos[0] for pos in positions]
-            y_coords = [pos[1] for pos in positions]
-            z_coords = [pos[2] for pos in positions]
+            x_coords = [pos[0] for pos in positions]; y_coords = [pos[1] for pos in positions]; z_coords = [pos[2] for pos in positions]
             
             robot_lines = self.ax.plot(x_coords, y_coords, z_coords, 'o-', linewidth=2, 
                                         markersize=6, color='#377df0', label='Robot', markerfacecolor='lightblue')
             self.plot_artists.append(robot_lines)
-            
             robot_tcp = self.ax.scatter([x_coords[-1]], [y_coords[-1]], [z_coords[-1]], 
                                          c="#cb0000", s=50, marker='o', label='Końcówka', edgecolors='darkred', linewidths=2)
             self.plot_artists.append(robot_tcp)
-            
             labels = ['Base', 'J1', 'J2', 'J3', 'J4', 'TCP']
             for i, pos in enumerate(positions):
                 text_label = self.ax.text(pos[0], pos[1], pos[2], f'  {labels[i]}', fontsize=8, color=LABEL_COLOR)
@@ -856,7 +772,7 @@ class RobotControlGUI:
         if log_message:
             if log_message == "#CONNECTION_LOST#":
                 self.status_label.config(text="Rozłączony (Błąd I/O)", foreground="red")
-                self.log("BŁĄD KRYTYCZNY: Utracono połączenie z urządzeniem ")
+                self.log("BŁĄD KRYTYCZNY: Utracono połączenie z urządzeniem")
                 return
 
             self.root.after(0, lambda: self.log(log_message))
@@ -881,97 +797,77 @@ class RobotControlGUI:
                 self.root.after(0, lambda: self.tcp_labels['TCP_Z'].config(text=f"{tcp_pos[2]:.2f}"))
     
     def toggle_phi_entry(self):
-        """Włącz/wyłącz pole orientacji w zależności od checkboxa"""
+        """Włącz/wyłącz pole orientacji w zależności od checkboxa automatycznego doboru Fi."""
         if self.auto_phi_var.get():
             self.phi_entry.config(state='disabled')
         else:
             self.phi_entry.config(state='normal')
 
     def connect_robot(self):
-        """Połącz z robotem"""
+        """Inicjuje połączenie z robotem."""
         success, message = self.robot.connect()
         if success:
+            self.is_connected = True
             self.status_label.config(text="Połączono", foreground="green")
             self.log(message)
         else:
+            self.is_connected = False
             self.status_label.config(text="Rozłączony", foreground="red")
             messagebox.showerror("Błąd połączenia", message)
             self.log(message)
     
     def send_position(self):
-        """Oblicz IK, zweryfikuj kolizje ostatnich stawów i wyślij do robota"""
+        """Oblicza IK, weryfikuje kolizje geometryczne i wysyła kąty do robota."""
         try:
-            x_target = float(self.x_entry.get())
-            y_target = float(self.y_entry.get())
-            z_target = float(self.z_entry.get())
-            if self.auto_phi_var.get():
-                phi_deg = None
-            else:
-                phi_deg = float(self.phi_entry.get())
+            x_target = float(self.x_entry.get()); y_target = float(self.y_entry.get()); z_target = float(self.z_entry.get())
+            phi_deg = None if self.auto_phi_var.get() else float(self.phi_entry.get())
             
             self.log(f"Obliczanie IK dla pozycji: X={x_target}, Y={y_target}, Z={z_target}")
-            
             current_pos = self.robot.get_current_angles()
             current_angles = tuple(math.radians(angle) for angle in current_pos[:4])
-            
             solution, config_name = solve_ik_for_cartesian(x_target, y_target, z_target, phi_deg, current_angles)
             
             if solution is None:
-                messagebox.showerror("Błąd IK", "Nie znaleziono osiągalnego rozwiązania IK.\nPozycja poza zasięgiem robota.")
+                messagebox.showerror("Błąd IK", "Nie znaleziono osiągalnego rozwiązania IK. Pozycja poza zasięgiem robota.")
                 self.log("BŁĄD: Pozycja poza zasięgiem robota")
                 return
             
             th1, th2, th3, th4 = solution
-
             positions = get_joint_positions(th1, th2, th3, th4)
-            z_wrist = positions[3][2]
-            z_tip = positions[4][2]
+            z_wrist = positions[3][2]; z_tip = positions[4][2]
             
             if z_wrist < -0.01 or z_tip < -0.01:
                 self.log(f"BLOKADA: Wykryto kolizję! Wrist Z={z_wrist:.2f}, Tip Z={z_tip:.2f}")
                 messagebox.showerror("Naruszenie strefy bezpiecznej", 
-                    f"Nie można wykonać ruchu!\n\nRozwiązanie IK prowadzi do kolizji z podłożem:\n"
-                    f"- Nadgarstek Z: {z_wrist:.2f} mm\n"
-                    f"- Końcówka Z: {z_tip:.2f} mm\n\nOperacja przerwana.")
+                    f"Nie można wykonać ruchu! Rozwiązanie IK prowadzi do kolizji z podłożem:\n- Nadgarstek Z: {z_wrist:.2f} mm\n- Końcówka Z: {z_tip:.2f} mm\nOperacja przerwana.")
                 return
             
             self.log(f"Wybrano konfigurację: {config_name}")
             
-            self.angle_labels['θ1 (X)'].config(text=f"{math.degrees(th1):.2f}°")
-            self.angle_labels['θ2 (Y)'].config(text=f"{math.degrees(th2):.2f}°")
-            self.angle_labels['θ3 (Z)'].config(text=f"{math.degrees(th3):.2f}°")
-            self.angle_labels['θ4 (E)'].config(text=f"{math.degrees(th4):.2f}°")
+            self.angle_labels['θ1 (X)'].config(text=f"{math.degrees(th1):.2f}°"); self.angle_labels['θ2 (Y)'].config(text=f"{math.degrees(th2):.2f}°")
+            self.angle_labels['θ3 (Z)'].config(text=f"{math.degrees(th3):.2f}°"); self.angle_labels['θ4 (E)'].config(text=f"{math.degrees(th4):.2f}°")
             
             success, message = self.robot.send_target_angles(th1, th2, th3, th4)
             if success:
-                self.log(message)
-                self.log("Pozycja wysłana pomyślnie")
+                self.log(message); self.log("Pozycja wysłana pomyślnie")
             else:
-                self.log(message)
-                messagebox.showerror("Błąd komunikacji", message)
+                self.log(message); messagebox.showerror("Błąd komunikacji", message)
                 
         except ValueError as e:
-            messagebox.showerror("Błąd", "Wprowadź poprawne wartości liczbowe")
-            self.log(f"BŁĄD: Niepoprawne dane wejściowe - {e}")
+            messagebox.showerror("Błąd", "Wprowadź poprawne wartości liczbowe"); self.log(f"BŁĄD: Niepoprawne dane wejściowe - {e}")
         except Exception as e:
-            messagebox.showerror("Błąd", f"Wystąpił błąd: {e}")
-            self.log(f"BŁĄD: {e}")
+            messagebox.showerror("Błąd", f"Wystąpił błąd: {e}"); self.log(f"BŁĄD: {e}")
     
     def on_angle_slider_change(self, joint_key, value):
-        """Callback dla zmiany wartości suwaka"""
+        """Callback dla zmiany wartości suwaka - aktualizuje etykietę i sprawdza kolizję."""
         angle = float(value)
         self.angle_value_labels[joint_key].config(text=f"{angle:.1f}°")
         
-        th1 = math.radians(self.angle_sliders['th1'].get())
-        th2 = math.radians(self.angle_sliders['th2'].get())
-        th3 = math.radians(self.angle_sliders['th3'].get())
-        th4 = math.radians(self.angle_sliders['th4'].get())
-        
+        th1 = math.radians(self.angle_sliders['th1'].get()); th2 = math.radians(self.angle_sliders['th2'].get())
+        th3 = math.radians(self.angle_sliders['th3'].get()); th4 = math.radians(self.angle_sliders['th4'].get())
         positions = get_joint_positions(th1, th2, th3, th4)
         
-        collision_detected = False
-        min_z = float('inf')
-        
+        collision_detected = False; min_z = float('inf')
         for i, pos in enumerate(positions):
             if pos[2] < 0:
                 collision_detected = True
@@ -980,53 +876,46 @@ class RobotControlGUI:
         if collision_detected:
             self.angle_value_labels[joint_key].config(foreground='red')
             if not hasattr(self, '_last_collision_state') or not self._last_collision_state:
-                self.log(f"⚠️ KOLIZJA: Staw znajduje się {abs(min_z):.1f}mm POD stołem!")
+                self.log(f"OSTRZEŻENIE: Staw znajduje się {abs(min_z):.1f}mm POD stołem!")
             self._last_collision_state = True
         else:
             self.angle_value_labels[joint_key].config(foreground='green')
             if hasattr(self, '_last_collision_state') and self._last_collision_state:
-                self.log("Kolizja usunięta - pozycja bezpieczna")
+                self.log("INFO: Kolizja usunięta - pozycja bezpieczna")
             self._last_collision_state = False
     
     def switch_control_mode(self):
-        """Przełącza między trybem sterowania pozycją a kątami"""
+        """Przełącza między trybem sterowania pozycją a kątami."""
         mode = self.control_mode.get()
         
         if mode == 'position':
-            self.target_frame.grid()
-            self.angle_control_frame.grid_remove()
+            self.target_frame.grid(); self.angle_control_frame.grid_remove()
             self.angles_frame.grid()
             self.stop_continuous_send()
-            self.log("Przełączono na tryb sterowania pozycją (XYZ)")
+            self.log("INFO: Przełączono na tryb sterowania pozycją (XYZ)")
             
         elif mode == 'angles':
             current_pos = self.robot.get_current_angles()
-            self.angle_sliders['th1'].set(current_pos[0])
-            self.angle_sliders['th2'].set(current_pos[1])
-            self.angle_sliders['th3'].set(current_pos[2])
-            self.angle_sliders['th4'].set(current_pos[3])
+            self.angle_sliders['th1'].set(current_pos[0]); self.angle_sliders['th2'].set(current_pos[1])
+            self.angle_sliders['th3'].set(current_pos[2]); self.angle_sliders['th4'].set(current_pos[3])
+            self.angle_value_labels['th1'].config(text=f"{current_pos[0]:.1f}°"); self.angle_value_labels['th2'].config(text=f"{current_pos[1]:.1f}°")
+            self.angle_value_labels['th3'].config(text=f"{current_pos[2]:.1f}°"); self.angle_value_labels['th4'].config(text=f"{current_pos[3]:.1f}°")
             
-            self.angle_value_labels['th1'].config(text=f"{current_pos[0]:.1f}°")
-            self.angle_value_labels['th2'].config(text=f"{current_pos[1]:.1f}°")
-            self.angle_value_labels['th3'].config(text=f"{current_pos[2]:.1f}°")
-            self.angle_value_labels['th4'].config(text=f"{current_pos[3]:.1f}°")
-            
-            self.target_frame.grid_remove()
-            self.angle_control_frame.grid()
+            self.target_frame.grid_remove(); self.angle_control_frame.grid()
             self.angles_frame.grid_remove()
             
             self.start_continuous_send()
             
-            self.log("Przełączono na tryb sterowania kątami (ciągłe)")
-            self.log(f"Załadowano aktualne kąty: θ1={current_pos[0]:.1f}°, θ2={current_pos[1]:.1f}°, θ3={current_pos[2]:.1f}°, θ4={current_pos[3]:.1f}°")
+            self.log("INFO: Przełączono na tryb sterowania kątami (ciągłe)")
+            self.log(f"INFO: Załadowano aktualne kąty: θ1={current_pos[0]:.1f}°, θ2={current_pos[1]:.1f}°, θ3={current_pos[2]:.1f}°, θ4={current_pos[3]:.1f}°")
     
     def start_continuous_send(self):
-        """Rozpoczyna ciągłe wysyłanie kątów do robota"""
+        """Rozpoczyna ciągłe wysyłanie kątów do robota."""
         self.angle_send_active = True
         self.send_angles_continuously()
     
     def stop_continuous_send(self):
-        """Zatrzymuje ciągłe wysyłanie kątów"""
+        """Zatrzymuje ciągłe wysyłanie kątów."""
         self.angle_send_active = False
         if self.angle_send_timer:
             self.root.after_cancel(self.angle_send_timer)
@@ -1038,29 +927,23 @@ class RobotControlGUI:
             return
         
         try:
-            th1_deg = self.angle_sliders['th1'].get()
-            th2_deg = self.angle_sliders['th2'].get()
-            th3_deg = self.angle_sliders['th3'].get()
-            th4_deg = self.angle_sliders['th4'].get()
+            th1_deg = self.angle_sliders['th1'].get(); th2_deg = self.angle_sliders['th2'].get()
+            th3_deg = self.angle_sliders['th3'].get(); th4_deg = self.angle_sliders['th4'].get()
             
-            th1 = math.radians(th1_deg)
-            th2 = math.radians(th2_deg)
-            th3 = math.radians(th3_deg)
-            th4 = math.radians(th4_deg)
+            th1 = math.radians(th1_deg); th2 = math.radians(th2_deg); th3 = math.radians(th3_deg); th4 = math.radians(th4_deg)
             
             positions = get_joint_positions(th1, th2, th3, th4)
             min_z = np.min(positions[:, 2])
             
             if min_z < 0:
                 if not hasattr(self, '_collision_warning_shown') or not self._collision_warning_shown:
-                    self.log(f"CRITICAL: Wykryto kolizję (Z = {min_z:.2f} mm). Ruch zablokowany.")
+                    self.log(f"KRYTYCZNE: Wykryto kolizję (Z = {min_z:.2f} mm). Ruch zablokowany.")
                     self._collision_warning_shown = True
-                
                 self.angle_send_timer = self.root.after(50, self.send_angles_continuously)
                 return
 
             if hasattr(self, '_collision_warning_shown') and self._collision_warning_shown:
-                self.log("✓ Strefa bezpieczna. Wznowiono transmisję.")
+                self.log("INFO: Strefa bezpieczna. Wznowiono transmisję.")
                 self._collision_warning_shown = False
             
             current_time = time.time()
@@ -1078,8 +961,10 @@ class RobotControlGUI:
         self.angle_send_timer = self.root.after(50, self.send_angles_continuously)
     
     def on_closing(self):
-        """Zamknięcie aplikacji"""
+        """Metoda wywoływana przy zamykaniu aplikacji - zapewnia bezpieczne rozłączenie."""
+        self.is_connected = False
         self.stop_continuous_send()
+        self.stop_sequence("Aplikacja zamknięta.")
         self.robot.close()
         self.root.destroy()
         
@@ -1088,134 +973,255 @@ class RobotControlGUI:
     # ====================================================================================
 
     def _create_sequence_frame(self, master, row):
-        """Tworzy ramkę do zapisu i wyświetlania sekwencji z funkcją przewijania."""
+        """Tworzy ramkę do zapisu, wczytywania i odtwarzania sekwencji."""
         COLOR_FRAME_BG = "#262a3e"
         
-        sequence_outer_frame = ttk.LabelFrame(master, text="Rejestrator sekwencji ruchów (JSON)", padding="10")
+        sequence_outer_frame = ttk.LabelFrame(master, text="Rejestrator/Odtwarzacz sekwencji ruchów", padding="10")
         sequence_outer_frame.grid(row=row, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5, padx=5)
         sequence_outer_frame.grid_columnconfigure(0, weight=1)
         
+        # Ramka na przyciski LOAD/PLAY/STOP
+        control_frame = ttk.Frame(sequence_outer_frame)
+        control_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 5))
+        control_frame.columnconfigure(0, weight=1); control_frame.columnconfigure(1, weight=1)
+        
+        ttk.Button(control_frame, text="WCZYTAJ SEKWENCJĘ", command=self.load_sequence_from_json, 
+                   style='TButton').grid(row=0, column=0, sticky=tk.W, padx=(0, 5))
+        
+        self.play_button = ttk.Button(control_frame, text="START SEKWENCJI", command=self.play_sequence, 
+                                      style='Play.TButton')
+        self.play_button.grid(row=0, column=1, sticky=tk.E, padx=(5, 0))
+
+        ttk.Separator(sequence_outer_frame, orient='horizontal').grid(row=1, column=0, columnspan=2, sticky='ew', pady=5)
+        
+        # Canvas i Scrollbar dla listy punktów
         canvas = tk.Canvas(sequence_outer_frame, borderwidth=0, background=COLOR_FRAME_BG, highlightthickness=0)
         vscrollbar = ttk.Scrollbar(sequence_outer_frame, orient="vertical", command=canvas.yview)
         
         self.sequence_list_frame = ttk.Frame(canvas, padding="5", style='TLabelframe')
         self.sequence_list_frame.bind(
             "<Configure>",
-            lambda e: canvas.configure(
-                scrollregion=canvas.bbox("all")
-            )
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
         )
         self.sequence_list_frame.grid_columnconfigure(0, weight=1)
 
         self.canvas_window_seq = canvas.create_window((0, 0), window=self.sequence_list_frame, anchor="nw", width=1)
-
         canvas.configure(yscrollcommand=vscrollbar.set)
 
-        # Użycie grid w rzędzie 0 dla canvasa i scrollbara
-        canvas.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S)) 
-        vscrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
-
-        # Wymuszamy, by canvas rozciągał się w pionie (wewnątrz sequence_outer_frame)
-        sequence_outer_frame.grid_rowconfigure(0, weight=1)
+        canvas.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S)) 
+        vscrollbar.grid(row=2, column=1, sticky=(tk.N, tk.S))
+        sequence_outer_frame.grid_rowconfigure(2, weight=1)
         
         def resize_content_seq(event):
              width = event.width - vscrollbar.winfo_width()
              canvas.itemconfig(self.canvas_window_seq, width=width)
         canvas.bind("<Configure>", resize_content_seq)
 
-        # Przycisk ZAPISZ SEKWENCJĘ umieszczony na dole (Wiersz 1)
+        # Przycisk ZAPISZ SEKWENCJĘ umieszczony na dole
         ttk.Button(sequence_outer_frame, text="ZAPISZ SEKWENCJĘ (JSON)", command=self.save_sequence_to_json, 
-                   style='TButton').grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(5, 0))
+                   style='TButton').grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(5, 0))
 
         self._update_sequence_display()
 
-    def add_point_to_sequence(self):
-        """
-        Dodaje aktualną pozycję docelową (XYZ, Fi) z trybu Pozycji do sekwencji, 
-        WERYFIKUJĄC jej osiągalność za pomocą IK.
-        """
-        try:
-            x_target = float(self.x_entry.get())
-            y_target = float(self.y_entry.get())
-            z_target = float(self.z_entry.get())
-            auto_phi = self.auto_phi_var.get()
-            
-            if auto_phi:
-                phi_deg = None
-            else:
-                phi_deg = float(self.phi_entry.get())
-            
-            self.log(f"Walidacja IK dla dodawanego punktu: X={x_target:.2f}, Y={y_target:.2f}, Z={z_target:.2f}")
+    def load_sequence_from_json(self):
+        """Wczytuje sekwencję ruchów z pliku JSON."""
+        file_path = askopenfilename(
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json")],
+            title="Wczytaj sekwencję ruchów"
+        )
+        
+        if file_path:
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    
+                if not isinstance(data, list) or not all(isinstance(item, dict) and 'X' in item for item in data):
+                    raise ValueError("Plik JSON ma nieprawidłowy format sekwencji.")
 
-            # 1. Walidacja: Rozwiązanie IK
+                self.sequence_data = data
+                self._update_sequence_display()
+                self.log(f"INFO: Wczytano {len(self.sequence_data)} punktów z pliku: {file_path}")
+                self.stop_sequence()
+                
+            except Exception as e:
+                self.log(f"BŁĄD WCZYTYWANIA: Wystąpił błąd: {e}")
+                messagebox.showerror("Błąd wczytywania", f"Nie udało się wczytać pliku sekwencji:\n{e}")
+
+    def play_sequence(self):
+        """Przełącza stan odtwarzania sekwencji (START/STOP)."""
+        if not self.is_connected:
+            messagebox.showwarning("Brak połączenia", "Robot musi być połączony, aby rozpocząć sekwencję.")
+            return
+
+        if not self.sequence_data:
+            messagebox.showwarning("Brak sekwencji", "Wczytaj lub zarejestruj punkty sekwencji przed rozpoczęciem.")
+            return
+
+        if self.sequence_playing:
+            self.stop_sequence()
+        else:
+            self.sequence_playing = True
+            self.current_sequence_index = 0
+            self.log("INFO: Rozpoczęto odtwarzanie sekwencji.")
+            self.play_button.config(text="STOP SEKWENCJI", style='Stop.TButton')
+            self._execute_sequence_step()
+
+    def stop_sequence(self, message="Przerwano odtwarzanie sekwencji."):
+        """Zatrzymuje odtwarzanie sekwencji i resetuje stan."""
+        if self.sequence_playing:
+            self.sequence_playing = False
+            self.current_sequence_index = 0
+            self.target_xyz = None
+            
+            if self.sequence_timer:
+                self.root.after_cancel(self.sequence_timer)
+                self.sequence_timer = None
+            
+            if self.play_button:
+                 self.play_button.config(text="START SEKWENCJI", style='Play.TButton')
+                 
+            self.log(f"INFO: {message}")
+            self._update_sequence_display()
+
+    def _execute_sequence_step(self):
+        """Wysyła cel do robota i uruchamia pętlę weryfikacji pozycji."""
+        if not self.sequence_playing:
+            return
+
+        if self.current_sequence_index >= len(self.sequence_data):
+            self.stop_sequence("Sekwencja zakończona pomyślnie.")
+            return
+
+        # 1. Pobranie punktu
+        point = self.sequence_data[self.current_sequence_index]
+        x, y, z = point['X'], point['Y'], point['Z']
+        
+        self.log(f"KROK {self.current_sequence_index + 1}/{len(self.sequence_data)}: Cel XYZ({x:.2f}, {y:.2f}, {z:.2f})")
+        
+        # Ustawienie docelowej pozycji dla pętli weryfikacyjnej
+        self.target_xyz = np.array([x, y, z])
+        self._update_sequence_display(highlight_index=self.current_sequence_index)
+        
+        try:
+            # 2. Decyzja: Użycie zapisanych kątów (Teach Mode) LUB obliczenie IK (Cartesian Mode)
+            if 'Joints' in point and point['Joints'] is not None:
+                # Ścieżka szybka: Mamy gotowe kąty z nauczania
+                th1_deg, th2_deg, th3_deg, th4_deg = point['Joints']
+                th1, th2, th3, th4 = map(math.radians, [th1_deg, th2_deg, th3_deg, th4_deg])
+
+            else:
+                # Ścieżka standardowa: Obliczenie IK
+                phi_deg = point['Fi'] if not point['Auto_Fi'] else None
+                current_pos = self.robot.get_current_angles()
+                current_angles = tuple(math.radians(angle) for angle in current_pos[:4])
+                
+                solution, _ = solve_ik_for_cartesian(x, y, z, phi_deg, current_angles)
+                
+                if solution is None:
+                    raise Exception("Brak rozwiązania IK dla tego punktu.")
+                
+                th1, th2, th3, th4 = solution
+            
+            # 3. Wysyłka do robota
+            success, message = self.robot.send_target_angles(th1, th2, th3, th4)
+            
+            if not success:
+                 raise Exception(f"Wysyłka komendy ruchu nieudana: {message}")
+                 
+            self.log(f"KOMENDA: Kąty wysłane. Oczekiwanie na osiągnięcie pozycji...")
+
+            # 4. Uruchomienie pętli weryfikacji pozycji
+            self._wait_for_position()
+
+        except Exception as e:
+            self.log(f"BŁĄD KRYTYCZNY: Wykonanie kroku {self.current_sequence_index + 1} nie powiodło się: {e}")
+            self.stop_sequence("Błąd krytyczny podczas wykonywania kroku. Sekwencja przerwana.")
+
+    def _wait_for_position(self):
+        """Pętla sprawdzająca osiągnięcie docelowej pozycji (target_xyz) na podstawie odczytu TCP z robota."""
+        if not self.sequence_playing or self.target_xyz is None:
+            return
+
+        # Obliczenie odległości euklidesowej
+        current_pos = self.last_tcp_pos 
+        distance = np.linalg.norm(current_pos - self.target_xyz)
+        
+        print(f"\rWeryfikacja: Błąd={distance:.2f}mm", end="") 
+
+        if distance <= POSITION_TOLERANCE:
+            self.log(f"INFO: Krok {self.current_sequence_index + 1} osiągnięty. Błąd końcowy: {distance:.2f}mm.")
+            
+            # Przejście do następnego kroku
+            self.current_sequence_index += 1
+            self.target_xyz = None 
+            
+            # Zaplanuj natychmiastowe wykonanie następnego kroku
+            self.sequence_timer = self.root.after(100, self._execute_sequence_step) 
+        else:
+            # Ponów sprawdzanie po 100 ms
+            self.sequence_timer = self.root.after(100, self._wait_for_position)
+
+    def add_point_to_sequence(self):
+        """Dodaje zweryfikowaną IK pozycję z trybu XYZ do sekwencji."""
+        try:
+            x_target = float(self.x_entry.get()); y_target = float(self.y_entry.get()); z_target = float(self.z_entry.get())
+            # Pobranie stanu checkboxa do zmiennej lokalnej
+            is_auto_phi = self.auto_phi_var.get()
+            phi_deg = None if is_auto_phi else float(self.phi_entry.get())
+            
+            self.log(f"INFO: Walidacja IK dla punktu: XYZ({x_target:.2f}, {y_target:.2f}, {z_target:.2f})")
             current_pos = self.robot.get_current_angles()
             current_angles = tuple(math.radians(angle) for angle in current_pos[:4])
-            
             solution, _ = solve_ik_for_cartesian(x_target, y_target, z_target, phi_deg, current_angles)
             
             if solution is None:
-                messagebox.showerror("Błąd Walidacji", "Nie można dodać punktu: Pozycja XYZ jest poza zasięgiem (Brak rozwiązania IK).")
+                messagebox.showerror("Błąd Walidacji", "Pozycja XYZ jest poza zasięgiem (Brak rozwiązania IK).")
                 self.log("BŁĄD: Dodawanie punktu odrzucone - Pozycja poza zasięgiem.")
                 return
 
-            # 2. Zapisanie zweryfikowanego punktu
             new_point = {
-                "X": round(x_target, 2),
-                "Y": round(y_target, 2),
-                "Z": round(z_target, 2),
+                "X": round(x_target, 2), "Y": round(y_target, 2), "Z": round(z_target, 2),
                 "Fi": round(phi_deg, 2) if phi_deg is not None else None,
-                "Auto_Fi": auto_phi
+                "Auto_Fi": is_auto_phi  # POPRAWKA: Użycie poprawnej zmiennej logicznej
             }
             
             self.sequence_data.append(new_point)
             self._update_sequence_display()
-            self.log(f"✓ Dodano punkt nr {len(self.sequence_data)} (zweryfikowany IK).")
+            self.log(f"INFO: Dodano punkt nr {len(self.sequence_data)} (zweryfikowany IK).")
             
         except ValueError:
             messagebox.showerror("Błąd", "Wprowadź poprawne wartości liczbowe dla X, Y, Z i Fi.")
         except Exception as e:
-            self.log(f"Błąd podczas dodawania punktu: {e}")
+            self.log(f"BŁĄD: Wystąpił błąd podczas dodawania punktu: {e}")
 
     def add_current_angles_to_sequence(self):
-        """
-        Dodaje aktualną pozycję obliczoną na podstawie suwaków (FK) z trybu Kątów do sekwencji.
-        """
+        """Dodaje aktualną pozycję obliczoną z kątów (FK) do sekwencji, zapisując również kąty źródłowe."""
         try:
-            # 1. Pobierz kąty z suwaków (w stopniach)
-            th1_deg = self.angle_sliders['th1'].get()
-            th2_deg = self.angle_sliders['th2'].get()
-            th3_deg = self.angle_sliders['th3'].get()
-            th4_deg = self.angle_sliders['th4'].get()
+            # Pobranie wartości z suwaków
+            th1_deg = self.angle_sliders['th1'].get(); th2_deg = self.angle_sliders['th2'].get()
+            th3_deg = self.angle_sliders['th3'].get(); th4_deg = self.angle_sliders['th4'].get()
             
-            # 2. Kinematyka Prosta (FK) do uzyskania pozycji XYZ i Orientacji Fi
-            th1 = math.radians(th1_deg)
-            th2 = math.radians(th2_deg)
-            th3 = math.radians(th3_deg)
-            th4 = math.radians(th4_deg)
+            th1 = math.radians(th1_deg); th2 = math.radians(th2_deg)
+            th3 = math.radians(th3_deg); th4 = math.radians(th4_deg)
 
             positions = get_joint_positions(th1, th2, th3, th4)
-            tcp_pos = positions[-1] # Pozycja TCP
+            tcp_pos = positions[-1]
             
-            # Obliczanie Fi na podstawie geometrii (zakładam, że Fi = th2 + th3 + th4)
-            try:
-                fi_rad = get_fk_orientation_fi(th2, th3, th4)
-            except NameError:
-                fi_rad = th2 + th3 + th4
-            
+            # Normalizacja orientacji Fi
+            raw_sum = th2 + th3 + th4
+            fi_rad = math.atan2(math.sin(raw_sum), math.cos(raw_sum))
             fi_deg = math.degrees(fi_rad)
 
-            # 3. Zapisz punkt
             new_point = {
-                "X": round(tcp_pos[0], 2),
-                "Y": round(tcp_pos[1], 2),
-                "Z": round(tcp_pos[2], 2),
-                "Fi": round(fi_deg, 2),
-                "Auto_Fi": False 
+                "X": round(tcp_pos[0], 2), "Y": round(tcp_pos[1], 2), "Z": round(tcp_pos[2], 2),
+                "Fi": round(fi_deg, 2), "Auto_Fi": False,
+                "Joints": [th1_deg, th2_deg, th3_deg, th4_deg]
             }
             
             self.sequence_data.append(new_point)
             self._update_sequence_display()
-            self.log(f"✓ Dodano punkt z trybu kątów (FK): XYZ({new_point['X']:.2f}, {new_point['Y']:.2f}, {new_point['Z']:.2f}), Fi={new_point['Fi']:.2f}°")
+            self.log(f"INFO: Dodano punkt (Teach Mode): XYZ({new_point['X']:.2f}, ...), Joints zapisane.")
 
         except Exception as e:
             self.log(f"BŁĄD: Nie udało się dodać punktu z trybu kątów: {e}")
@@ -1225,30 +1231,32 @@ class RobotControlGUI:
         if 0 <= index < len(self.sequence_data):
             del self.sequence_data[index]
             self._update_sequence_display()
-            self.log(f"Usunięto punkt nr {index + 1} z sekwencji.")
+            self.log(f"INFO: Usunięto punkt nr {index + 1} z sekwencji.")
 
-    def _update_sequence_display(self):
-        """Odświeża wizualizację listy punktów w przewijalnej ramce."""
+    def _update_sequence_display(self, highlight_index=None):
+        """Odświeża wizualizację listy punktów w przewijalnej ramce, z opcją podświetlenia."""
         for widget in self.sequence_list_frame.winfo_children():
             widget.destroy()
 
-        COLOR_TEXT = "#c4cad0"
+        COLOR_TEXT = "#c4cad0"; COLOR_HIGHLIGHT = "#FFD700" 
         
         if not self.sequence_data:
             ttk.Label(self.sequence_list_frame, text="Brak zapisanych punktów", foreground='gray').grid(row=0, column=0, padx=5, pady=5)
             return
             
         for i, point in enumerate(self.sequence_data):
-            point_frame = ttk.Frame(self.sequence_list_frame, padding="5", relief=tk.SOLID, borderwidth=1, style='TLabelframe')
-            point_frame.grid(row=i, column=0, sticky=(tk.W, tk.E), pady=2, padx=2)
-            point_frame.columnconfigure(1, weight=1)
+            bg_style = 'TButton' if i == highlight_index and self.sequence_playing else 'TLabelframe'
+            fg_color = COLOR_HIGHLIGHT if i == highlight_index and self.sequence_playing else COLOR_TEXT
             
-            ttk.Label(point_frame, text=f"PUNKT {i+1}", font=('Arial', 10, 'bold'), foreground='#377df0').grid(row=0, column=0, sticky=tk.W, padx=5)
+            point_frame = ttk.Frame(self.sequence_list_frame, padding="5", relief=tk.SOLID, borderwidth=1, style=bg_style)
+            point_frame.grid(row=i, column=0, sticky=(tk.W, tk.E), pady=2, padx=2); point_frame.columnconfigure(1, weight=1)
+            
+            ttk.Label(point_frame, text=f"PUNKT {i+1}", font=('Arial', 10, 'bold'), foreground=fg_color).grid(row=0, column=0, sticky=tk.W, padx=5)
 
             phi_display = f"Auto" if point['Auto_Fi'] else f"{point['Fi']:.2f}°"
             data_text = f"X: {point['X']:.2f}, Y: {point['Y']:.2f}, Z: {point['Z']:.2f}, φ: {phi_display}"
             
-            ttk.Label(point_frame, text=data_text).grid(row=1, column=0, sticky=tk.W, padx=5)
+            ttk.Label(point_frame, text=data_text, foreground=fg_color).grid(row=1, column=0, sticky=tk.W, padx=5)
             
             ttk.Button(point_frame, text="✕", width=2, 
                        command=lambda idx=i: self.remove_point_from_sequence(idx)).grid(row=0, column=1, rowspan=2, sticky=tk.E, padx=5, pady=5)
@@ -1273,16 +1281,12 @@ class RobotControlGUI:
                 with open(filename, 'w', encoding='utf-8') as f:
                     json.dump(self.sequence_data, f, indent=4)
                 
-                self.log(f"Zapisano sekwencję {len(self.sequence_data)} punktów do: {filename}")
+                self.log(f"INFO: Zapisano {len(self.sequence_data)} punktów do: {filename}")
                 messagebox.showinfo("Zapisano", f"Sekwencja została pomyślnie zapisana do:\n{filename}")
                 
             except Exception as e:
                 self.log(f"BŁĄD ZAPISU: Nie udało się zapisać pliku JSON: {e}")
                 messagebox.showerror("Błąd zapisu", f"Nie udało się zapisać pliku JSON:\n{e}")
-        """Zamknięcie aplikacji"""
-        self.stop_continuous_send()
-        self.robot.close()
-        self.root.destroy()
 
 # =====================================================================
 # MAIN
