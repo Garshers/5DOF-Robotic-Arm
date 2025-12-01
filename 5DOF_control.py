@@ -512,7 +512,7 @@ class RobotControlGUI:
         COLOR_BORDER = "#565a6c"
         COLOR_TEXT = "#c4cad0"
         COLOR_ACCENT = "#101122"
-        COLOR_BUTTON = "#377df0"
+        COLOR_BUTTON = "#2f3347"
         COLOR_STOP = "#cb0000" 
         COLOR_PLAY = "#008000" 
 
@@ -627,9 +627,17 @@ class RobotControlGUI:
             value_label = ttk.Label(self.angle_control_frame, text="0.0°", font=('Arial', 10, 'bold'))
             value_label.grid(row=i, column=2, padx=5)
             self.angle_value_labels[key] = value_label
+        
+        self.live_control_var = tk.BooleanVar(value=False)
+        self.live_control_check = ttk.Checkbutton(self.angle_control_frame, 
+                                                  text="WŁĄCZ LIVE (Transmisja ciągła)",
+                                                  variable=self.live_control_var,
+                                                  command=self.toggle_live_control)
+        self.live_control_check.grid(row=len(joint_names), column=0, columnspan=3, pady=10, sticky=tk.W)
+
         self.add_angle_point_button = ttk.Button(self.angle_control_frame, text="DODAJ AKTUALNE KĄTY (do sekwencji)", 
                                                  command=self.add_current_angles_to_sequence, style='TButton')
-        self.add_angle_point_button.grid(row=len(joint_names), column=0, columnspan=3, pady=5, sticky=(tk.W, tk.E))
+        self.add_angle_point_button.grid(row=len(joint_names)+1, column=0, columnspan=3, pady=5, sticky=(tk.W, tk.E))
         
         # Pozycja docelowa (row 5)
         self.target_frame = ttk.LabelFrame(self.content_frame, text="Pozycja docelowa [mm]", padding="10")
@@ -639,20 +647,27 @@ class RobotControlGUI:
         ttk.Label(self.target_frame, text="Z:").grid(row=2, column=0, sticky=tk.W, pady=5); self.z_entry = ttk.Entry(self.target_frame, width=15); self.z_entry.grid(row=2, column=1, padx=5); self.z_entry.insert(0, "372.5")
         ttk.Label(self.target_frame, text="Orientacja φ [°]:").grid(row=3, column=0, sticky=tk.W, pady=5); self.phi_entry = ttk.Entry(self.target_frame, width=15); self.phi_entry.grid(row=3, column=1, padx=5); self.phi_entry.insert(0, "0")
         self.auto_phi_var = tk.BooleanVar(value=True)
-        self.auto_phi_check = ttk.Checkbutton(self.target_frame, text="Orientacja automatyczna (optymalizacja przemysłowa)",
+        self.auto_phi_check = ttk.Checkbutton(self.target_frame, text="Orientacja automatyczna",
                                               variable=self.auto_phi_var, command=self.toggle_phi_entry)
         self.auto_phi_check.grid(row=4, column=0, columnspan=2, pady=5, sticky=tk.W)
-        ttk.Button(self.target_frame, text="WYŚLIJ POZYCJĘ", command=self.send_position, style='TButton').grid(row=5, column=0, columnspan=2, pady=5, sticky=(tk.W, tk.E))
-        ttk.Button(self.target_frame, text="DODAJ PUNKT (do sekwencji) [Walidacja IK]", 
-                   command=self.add_point_to_sequence, style='TButton').grid(row=6, column=0, columnspan=2, pady=5, sticky=(tk.W, tk.E))
-        self.toggle_phi_entry()
+        # Kontener na przyciski w jednym wierszu (row 5)
+        buttons_row = ttk.Frame(self.target_frame)
+        buttons_row.grid(row=5, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
         
-        # Ramka zapisu sekwencji (row 7)
-        self._create_sequence_frame(self.content_frame, 7) 
+        # Konfiguracja kolumn: weight=1 (rozciąganie) oraz uniform="row_group" (wymuszenie równej szerokości)
+        buttons_row.columnconfigure(0, weight=1, uniform="row_group") 
+        buttons_row.columnconfigure(1, weight=1, uniform="row_group")
+
+        ttk.Button(buttons_row, text="WYŚLIJ POZYCJĘ", command=self.send_position, style='TButton').grid(row=0, column=0, padx=(0, 2), sticky=(tk.W, tk.E))
+        ttk.Button(buttons_row, text="DODAJ PUNKT", command=self.add_point_to_sequence, style='TButton').grid(row=0, column=1, padx=(2, 0), sticky=(tk.W, tk.E))
+
+        ttk.Button(buttons_row, text="WYŚLIJ POZYCJĘ", command=self.send_position, style='TButton').grid(row=0, column=0, padx=(0, 2), sticky=(tk.W, tk.E))
+        ttk.Button(buttons_row, text="DODAJ PUNKT (do sekwencji)", command=self.add_point_to_sequence, style='TButton').grid(row=0, column=1, padx=(2, 0), sticky=(tk.W, tk.E))
+        self.toggle_phi_entry()
         
         # Log (row 8)
         log_frame = ttk.LabelFrame(self.content_frame, text="Log komunikacji", padding="10")
-        log_frame.grid(row=8, column=0, sticky=(tk.W, tk.E), pady=5, padx=5)
+        log_frame.grid(row=7, column=0, sticky=(tk.W, tk.E), pady=5, padx=5)
         self.log_text = tk.Text(log_frame, height=10, width=50, bg=COLOR_FRAME_BG, fg=COLOR_TEXT, 
                                 insertbackground=COLOR_TEXT, selectbackground=COLOR_ACCENT,
                                 highlightbackground=COLOR_BORDER, highlightthickness=1)
@@ -661,6 +676,9 @@ class RobotControlGUI:
         scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
         self.log_text['yscrollcommand'] = scrollbar.set
         log_frame.grid_columnconfigure(0, weight=1); log_frame.grid_rowconfigure(0, weight=1)
+
+        # Ramka zapisu sekwencji (row 7)
+        self._create_sequence_frame(self.content_frame, 8) 
 
         # === WIZUALIZACJA 3D ===
         viz_frame = ttk.LabelFrame(right_frame, text="Wizualizacja 3D", padding="10")
@@ -888,26 +906,29 @@ class RobotControlGUI:
         """Przełącza między trybem sterowania pozycją a kątami."""
         mode = self.control_mode.get()
         
+        # Zawsze zatrzymujemy transmisję przy zmianie trybu dla bezpieczeństwa
+        self.stop_continuous_send()
+        self.live_control_var.set(False) 
+        
         if mode == 'position':
             self.target_frame.grid(); self.angle_control_frame.grid_remove()
             self.angles_frame.grid()
-            self.stop_continuous_send()
             self.log("INFO: Przełączono na tryb sterowania pozycją (XYZ)")
             
         elif mode == 'angles':
             current_pos = self.robot.get_current_angles()
             self.angle_sliders['th1'].set(current_pos[0]); self.angle_sliders['th2'].set(current_pos[1])
             self.angle_sliders['th3'].set(current_pos[2]); self.angle_sliders['th4'].set(current_pos[3])
-            self.angle_value_labels['th1'].config(text=f"{current_pos[0]:.1f}°"); self.angle_value_labels['th2'].config(text=f"{current_pos[1]:.1f}°")
-            self.angle_value_labels['th3'].config(text=f"{current_pos[2]:.1f}°"); self.angle_value_labels['th4'].config(text=f"{current_pos[3]:.1f}°")
+            
+            self.angle_value_labels['th1'].config(text=f"{current_pos[0]:.1f}°")
+            self.angle_value_labels['th2'].config(text=f"{current_pos[1]:.1f}°")
+            self.angle_value_labels['th3'].config(text=f"{current_pos[2]:.1f}°")
+            self.angle_value_labels['th4'].config(text=f"{current_pos[3]:.1f}°")
             
             self.target_frame.grid_remove(); self.angle_control_frame.grid()
             self.angles_frame.grid_remove()
             
-            self.start_continuous_send()
-            
-            self.log("INFO: Przełączono na tryb sterowania kątami (ciągłe)")
-            self.log(f"INFO: Załadowano aktualne kąty: θ1={current_pos[0]:.1f}°, θ2={current_pos[1]:.1f}°, θ3={current_pos[2]:.1f}°, θ4={current_pos[3]:.1f}°")
+            self.log("INFO: Przełączono na tryb sterowania kątami. Zaznacz 'LIVE' aby sterować.")
     
     def start_continuous_send(self):
         """Rozpoczyna ciągłe wysyłanie kątów do robota."""
@@ -972,6 +993,19 @@ class RobotControlGUI:
     #           METODY OBSŁUGI SEKWENCJI RUCHÓW
     # ====================================================================================
 
+    def toggle_live_control(self):
+        """Obsługuje manualne włączanie/wyłączanie ciągłej transmisji."""
+        if self.live_control_var.get():
+            if self.sequence_playing:
+                self.log("OSTRZEŻENIE: Nie można włączyć trybu LIVE podczas odtwarzania sekwencji!")
+                self.live_control_var.set(False)
+                return
+            self.start_continuous_send()
+            self.log("INFO: Transmisja LIVE włączona.")
+        else:
+            self.stop_continuous_send()
+            self.log("INFO: Transmisja LIVE wyłączona.")
+
     def _create_sequence_frame(self, master, row):
         """Tworzy ramkę do zapisu, wczytywania i odtwarzania sekwencji."""
         COLOR_FRAME_BG = "#262a3e"
@@ -980,18 +1014,29 @@ class RobotControlGUI:
         sequence_outer_frame.grid(row=row, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5, padx=5)
         sequence_outer_frame.grid_columnconfigure(0, weight=1)
         
-        # Ramka na przyciski LOAD/PLAY/STOP
-        control_frame = ttk.Frame(sequence_outer_frame)
+        # Ramka na przyciski LOAD/SAVE/PLAY (Wszystkie w control_frame)
+        control_frame = tk.Frame(sequence_outer_frame, bg=COLOR_FRAME_BG)
         control_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 5))
-        control_frame.columnconfigure(0, weight=1); control_frame.columnconfigure(1, weight=1)
         
-        ttk.Button(control_frame, text="WCZYTAJ SEKWENCJĘ", command=self.load_sequence_from_json, 
-                   style='TButton').grid(row=0, column=0, sticky=tk.W, padx=(0, 5))
+        # --- KONFIGURACJA ŚRODKOWANIA ---
+        # Kolumny 0 i 4 to "sprężyny" (weight=1), które dopychają 3 przyciski do środka
+        control_frame.columnconfigure(0, weight=1)
+        control_frame.columnconfigure(4, weight=1)
         
+        # Przycisk 1: WCZYTAJ (kolumna 1)
+        ttk.Button(control_frame, text="WCZYTAJ", command=self.load_sequence_from_json, 
+                   style='TButton').grid(row=0, column=1, padx=5)
+        
+        # Przycisk 2: ZAPISZ (kolumna 2) - Teraz wewnątrz control_frame!
+        ttk.Button(control_frame, text="ZAPISZ", command=self.save_sequence_to_json, 
+                   style='TButton').grid(row=0, column=2, padx=5)
+        
+        # Przycisk 3: START (kolumna 3)
         self.play_button = ttk.Button(control_frame, text="START SEKWENCJI", command=self.play_sequence, 
                                       style='Play.TButton')
-        self.play_button.grid(row=0, column=1, sticky=tk.E, padx=(5, 0))
-
+        self.play_button.grid(row=0, column=3, padx=5)
+        
+        # Separator pod przyciskami (row 1 w ramce zewnętrznej)
         ttk.Separator(sequence_outer_frame, orient='horizontal').grid(row=1, column=0, columnspan=2, sticky='ew', pady=5)
         
         # Canvas i Scrollbar dla listy punktów
@@ -1016,10 +1061,6 @@ class RobotControlGUI:
              width = event.width - vscrollbar.winfo_width()
              canvas.itemconfig(self.canvas_window_seq, width=width)
         canvas.bind("<Configure>", resize_content_seq)
-
-        # Przycisk ZAPISZ SEKWENCJĘ umieszczony na dole
-        ttk.Button(sequence_outer_frame, text="ZAPISZ SEKWENCJĘ (JSON)", command=self.save_sequence_to_json, 
-                   style='TButton').grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(5, 0))
 
         self._update_sequence_display()
 
@@ -1054,10 +1095,17 @@ class RobotControlGUI:
             messagebox.showwarning("Brak połączenia", "Robot musi być połączony, aby rozpocząć sekwencję.")
             return
 
+        # 1. Obsługa konfliktu z trybem manualnym (LIVE)
+        if self.live_control_var.get():
+            self.live_control_var.set(False)
+            self.stop_continuous_send()
+            self.log("INFO: Tryb LIVE został automatycznie wyłączony przez sekwenser.")
+
         if not self.sequence_data:
             messagebox.showwarning("Brak sekwencji", "Wczytaj lub zarejestruj punkty sekwencji przed rozpoczęciem.")
             return
 
+        # 2. Logika przełączania START/STOP
         if self.sequence_playing:
             self.stop_sequence()
         else:
@@ -1069,21 +1117,25 @@ class RobotControlGUI:
 
     def stop_sequence(self, message="Przerwano odtwarzanie sekwencji."):
         """Zatrzymuje odtwarzanie sekwencji i resetuje stan."""
-        if self.sequence_playing:
-            self.sequence_playing = False
-            self.current_sequence_index = 0
-            self.target_xyz = None
-            
-            if self.sequence_timer:
-                self.root.after_cancel(self.sequence_timer)
-                self.sequence_timer = None
-            
-            if self.play_button:
-                 self.play_button.config(text="START SEKWENCJI", style='Play.TButton')
-                 
-            self.log(f"INFO: {message}")
-            self._update_sequence_display()
-
+        # Reset flagi odtwarzania
+        self.sequence_playing = False
+        self.current_sequence_index = 0
+        self.target_xyz = None
+        
+        # Anulowanie timera sekwencji, jeśli istnieje
+        if self.sequence_timer:
+            self.root.after_cancel(self.sequence_timer)
+            self.sequence_timer = None
+        
+        # Przywrócenie wyglądu przycisku Play
+        if self.play_button:
+             self.play_button.config(text="START SEKWENCJI", style='Play.TButton')
+             
+        self.log(f"INFO: {message}")
+        
+        # Odświeżenie listy (usunięcie podświetlenia)
+        self._update_sequence_display()
+                
     def _execute_sequence_step(self):
         """Wysyła cel do robota i uruchamia pętlę weryfikacji pozycji."""
         if not self.sequence_playing:
