@@ -2,15 +2,16 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 from tkinter.filedialog import asksaveasfilename, askopenfilename
 import json
-import sympy as sp
-import numpy as np
-import math
 import serial
 import serial.tools.list_ports
 import time
 import threading
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
+
+## KINEMATYKA
+import math
+import numpy as np
 
 # =====================================================================
 # KOMUNIKACJA SERIAL Z ESP-32
@@ -217,241 +218,214 @@ class RobotSerial:
 # KINEMATYKA (Model matematyczny robota 5-DOF)
 # =====================================================================
 
-# Parametry geometryczne (Denavit-Hartenberg / wymiary ogniw w mm)
-l1_val = 18.4
-l2_val = 149.0
-l3_val = 120.3
-l4_val = 87.8
-l5_val = 23.0
-lambda1_val = 110.8
-lambda5_val = 10.0
+class RobotKinematics:
+    def __init__(self, geometry_params, joint_limits):
+        """
+        Inicjalizacja modelu kinematycznego i prekomputacja stałych.
+        
+        :param geometry_params: Słownik z wymiarami: l1, l2, l3, l4, l5, lambda1, lambda5
+        :param joint_limits: Słownik z limitami kątowymi: 'th1', 'th2', 'th3', 'th4'
+        """
+        # 1. Przypisanie parametrów geometrycznych
+        self.l1 = geometry_params['l1']
+        self.l2 = geometry_params['l2']
+        self.l3 = geometry_params['l3']
+        self.l4 = geometry_params['l4']
+        self.l5 = geometry_params['l5']
+        self.lambda1 = geometry_params['lambda1']
+        self.lambda5 = geometry_params['lambda5']
+        
+        self.limits = joint_limits
 
-phi_offset = math.atan2(lambda5_val, l4_val + l5_val)
+        # 2. Prekomputacja stałych dla IK (Optymalizacja CPU)
+        # Efektywne długości ramion
+        self.L1 = self.l2
+        self.L2 = self.l3
+        # L3 jako wektor sztywny (sqrt obliczany raz przy inicjalizacji)
+        self.L3 = math.sqrt((self.l4 + self.l5)**2 + self.lambda5**2)
+        
+        # Stałe do twierdzenia cosinusów (unikamy potęgowania w czasie rzeczywistym)
+        self.L1_sq = self.L1**2
+        self.L2_sq = self.L2**2
+        self.denom = 2 * self.L1 * self.L2
+        
+        # Stałe zasięgu (kwadraty, aby unikać sqrt w warunkach if)
+        self.max_reach_sq = (self.L1 + self.L2)**2
+        self.min_reach_sq = (self.L1 - self.L2)**2
+        
+        # Stały offset geometryczny narzędzia
+        self.geo_phi_offset = math.atan2(self.lambda5, self.l4 + self.l5)
 
-# Zmienne symboliczne (używane przez SymPy do analizy, rzadziej w runtime)
-th1, th2, th3, th4, alpha5 = sp.symbols('θ1 θ2 θ3 θ4 α5')
-pi = sp.pi
+    def _rot_z(self, t):
+        c, s = np.cos(t), np.sin(t)
+        return np.array([[c, -s, 0, 0], [s, c, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
 
-# --- Macierze transformacji jednorodnych ---
-def RotZ(theta):
-    c, s = sp.cos(theta), sp.sin(theta)
-    return sp.Matrix([[c, -s, 0, 0], [s, c, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
+    def _rot_x(self, a):
+        c, s = np.cos(a), np.sin(a)
+        return np.array([[1, 0, 0, 0], [0, c, -s, 0], [0, s, c, 0], [0, 0, 0, 1]])
 
-def RotX(alpha):
-    c, s = sp.cos(alpha), sp.sin(alpha)
-    return sp.Matrix([[1, 0, 0, 0], [0, c, -s, 0], [0, s, c, 0], [0, 0, 0, 1]])
+    def _trans_z(self, d):
+        return np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, d], [0, 0, 0, 1]])
 
-def TransZ(d):
-    return sp.Matrix([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, d], [0, 0, 0, 1]])
+    def _trans_x(self, a):
+        return np.array([[1, 0, 0, a], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
 
-def TransX(a):
-    return sp.Matrix([[1, 0, 0, a], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
+    def forward_kinematics(self, th1, th2, th3, th4, alpha5=0.0):
+        """
+        Oblicza kinematykę prostą (FK).
+        """
+        # Parametry DH (kąty skręcenia)
+        alpha1, alpha4 = np.pi / 2, -np.pi / 2
 
-def forward_kinematics(th1_val, th2_val, th3_val, th4_val, alpha5_val=0.0):
-    """
-    Oblicza kinematykę prostą (FK) przy użyciu macierzy symbolicznych SymPy.
-    UWAGA: Funkcja kosztowna obliczeniowo. Do wizualizacji realtime użyj get_joint_positions.
-    """
-    alpha1_val = np.pi / 2
-    alpha4_val = -np.pi / 2
-    
-    A1 = RotZ(th1_val) * TransZ(lambda1_val) * TransX(l1_val) * RotX(alpha1_val)
-    A2 = RotZ(th2_val) * TransX(l2_val)
-    A3 = RotZ(-th3_val) * TransX(l3_val)
-    A4 = RotZ(-th4_val) * TransX(l4_val) * RotX(alpha4_val)
-    A5 = TransZ(lambda5_val) * TransX(l5_val) * RotX(alpha5_val)
-    
-    A_total = A1 * A2 * A3 * A4 * A5
-    A_num = np.array(A_total.evalf().tolist()).astype(float)
+        # Macierze transformacji
+        T1 = self._rot_z(th1) @ self._trans_z(self.lambda1) @ self._trans_x(self.l1) @ self._rot_x(alpha1)
+        T2 = self._rot_z(th2) @ self._trans_x(self.l2)
+        T3 = self._rot_z(-th3) @ self._trans_x(self.l3)
+        T4 = self._rot_z(-th4) @ self._trans_x(self.l4) @ self._rot_x(alpha4)
+        T5 = self._trans_z(self.lambda5) @ self._trans_x(self.l5) @ self._rot_x(alpha5)
 
-    print("[DEBUG FK] Asum =\n", A_num)
-    return A_num
+        origin = np.array([0, 0, 0, 1])
+        
+        # P1..P5
+        p1 = np.array([0, 0, 0])
+        p2 = (T1 @ origin)[:3]
+        p3 = (T1 @ T2 @ origin)[:3]
+        p4 = (T1 @ T2 @ T3 @ origin)[:3]
+        p5 = (T1 @ T2 @ T3 @ T4 @ T5 @ origin)[:3]
 
-def inverse_kinematics(R, Z, th1_base, phi_deg=0.0, elbow_up=True, reverse_base=False):
-    """
-    Rozwiązuje zagadnienie kinematyki odwrotnej (IK) metodą geometryczną.
-    Redukuje problem 3D do płaszczyzny 2D zdefiniowanej przez kąt bazy th1.
-    """
-    th1 = th1_base
-    
-    # Efektywne długości ramion
-    L1 = l2_val
-    L2 = l3_val
-    L3 = math.sqrt((l4_val + l5_val)**2 + lambda5_val**2)
-    
-    phi_rad = math.radians(phi_deg)
-    phi_corr = phi_rad + phi_offset
-    
-    # Współrzędna radialna w układzie cylindrycznym
-    R_ik = -R if reverse_base else R
-    
-    # Wyznaczenie pozycji nadgarstka (Wrist Point)
-    R_wrist = R_ik - l1_val - L3 * math.cos(phi_corr)
-    Z_wrist = Z - lambda1_val - L3 * math.sin(phi_corr)
-    
-    D = math.hypot(R_wrist, Z_wrist)
-    
-    # Sprawdzenie zasięgu (nierówność trójkąta)
-    if D > (L1 + L2) or D < abs(L1 - L2):
-        return None
-    
-    # Twierdzenie cosinusów
-    cos_th3 = (D**2 - L1**2 - L2**2) / (2 * L1 * L2)
-    cos_th3 = np.clip(cos_th3, -1.0, 1.0)
-    
-    th3_ik = math.acos(cos_th3) if elbow_up else -math.acos(cos_th3)
-    
-    alpha = math.atan2(Z_wrist, R_wrist)
-    beta = math.atan2(L2 * math.sin(th3_ik), L1 + L2 * math.cos(th3_ik))
-    
-    th2 = alpha - beta
-    
-    # Kąty wynikowe
-    th4_ik = phi_rad - th2 - th3_ik
-    th3 = -th3_ik
-    th4 = -th4_ik
-    
-    # Normalizacja do [-pi, pi]
-    th1 = math.atan2(math.sin(th1), math.cos(th1))
-    th2 = math.atan2(math.sin(th2), math.cos(th2))
-    th3 = math.atan2(math.sin(th3), math.cos(th3))
-    th4 = math.atan2(math.sin(th4), math.cos(th4))
-    
-    return (th1, th2, th3, th4)
+        return np.array([p1, p2, p3, p4, p5])
 
-JOINT_CONST = pi/2
-JOINT_LIMITS = {
-    'th1': (-JOINT_CONST, JOINT_CONST),       # Baza
-    'th2': (0            , JOINT_CONST * 1.5),# Bark
-    'th3': (-JOINT_CONST, JOINT_CONST),       # Łokieć
-    'th4': (-JOINT_CONST, JOINT_CONST)        # Nadgarstek
-}
-
-def check_constraints(th1, th2, th3, th4):
-    """Weryfikuje limity kątowe oraz bezkolizyjność z płaszczyzną stołu (Z=0)."""
-    # 1. Limity złączy
-    if not (JOINT_LIMITS['th1'][0] <= th1 <= JOINT_LIMITS['th1'][1]): return False
-    if not (JOINT_LIMITS['th2'][0] <= th2 <= JOINT_LIMITS['th2'][1]): return False
-    if not (JOINT_LIMITS['th3'][0] <= th3 <= JOINT_LIMITS['th3'][1]): return False
-    if not (JOINT_LIMITS['th4'][0] <= th4 <= JOINT_LIMITS['th4'][1]): return False
-
-    # 2. Kolizja z podłożem (Z < 0)
-    z_elbow = lambda1_val + l2_val * math.sin(th2)
-    if z_elbow < 0: return False
-
-    z_wrist = z_elbow + l3_val * math.sin(th2 - th3)
-    if z_wrist < 0: return False
-
-    return True
-
-def calculate_joint_distance(q_current, q_target):
-    """Oblicza ważoną odległość w przestrzeni konfiguracyjnej (C-Space)."""
-    if q_target is None: return float('inf')
-    
-    total_distance = 0
-    weights = [1.0, 1.0, 1.0, 1.0]
-    
-    for i in range(len(q_current)):
-        diff = q_target[i] - q_current[i]
-        # Normalizacja różnicy kątowej
-        normalized_diff = (diff + math.pi) % (2 * math.pi) - math.pi
-        total_distance += abs(normalized_diff) * weights[i]
-    
-    return total_distance
-
-def calculate_configuration_cost(angles, current_angles):
-    """
-    Funkcja kosztu dla optymalizatora IK.
-    Składniki: JRA (odległość od limitów), Distance Cost (ruch), Singularity Cost.
-    """
-    th1, th2, th3, th4 = angles
-    
-    # 1. Koszt limitów
-    joint_limit_cost = 0
-    joints = [th1, th2, th3, th4]
-    limits = [JOINT_LIMITS['th1'], JOINT_LIMITS['th2'], JOINT_LIMITS['th3'], JOINT_LIMITS['th4']]
-    
-    for val, (min_l, max_l) in zip(joints, limits):
-        normalized = (val - min_l) / (max_l - min_l)
-        joint_limit_cost += (normalized - 0.5)**2
-    
-    # 2. Koszt ruchu
-    motion_cost = calculate_joint_distance(current_angles, angles)
-    
-    # 3. Koszt singularności (th3 bliskie 0)
-    singularity_cost = 1.0 / (abs(th3) + 0.1)
-    
-    return (2.0 * joint_limit_cost + 1.0 * motion_cost + 3.0 * singularity_cost)
-
-def solve_ik_for_cartesian(x_target, y_target, z_target, phi_deg, current_angles):
-    """
-    Wrapper IK z optymalizacją. Przeszukuje przestrzeń orientacji (Phi), jeśli nie jest zadana,
-    oraz sprawdza różne konfiguracje geometryczne (elbow up/down, base flip).
-    """
-    R_target = math.sqrt(x_target**2 + y_target**2)
-    th1_base = math.atan2(y_target, x_target) if R_target > 0.01 else 0.0
-    
-    phi_range = [phi_deg] if phi_deg is not None else range(-180, 180, 5)
-    
-    all_solutions = []
-    strategies = [
-        (True, False, "Baza Normalna, Łokieć GÓRA"),
-        (False, False, "Baza Normalna, Łokieć DÓŁ"),
-        (True, True, "Baza Odwrócona, Łokieć GÓRA"),
-        (False, True, "Baza Odwrócona, Łokieć DÓŁ")
-    ]
-
-    for phi in phi_range:
-        for elbow_up, reverse_base, name in strategies:
-            # Korekta bazy dla konfiguracji odwróconej
-            th1_in = ((th1_base + math.pi) + math.pi) % (2*math.pi) - math.pi if reverse_base else th1_base
-
-            sol = inverse_kinematics(R_target, z_target, th1_in, phi, elbow_up, reverse_base)
+    def inverse_kinematics(self, R, Z, th1_base, phi_deg=0.0, elbow_up=True, reverse_base=False):
+        """
+        Analityczne IK metodą geometryczną z optymalizacją (D_sq).
+        """
+        th1 = th1_base
+        phi_rad = math.radians(phi_deg)
+        phi_corr = phi_rad + self.geo_phi_offset
+        
+        R_ik = -R if reverse_base else R
+        
+        # Pozycja nadgarstka
+        R_wrist = R_ik - self.l1 - self.L3 * math.cos(phi_corr)
+        Z_wrist = Z - self.lambda1 - self.L3 * math.sin(phi_corr)
+        
+        # OPTYMALIZACJA: Kwadrat odległości zamiast hypot/sqrt
+        D_sq = R_wrist**2 + Z_wrist**2
+        
+        # Szybka weryfikacja osiągalności
+        if D_sq > self.max_reach_sq or D_sq < self.min_reach_sq:
+            return None
+        
+        # Twierdzenie cosinusów na preliczonych kwadratach
+        cos_th3 = (D_sq - self.L1_sq - self.L2_sq) / self.denom
+        
+        # Clip (zabezpieczenie przed błędami float rzędu 1e-15)
+        if cos_th3 > 1.0: cos_th3 = 1.0
+        elif cos_th3 < -1.0: cos_th3 = -1.0
+        
+        th3_ik = math.acos(cos_th3)
+        if not elbow_up:
+            th3_ik = -th3_ik
             
-            if sol and check_constraints(*sol):
-                mech_cost = calculate_configuration_cost(sol, current_angles)
-                orientation_penalty = abs(phi) * 10 if phi_deg is None else 0.0
-                all_solutions.append((mech_cost + orientation_penalty, sol, f"{name}, φ={phi}°"))
+        # Kąty pomocnicze alpha/beta
+        alpha_angle = math.atan2(Z_wrist, R_wrist)
+        beta_angle = math.atan2(self.L2 * math.sin(th3_ik), self.L1 + self.L2 * math.cos(th3_ik))
+        
+        th2 = alpha_angle - beta_angle
+        
+        # Pozostałe kąty
+        th4_ik = phi_rad - th2 - th3_ik
+        th3 = -th3_ik
+        th4 = -th4_ik
+        
+        # Normalizacja kątów
+        th1 = math.atan2(math.sin(th1), math.cos(th1))
+        th2 = math.atan2(math.sin(th2), math.cos(th2))
+        th3 = math.atan2(math.sin(th3), math.cos(th3))
+        th4 = math.atan2(math.sin(th4), math.cos(th4))
+        
+        return (th1, th2, th3, th4)
 
-    if not all_solutions:
-        return None, "BRAK ROZWIĄZANIA (Ograniczenia lub Zasięg)"
+    def check_constraints(self, th1, th2, th3, th4):
+        """Weryfikacja limitów i kolizji z podłożem."""
+        # 1. Limity
+        if not (self.limits['th1'][0] <= th1 <= self.limits['th1'][1]): return False
+        if not (self.limits['th2'][0] <= th2 <= self.limits['th2'][1]): return False
+        if not (self.limits['th3'][0] <= th3 <= self.limits['th3'][1]): return False
+        if not (self.limits['th4'][0] <= th4 <= self.limits['th4'][1]): return False
+
+        # 2. Kolizja z podłożem (Z < 0)
+        z_elbow = self.lambda1 + self.l2 * math.sin(th2)
+        if z_elbow < 0: return False
+
+        z_wrist = z_elbow + self.l3 * math.sin(th2 - th3)
+        if z_wrist < 0: return False
+
+        return True
+
+    def calculate_joint_distance(self, q_current, q_target):
+        if q_target is None: return float('inf')
+        total_dist = 0
+        weights = [1.0, 1.0, 1.0, 1.0]
+        
+        for i in range(4):
+            diff = q_target[i] - q_current[i]
+            normalized = (diff + math.pi) % (2 * math.pi) - math.pi
+            total_dist += abs(normalized) * weights[i]
+        return total_dist
+
+    def calculate_configuration_cost(self, angles, current_angles):
+        th1, th2, th3, th4 = angles
+        
+        # Koszt limitów
+        jl_cost = 0
+        vals = [th1, th2, th3, th4]
+        lims = [self.limits['th1'], self.limits['th2'], self.limits['th3'], self.limits['th4']]
+        
+        for v, (mn, mx) in zip(vals, lims):
+            norm = (v - mn) / (mx - mn)
+            jl_cost += (norm - 0.5)**2
+            
+        # Koszt ruchu
+        motion_cost = self.calculate_joint_distance(current_angles, angles)
+        
+        # Koszt singularności
+        singularity_cost = 1.0 / (abs(th3) + 0.1)
+        
+        return 2.0 * jl_cost + 1.0 * motion_cost + 3.0 * singularity_cost
+
+    def solve_ik(self, x_target, y_target, z_target, current_angles, phi_deg=None):
+        """Wrapper szukający najlepszego rozwiązania."""
+        R_target = math.sqrt(x_target**2 + y_target**2)
+        th1_base = math.atan2(y_target, x_target) if R_target > 0.01 else 0.0
+        
+        phi_range = [phi_deg] if phi_deg is not None else range(-180, 180, 5)
+        all_solutions = []
+        
+        strategies = [
+            (True, False, "Baza Normalna, Łokieć GÓRA"),
+            (False, False, "Baza Normalna, Łokieć DÓŁ"),
+            (True, True, "Baza Odwrócona, Łokieć GÓRA"),
+            (False, True, "Baza Odwrócona, Łokieć DÓŁ")
+        ]
+
+        for phi in phi_range:
+            for elbow_up, reverse_base, name in strategies:
+                th1_in = ((th1_base + math.pi) + math.pi) % (2*math.pi) - math.pi if reverse_base else th1_base
+                
+                sol = self.inverse_kinematics(R_target, z_target, th1_in, phi, elbow_up, reverse_base)
+                
+                if sol and self.check_constraints(*sol):
+                    cost = self.calculate_configuration_cost(sol, current_angles)
+                    orient_penalty = abs(phi) * 10 if phi_deg is None else 0.0
+                    all_solutions.append((cost + orient_penalty, sol, f"{name}, φ={phi}°"))
+
+        if not all_solutions:
+            return None, "BRAK ROZWIĄZANIA"
+            
+        all_solutions.sort(key=lambda x: x[0])
+        return all_solutions[0][1], all_solutions[0][2]
     
-    # Zwróć rozwiązanie o najmniejszym koszcie
-    all_solutions.sort(key=lambda x: x[0])
-    return all_solutions[0][1], all_solutions[0][2]
-
-def get_joint_positions(th1_val, th2_val, th3_val, th4_val, alpha5_val=0.0):
-    """
-    Szybka kinematyka prosta oparta na NumPy dla celów wizualizacji (zwraca pozycje węzłów).
-    Wykorzystuje te same parametry DH co wersja SymPy.
-    """
-    alpha1_val, alpha4_val = np.pi / 2, -np.pi / 2
-
-    # Funkcje pomocnicze inline (dla wydajności)
-    def np_RotZ(t): c, s = np.cos(t), np.sin(t); return np.array([[c, -s, 0, 0], [s, c, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
-    def np_RotX(a): c, s = np.cos(a), np.sin(a); return np.array([[1, 0, 0, 0], [0, c, -s, 0], [0, s, c, 0], [0, 0, 0, 1]])
-    def np_TransZ(d): return np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, d], [0, 0, 0, 1]])
-    def np_TransX(a): return np.array([[1, 0, 0, a], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
-
-    # Łańcuch transformacji
-    T1 = np_RotZ(th1_val) @ np_TransZ(lambda1_val) @ np_TransX(l1_val) @ np_RotX(alpha1_val)
-    T2 = np_RotZ(th2_val) @ np_TransX(l2_val)
-    T3 = np_RotZ(-th3_val) @ np_TransX(l3_val)
-    T4 = np_RotZ(-th4_val) @ np_TransX(l4_val) @ np_RotX(alpha4_val)
-    T5 = np_TransZ(lambda5_val) @ np_TransX(l5_val) @ np_RotX(alpha5_val)
-
-    # Obliczenie pozycji węzłów względem bazy
-    origin = np.array([0, 0, 0, 1])
-    points = [
-        np.array([0, 0, 0]),          # P1: Baza
-        (T1 @ origin)[:3],            # P2: Bark
-        (T1 @ T2 @ origin)[:3],       # P3: Łokieć
-        (T1 @ T2 @ T3 @ origin)[:3],  # P4: Nadgarstek
-        (T1 @ T2 @ T3 @ T4 @ T5 @ origin)[:3] # P5: Końcówka (TCP)
-    ]
-
-    return np.array(points)
-
 # =====================================================================
 # GUI APPLICATION
 # =====================================================================
@@ -461,18 +435,43 @@ POSITION_TOLERANCE = 5.0 # mm
 class RobotControlGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Robot Control Interface")
+        self.root.title("Robot Control Interface (Kinematics V2)")
         self.root.geometry("1400x800")
 
+        # ========================================================
+        # 1. INICJALIZACJA MODELU KINEMATYCZNEGO
+        # ========================================================
+        geo_params = {
+            'l1': 18.4, 'l2': 149.0, 'l3': 120.3, 
+            'l4': 87.8, 'l5': 23.0, 
+            'lambda1': 110.8, 'lambda5': 10.0
+        }
+        
+        pi = math.pi
+        limits = {
+            'th1': (-pi/2, pi/2),
+            'th2': (0, pi/2 * 1.5),
+            'th3': (-pi/2, pi/2),
+            'th4': (-pi/2, pi/2)
+        }
+        
+        # Instancja nowej klasy optymalizującej obliczenia
+        self.kin = RobotKinematics(geo_params, limits)
+
+        # ========================================================
+        # 2. ZMIENNE STANU APLIKACJI
+        # ========================================================
         self.last_gui_update_time = 0.0
         self.last_tcp_pos = np.array([0.0, 0.0, 0.0])
         
+        # Połączenie ze sprzętem
         self.robot = RobotSerial()
         self.robot.gui_callback = self.update_position_display
         
         # Wizualizacja
         self.plot_artists = []
-        self.max_reach = l2_val + l3_val + l4_val + l5_val
+        # Obliczenie max zasięgu z parametrów kinematyki dla skalowania wykresu
+        self.max_reach = self.kin.l2 + self.kin.l3 + self.kin.l4 + self.kin.l5
         self.control_mode = tk.StringVar(value='position')
         
         # Stan sterowania
@@ -491,10 +490,13 @@ class RobotControlGUI:
         self.sequence_timer = None
         self.play_button = None 
         self.target_xyz = None 
+        self.POSITION_TOLERANCE = 2.0  # mm
 
         self.setup_ui()
         self.setup_3d_plot()
         self.update_3d_visualization()
+        
+        # Auto-connect po starcie GUI
         self.root.after(100, self.connect_robot)
 
     def setup_ui(self):
@@ -607,7 +609,9 @@ class RobotControlGUI:
         
         for i, (key, label) in enumerate(joint_defs):
             ttk.Label(self.angle_control_frame, text=label).grid(row=i, column=0, sticky="w", pady=5)
-            min_rad, max_rad = JOINT_LIMITS[key]
+            # UŻYCIE LIMITÓW Z KLASY KINEMATYKI
+            min_rad, max_rad = self.kin.limits[key]
+            
             slider = tk.Scale(self.angle_control_frame, from_=math.degrees(min_rad), to=math.degrees(max_rad),    
                               orient=tk.HORIZONTAL, resolution=0.1, length=250,
                               bg=COLORS['FRAME'], fg=COLORS['TEXT'], troughcolor=COLORS['BG'], highlightthickness=0, 
@@ -631,7 +635,6 @@ class RobotControlGUI:
         self.target_frame = ttk.LabelFrame(self.content_frame, text="Pozycja docelowa [mm]", padding="10")
         self.target_frame.grid(row=5, column=0, sticky="ew", pady=5, padx=5)
         
-        # Generowanie pól w pętli (optymalizacja redundancji)
         input_defs = [("X:", "-87.5", "x_entry"), ("Y:", "0", "y_entry"), 
                       ("Z:", "372.5", "z_entry"), ("Orientacja φ [°]:", "0", "phi_entry")]
         for i, (lbl_txt, def_val, attr_name) in enumerate(input_defs):
@@ -740,7 +743,9 @@ class RobotControlGUI:
             # Pobranie pozycji
             angles = self.robot.get_current_angles()
             rads = [math.radians(a) for a in angles[:4]]
-            positions = get_joint_positions(*rads) # Zwraca tablicę NumPy
+            
+            # UŻYCIE KLASY KINEMATYKI
+            positions = self.kin.forward_kinematics(*rads)
             self.last_tcp_pos = positions[-1]
             
             # Rysowanie
@@ -771,7 +776,7 @@ class RobotControlGUI:
         self.log_text.see(tk.END)
 
     def update_position_display(self, angles=None, log_message=None):
-        """Callback z wątku serial. Zoptymalizowany pod kątem redukcji wywołań event loop."""
+        """Callback z wątku serial."""
         
         def _update_ui():
             if log_message:
@@ -795,7 +800,6 @@ class RobotControlGUI:
         now = time.time() * 1000.0
         if log_message or (now - self.last_gui_update_time >= 200.0):
             self.last_gui_update_time = now
-            # Pojedyncze wywołanie after zamiast serii
             self.root.after(0, _update_ui)
 
     def toggle_phi_entry(self):
@@ -818,14 +822,15 @@ class RobotControlGUI:
             self.log(f"IK dla: X={x}, Y={y}, Z={z}")
             cur_rads = [math.radians(a) for a in self.robot.get_current_angles()[:4]]
             
-            sol, name = solve_ik_for_cartesian(x, y, z, phi, tuple(cur_rads))
+            # UŻYCIE KLASY KINEMATYKI (Metoda solve_ik)
+            sol, name = self.kin.solve_ik(x, y, z, tuple(cur_rads), phi_deg=phi)
             
             if sol is None:
                 messagebox.showerror("Błąd IK", "Pozycja poza zasięgiem.")
                 return
             
-            # Weryfikacja kolizji końcowej
-            pos = get_joint_positions(*sol)
+            # Weryfikacja kolizji końcowej przez FK
+            pos = self.kin.forward_kinematics(*sol)
             if pos[3][2] < -0.01 or pos[4][2] < -0.01:
                 messagebox.showerror("Kolizja", "Rozwiązanie koliduje z podłożem!")
                 return
@@ -847,9 +852,9 @@ class RobotControlGUI:
         angle = float(val)
         self.angle_value_labels[key].config(text=f"{angle:.1f}°")
         
-        # Szybkie sprawdzenie kolizji dla suwaków
+        # Szybkie sprawdzenie kolizji dla suwaków przez FK
         rads = [math.radians(self.angle_sliders[k].get()) for k in ['th1','th2','th3','th4']]
-        pos = get_joint_positions(*rads)
+        pos = self.kin.forward_kinematics(*rads)
         min_z = np.min(pos[:, 2])
         
         is_collision = min_z < 0
@@ -894,7 +899,7 @@ class RobotControlGUI:
         if not self.angle_send_active: return
         
         rads = [math.radians(self.angle_sliders[k].get()) for k in ['th1','th2','th3','th4']]
-        pos = get_joint_positions(*rads)
+        pos = self.kin.forward_kinematics(*rads)
         
         if np.min(pos[:, 2]) < 0:
             if not self._collision_warning_shown:
@@ -965,7 +970,7 @@ class RobotControlGUI:
         self._update_sequence_display()
 
     def load_sequence_from_json(self):
-        f = askopenfilename(filetypes=[("JSON", "*.json")])
+        f = filedialog.askopenfilename(filetypes=[("JSON", "*.json")])
         if f:
             try:
                 with open(f, 'r', encoding='utf-8') as fp:
@@ -974,6 +979,16 @@ class RobotControlGUI:
                 self.log(f"Wczytano {len(self.sequence_data)} pkt")
             except Exception as e:
                 messagebox.showerror("Błąd", str(e))
+    
+    def save_sequence_to_json(self):
+        f = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")])
+        if f:
+            try:
+                with open(f, 'w', encoding='utf-8') as fp:
+                    json.dump(self.sequence_data, fp, indent=4)
+                self.log("Zapisano sekwencję")
+            except Exception as e:
+                messagebox.showerror("Błąd zapisu", str(e))
 
     def play_sequence(self):
         if not self.is_connected:
@@ -1019,7 +1034,10 @@ class RobotControlGUI:
             else:
                 cur = [math.radians(a) for a in self.robot.get_current_angles()[:4]]
                 phi = pt['Fi'] if not pt['Auto_Fi'] else None
-                sol, _ = solve_ik_for_cartesian(pt['X'], pt['Y'], pt['Z'], phi, tuple(cur))
+                
+                # UŻYCIE KLASY KINEMATYKI
+                sol, _ = self.kin.solve_ik(pt['X'], pt['Y'], pt['Z'], tuple(cur), phi_deg=phi)
+                
                 if sol: self.robot.send_target_angles(*sol)
                 else: raise Exception("Brak IK")
                 
@@ -1031,7 +1049,7 @@ class RobotControlGUI:
         if not self.sequence_playing: return
         
         dist = np.linalg.norm(self.last_tcp_pos - self.target_xyz)
-        if dist <= POSITION_TOLERANCE:
+        if dist <= self.POSITION_TOLERANCE:
             self.current_sequence_index += 1
             self.sequence_timer = self.root.after(100, self._execute_sequence_step)
         else:
@@ -1044,7 +1062,11 @@ class RobotControlGUI:
             phi = None if auto else float(self.phi_entry.get())
             
             cur = [math.radians(a) for a in self.robot.get_current_angles()[:4]]
-            if solve_ik_for_cartesian(x, y, z, phi, tuple(cur))[0]:
+            
+            # Weryfikacja osiągalności przed dodaniem
+            sol, _ = self.kin.solve_ik(x, y, z, tuple(cur), phi_deg=phi)
+            
+            if sol:
                 self.sequence_data.append({"X":x, "Y":y, "Z":z, "Fi":phi if phi else 0, "Auto_Fi":auto})
                 self._update_sequence_display()
             else:
@@ -1053,7 +1075,9 @@ class RobotControlGUI:
 
     def add_current_angles_to_sequence(self):
         rads = [math.radians(self.angle_sliders[k].get()) for k in ['th1','th2','th3','th4']]
-        pos = get_joint_positions(*rads)[-1]
+        
+        # Pobranie pozycji przez FK
+        pos = self.kin.forward_kinematics(*rads)[-1]
         fi_rad = math.atan2(math.sin(sum(rads[1:])), math.cos(sum(rads[1:])))
         
         self.sequence_data.append({
@@ -1086,13 +1110,6 @@ class RobotControlGUI:
             txt = f"X:{pt['X']:.1f} Y:{pt['Y']:.1f} Z:{pt['Z']:.1f}"
             ttk.Label(f, text=txt, foreground=fg).grid(row=1, column=0, sticky="w")
             ttk.Button(f, text="✕", width=2, command=lambda x=i: self.remove_point(x)).grid(row=0, column=1, rowspan=2, sticky="e")
-
-    def save_sequence_to_json(self):
-        f = asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")])
-        if f:
-            try:
-                with open(f, 'w') as fp: json.dump(self.sequence_data, fp, indent=4)
-            except Exception as e: messagebox.showerror("Błąd", str(e))
 
 def main():
     root = tk.Tk()
