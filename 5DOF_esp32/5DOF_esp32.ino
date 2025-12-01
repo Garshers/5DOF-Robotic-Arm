@@ -3,7 +3,7 @@
 #include <AccelStepper.h>
 
 // ==================== Tryb symulacji ====================
-#define SIMULATION_MODE false
+#define SIMULATION_MODE true
 
 // ==================== Podstawowe ustawienia ====================
 #define BAUD 115200
