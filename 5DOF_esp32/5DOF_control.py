@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 from tkinter.filedialog import asksaveasfilename, askopenfilename
 import json
 import serial
@@ -219,74 +219,74 @@ class RobotSerial:
 # =====================================================================
 
 class RobotKinematics:
-    def __init__(self, geometry_params, joint_limits):
+    def __init__(self):
         """
-        Inicjalizacja modelu kinematycznego i prekomputacja stałych.
-        
-        :param geometry_params: Słownik z wymiarami: l1, l2, l3, l4, l5, lambda1, lambda5
-        :param joint_limits: Słownik z limitami kątowymi: 'th1', 'th2', 'th3', 'th4'
+        Inicjalizacja modelu kinematycznego dla dedykowanej konstrukcji robota.
+        Wymiary i limity są zdefiniowane bezpośrednio wewnątrz klasy.
         """
-        # 1. Przypisanie parametrów geometrycznych
-        self.l1 = geometry_params['l1']
-        self.l2 = geometry_params['l2']
-        self.l3 = geometry_params['l3']
-        self.l4 = geometry_params['l4']
-        self.l5 = geometry_params['l5']
-        self.lambda1 = geometry_params['lambda1']
-        self.lambda5 = geometry_params['lambda5']
+        # Stałe parametry [mm]
+        self.l1 = 18.4
+        self.l2 = 149.0
+        self.l3 = 120.3
+        self.l4 = 87.8
+        self.l5 = 23.0
+        self.lambda1 = 110.8
+        self.lambda5 = 10.0
         
-        self.limits = joint_limits
+        # Definicja limitów w złączach [rad]
+        range_const = math.pi / 2
+        self.limits = {
+            'th1': (-range_const, range_const), # X
+            'th2': (0, range_const * 1.5),      # YA
+            'th3': (-range_const, range_const), # Z
+            'th4': (-range_const, range_const)  # E
+        }
 
-        # 2. Prekomputacja stałych dla IK (Optymalizacja CPU)
-        # Efektywne długości ramion
+        # Prekomputacja stałych
         self.L1 = self.l2
         self.L2 = self.l3
-        # L3 jako wektor sztywny (sqrt obliczany raz przy inicjalizacji)
         self.L3 = math.sqrt((self.l4 + self.l5)**2 + self.lambda5**2)
         
-        # Stałe do twierdzenia cosinusów (unikamy potęgowania w czasie rzeczywistym)
+        # Stałe do twierdzenia cosinusów
         self.L1_sq = self.L1**2
         self.L2_sq = self.L2**2
         self.denom = 2 * self.L1 * self.L2
         
-        # Stałe zasięgu (kwadraty, aby unikać sqrt w warunkach if)
+        # Kwadraty zasięgów (do szybkiej weryfikacji bez pierwiastkowania)
         self.max_reach_sq = (self.L1 + self.L2)**2
         self.min_reach_sq = (self.L1 - self.L2)**2
         
-        # Stały offset geometryczny narzędzia
+        # Przesunięcie środka osi przez serwo
         self.geo_phi_offset = math.atan2(self.lambda5, self.l4 + self.l5)
 
     def _rot_z(self, t):
         c, s = np.cos(t), np.sin(t)
         return np.array([[c, -s, 0, 0], [s, c, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
-
     def _rot_x(self, a):
         c, s = np.cos(a), np.sin(a)
         return np.array([[1, 0, 0, 0], [0, c, -s, 0], [0, s, c, 0], [0, 0, 0, 1]])
-
     def _trans_z(self, d):
         return np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, d], [0, 0, 0, 1]])
-
     def _trans_x(self, a):
         return np.array([[1, 0, 0, a], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
 
     def forward_kinematics(self, th1, th2, th3, th4, alpha5=0.0):
         """
-        Oblicza kinematykę prostą (FK).
+        Funkcja obliczająca macierze transformacji kinematyki prostej metodą notacji Denavita-Hartenberga.
+        Parametry oraz struktury macierzy zostały wyznaczone ręcznie.
         """
-        # Parametry DH (kąty skręcenia)
         alpha1, alpha4 = np.pi / 2, -np.pi / 2
 
         # Macierze transformacji
-        T1 = self._rot_z(th1) @ self._trans_z(self.lambda1) @ self._trans_x(self.l1) @ self._rot_x(alpha1)
-        T2 = self._rot_z(th2) @ self._trans_x(self.l2)
-        T3 = self._rot_z(-th3) @ self._trans_x(self.l3)
-        T4 = self._rot_z(-th4) @ self._trans_x(self.l4) @ self._rot_x(alpha4)
-        T5 = self._trans_z(self.lambda5) @ self._trans_x(self.l5) @ self._rot_x(alpha5)
+        T1 = self._rot_z(th1)  @ self._trans_z(self.lambda1) @ self._trans_x(self.l1) @ self._rot_x(alpha1)
+        T2 = self._rot_z(th2)  @                               self._trans_x(self.l2)
+        T3 = self._rot_z(-th3) @                               self._trans_x(self.l3)
+        T4 = self._rot_z(-th4) @                               self._trans_x(self.l4) @ self._rot_x(alpha4)
+        T5 =                     self._trans_z(self.lambda5) @ self._trans_x(self.l5) @ self._rot_x(alpha5)
 
         origin = np.array([0, 0, 0, 1])
         
-        # P1..P5
+        # Macierze poszczególnych osi
         p1 = np.array([0, 0, 0])
         p2 = (T1 @ origin)[:3]
         p3 = (T1 @ T2 @ origin)[:3]
@@ -295,50 +295,52 @@ class RobotKinematics:
 
         return np.array([p1, p2, p3, p4, p5])
 
-    def inverse_kinematics(self, R, Z, th1_base, phi_deg=0.0, elbow_up=True, reverse_base=False):
+    def inverse_kinematics(self, R, Z, th1, phi_deg=0.0, elbow_up=True, reverse_base=False):
         """
-        Analityczne IK metodą geometryczną z optymalizacją (D_sq).
+        Funkcja rozwiązuje analitycznie zadanie odwrotne kinematyki metodą geometryczną.
+        
+        Algorytm redukuje układ trójwymiarowy manipulatora do problemu na płaszczyźnie 2D
+        poprzez wyznaczenie orientacji bazy. Zmienne konfiguracyjne ramienia obliczane są 
+        z wykorzystaniem twierdzenia cosinusów oraz funkcji atan2.
         """
-        th1 = th1_base
+        # Wyznaczenie orientacji efektora
         phi_rad = math.radians(phi_deg)
         phi_corr = phi_rad + self.geo_phi_offset
         
+        # Uwzględnienie orientacji tylnej - robot nie musi się obracać w stronę punktu,
+        # może spróbować sięgnąć za siebie
         R_ik = -R if reverse_base else R
         
-        # Pozycja nadgarstka
+        # Pozycja nadgarstka (Silnik E)
         R_wrist = R_ik - self.l1 - self.L3 * math.cos(phi_corr)
         Z_wrist = Z - self.lambda1 - self.L3 * math.sin(phi_corr)
         
-        # OPTYMALIZACJA: Kwadrat odległości zamiast hypot/sqrt
+        # Weryfikacja osiągalności (zoptymalizowana metoda pitagorasa)
         D_sq = R_wrist**2 + Z_wrist**2
-        
-        # Szybka weryfikacja osiągalności
         if D_sq > self.max_reach_sq or D_sq < self.min_reach_sq:
             return None
         
         # Twierdzenie cosinusów na preliczonych kwadratach
         cos_th3 = (D_sq - self.L1_sq - self.L2_sq) / self.denom
         
-        # Clip (zabezpieczenie przed błędami float rzędu 1e-15)
-        if cos_th3 > 1.0: cos_th3 = 1.0
-        elif cos_th3 < -1.0: cos_th3 = -1.0
+        # Obcięcie wartości wykraczających poza zakres [-1,1] (zabezpieczenie przed błędami float)
+        cos_th3 = np.clip(cos_th3, -1.0, 1.0)
         
+        # Pozycja ramienia L2 (Silnik Z)
         th3_ik = math.acos(cos_th3)
-        if not elbow_up:
-            th3_ik = -th3_ik
+        if not elbow_up: th3_ik = -th3_ik
             
-        # Kąty pomocnicze alpha/beta
+        # Kąty pomocnicze
         alpha_angle = math.atan2(Z_wrist, R_wrist)
         beta_angle = math.atan2(self.L2 * math.sin(th3_ik), self.L1 + self.L2 * math.cos(th3_ik))
         
+        # Kąty poszczególnych silników
         th2 = alpha_angle - beta_angle
-        
-        # Pozostałe kąty
         th4_ik = phi_rad - th2 - th3_ik
         th3 = -th3_ik
         th4 = -th4_ik
         
-        # Normalizacja kątów
+        # Normalizacja kątów do zakresu [-pi, pi]
         th1 = math.atan2(math.sin(th1), math.cos(th1))
         th2 = math.atan2(math.sin(th2), math.cos(th2))
         th3 = math.atan2(math.sin(th3), math.cos(th3))
@@ -348,13 +350,13 @@ class RobotKinematics:
 
     def check_constraints(self, th1, th2, th3, th4):
         """Weryfikacja limitów i kolizji z podłożem."""
-        # 1. Limity
+        # Zakres ruchu
         if not (self.limits['th1'][0] <= th1 <= self.limits['th1'][1]): return False
         if not (self.limits['th2'][0] <= th2 <= self.limits['th2'][1]): return False
         if not (self.limits['th3'][0] <= th3 <= self.limits['th3'][1]): return False
         if not (self.limits['th4'][0] <= th4 <= self.limits['th4'][1]): return False
 
-        # 2. Kolizja z podłożem (Z < 0)
+        # Kolizja z podłożem (Z < 0)
         z_elbow = self.lambda1 + self.l2 * math.sin(th2)
         if z_elbow < 0: return False
 
@@ -364,52 +366,88 @@ class RobotKinematics:
         return True
 
     def calculate_joint_distance(self, q_current, q_target):
+        """
+        Oblicza koszt ruchu robota - jak daleko robot musiałby się obrócić, aby przejść z obecnej 
+        pozycji (q_current) do nowej (q_target). Służy do wyboru najmniej skomplikowanej trasy ruchu.
+        """
+        # Jeśli nie ma ważnego rozwiązania, koszt jest nieskończony.
         if q_target is None: return float('inf')
+        
         total_dist = 0
-        weights = [1.0, 1.0, 1.0, 1.0]
+        weights = [5.0, 5.0, 3.0, 1.0] # wagi dla [th1, th2, th3, th4]
         
         for i in range(4):
-            diff = q_target[i] - q_current[i]
+            diff = q_target[i] - q_current[i] # Różnica między pozycją docelową a obecną
+            
+            # Upewnienie się, że zawsze mierzymy najkrótszą drogę.
+            # Zmiana z 350 stopni na 10 stopni to 20 stopni, a nie -340 stopni.
             normalized = (diff + math.pi) % (2 * math.pi) - math.pi
             total_dist += abs(normalized) * weights[i]
+            
         return total_dist
 
     def calculate_configuration_cost(self, angles, current_angles):
+        """
+        Główna funkcja kosztu oceniająca jakość potencjalnej konfiguracji robota.
+        Łączy niezależne koszty (limity, ruch, osobliwości) w jedną ważoną wartość.
+        """
         th1, th2, th3, th4 = angles
         
-        # Koszt limitów
+        ## ---------- KOSZT LIMITÓW ZŁĄCZY ----------
+        # Im bliżej limitów złączy, tym większa koszt, co wymusza pracę w bezpiecznym centrum zakresu
         jl_cost = 0
         vals = [th1, th2, th3, th4]
         lims = [self.limits['th1'], self.limits['th2'], self.limits['th3'], self.limits['th4']]
         
         for v, (mn, mx) in zip(vals, lims):
-            norm = (v - mn) / (mx - mn)
-            jl_cost += (norm - 0.5)**2
+            norm = (v - mn) / (mx - mn) # Normalizacja do zakresu [0, 1]
+            jl_cost += (norm - 0.5)**2  #Daje zero idealnie na środku, a największą karę na krańcach.
             
-        # Koszt ruchu
+        ## ---------- KOSZT RUCHU ----------
+        # Im większy ruch musi wykonać, tym większy koszt
         motion_cost = self.calculate_joint_distance(current_angles, angles)
-        
-        # Koszt singularności
+            
+        ## ---------- KOSZT OSOBLIWOŚCI ----------
+        # Utrzymanie robota z dala od punktów, w których traci stopnie swobody
         singularity_cost = 1.0 / (abs(th3) + 0.1)
         
         return 2.0 * jl_cost + 1.0 * motion_cost + 3.0 * singularity_cost
 
     def solve_ik(self, x_target, y_target, z_target, current_angles, phi_deg=None):
-        """Wrapper szukający najlepszego rozwiązania."""
+        """
+        Główny algorytm, który szuka najlepszego sposobu na dotarcie robota do celu (XYZ).
+        Przeszukuje wszystkie geometrycznie możliwe ułożenia ramion i wybiera to, 
+        które jest najbezpieczniejsze i wymaga najmniej ruchu.
+        """
         R_target = math.sqrt(x_target**2 + y_target**2)
         th1_base = math.atan2(y_target, x_target) if R_target > 0.01 else 0.0
         
-        phi_range = [phi_deg] if phi_deg is not None else range(-180, 180, 5)
         all_solutions = []
         
+        # 1. PRZYGOTOWANIE STRATEGII GEOMETRYCZNYCH (Optymalizacja 1)
         strategies = [
             (True, False, "Baza Normalna, Łokieć GÓRA"),
             (False, False, "Baza Normalna, Łokieć DÓŁ"),
-            (True, True, "Baza Odwrócona, Łokieć GÓRA"),
-            (False, True, "Baza Odwrócona, Łokieć DÓŁ")
         ]
-
-        for phi in phi_range:
+        
+        # Jeśli cel jest z tyłu (x <= 0), bierzemy pod uwagę "Base Reverse".
+        if x_target <= 0:
+            strategies.extend([
+                (True, True, "Baza Odwrócona, Łokieć GÓRA"),
+                (False, True, "Baza Odwrócona, Łokieć DÓŁ")
+            ])
+        
+        # Jeśli Phi jest zadane, nie optymalizujemy – testujemy jedną wartość.
+        if phi_deg is not None:
+            phi_range_coarse = [phi_deg]
+        else:
+            phi_range_coarse = range(-180, 180, 20) # Używamy dwustopniowego przeszukiwania
+        
+        best_cost_coarse = float('inf')
+        best_phi_coarse = 0
+        
+        # Przeszukiwanie Grubej Siatki
+        for phi in phi_range_coarse:
             for elbow_up, reverse_base, name in strategies:
                 th1_in = ((th1_base + math.pi) + math.pi) % (2*math.pi) - math.pi if reverse_base else th1_base
                 
@@ -418,10 +456,43 @@ class RobotKinematics:
                 if sol and self.check_constraints(*sol):
                     cost = self.calculate_configuration_cost(sol, current_angles)
                     orient_penalty = abs(phi) * 10 if phi_deg is None else 0.0
-                    all_solutions.append((cost + orient_penalty, sol, f"{name}, φ={phi}°"))
+                    current_total_cost = cost + orient_penalty
+                    
+                    all_solutions.append((current_total_cost, sol, f"{name}, φ={phi}°"))
+                    
+                    # Śledzenie najlepszego kandydata Phi
+                    if current_total_cost < best_cost_coarse:
+                        best_cost_coarse = current_total_cost
+                        best_phi_coarse = phi
 
+        # Przeszukiwanie Cienkiej Siatki
+        if phi_deg is None and all_solutions:
+            # Definiujemy wąski zakres wokół najlepszego kandydata z Etapu 1
+            search_start = max(-180, best_phi_coarse - 15)
+            search_end = min(180, best_phi_coarse + 15)
+            phi_range_fine = range(search_start, search_end + 1, 2)
+
+            # Unikanie ponownego obliczania tych samych kątów
+            tested_angles = set(phi_range_coarse)
+            
+            for phi in phi_range_fine:
+                if phi in tested_angles:
+                    continue
+                    
+                for elbow_up, reverse_base, name in strategies:
+                    th1_in = ((th1_base + math.pi) + math.pi) % (2*math.pi) - math.pi if reverse_base else th1_base
+                    
+                    sol = self.inverse_kinematics(R_target, z_target, th1_in, phi, elbow_up, reverse_base)
+                    
+                    if sol and self.check_constraints(*sol):
+                        cost = self.calculate_configuration_cost(sol, current_angles)
+                        orient_penalty = abs(phi) * 10
+                        all_solutions.append((cost + orient_penalty, sol, f"{name}, φ={phi}°"))
+
+
+        # 3. WYBÓR OPTYMALNEGO ROZWIĄZANIA
         if not all_solutions:
-            return None, "BRAK ROZWIĄZANIA"
+            return None, "BRAK ROZWIĄZANIA (Cel nieosiągalny lub poza limitami)"
             
         all_solutions.sort(key=lambda x: x[0])
         return all_solutions[0][1], all_solutions[0][2]
@@ -441,22 +512,8 @@ class RobotControlGUI:
         # ========================================================
         # 1. INICJALIZACJA MODELU KINEMATYCZNEGO
         # ========================================================
-        geo_params = {
-            'l1': 18.4, 'l2': 149.0, 'l3': 120.3, 
-            'l4': 87.8, 'l5': 23.0, 
-            'lambda1': 110.8, 'lambda5': 10.0
-        }
-        
-        pi = math.pi
-        limits = {
-            'th1': (-pi/2, pi/2),
-            'th2': (0, pi/2 * 1.5),
-            'th3': (-pi/2, pi/2),
-            'th4': (-pi/2, pi/2)
-        }
-        
-        # Instancja nowej klasy optymalizującej obliczenia
-        self.kin = RobotKinematics(geo_params, limits)
+
+        self.kin = RobotKinematics()
 
         # ========================================================
         # 2. ZMIENNE STANU APLIKACJI

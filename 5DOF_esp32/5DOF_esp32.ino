@@ -228,7 +228,7 @@ void readEncoders() {
             
             for (int i = 0; i < 5; i++) {
                 float error = tempTarget[i] - tempCurrent[i];
-                float velocity = constrain(error * 2.0, -20.0, 20.0);
+                float velocity = constrain(error * 2.0, -50.0, 50.0);
                 tempCurrent[i] += velocity * dt;
             }
             
