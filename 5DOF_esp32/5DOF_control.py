@@ -8,8 +8,6 @@ import time
 import threading
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
-
-## KINEMATYKA
 import math
 import numpy as np
 
@@ -225,13 +223,13 @@ class RobotKinematics:
         Wymiary i limity są zdefiniowane bezpośrednio wewnątrz klasy.
         """
         # Stałe parametry [mm]
-        self.l1 = 18.4
-        self.l2 = 149.0
-        self.l3 = 120.3
-        self.l4 = 87.8
-        self.l5 = 23.0
-        self.lambda1 = 110.8
-        self.lambda5 = 10.0
+        self.a1 = 18.4
+        self.a2 = 149.0
+        self.a3 = 120.3
+        self.a4 = 87.8
+        self.a5 = 23.0
+        self.d1 = 110.8
+        self.d5 = 10.0
         
         # Definicja limitów w złączach [rad]
         range_const = math.pi / 2
@@ -243,9 +241,9 @@ class RobotKinematics:
         }
 
         # Prekomputacja stałych
-        self.L1 = self.l2
-        self.L2 = self.l3
-        self.L3 = math.sqrt((self.l4 + self.l5)**2 + self.lambda5**2)
+        self.L1 = self.a2
+        self.L2 = self.a3
+        self.L3 = math.sqrt((self.a4 + self.a5)**2 + self.d5**2)
         
         # Stałe do twierdzenia cosinusów
         self.L1_sq = self.L1**2
@@ -257,7 +255,7 @@ class RobotKinematics:
         self.min_reach_sq = (self.L1 - self.L2)**2
         
         # Przesunięcie środka osi przez serwo
-        self.geo_phi_offset = math.atan2(self.lambda5, self.l4 + self.l5)
+        self.geo_phi_offset = math.atan2(self.d5, self.a4 + self.a5)
 
     def _rot_z(self, t):
         c, s = np.cos(t), np.sin(t)
@@ -278,11 +276,11 @@ class RobotKinematics:
         alpha1, alpha4 = np.pi / 2, -np.pi / 2
 
         # Macierze transformacji
-        T1 = self._rot_z(th1)  @ self._trans_z(self.lambda1) @ self._trans_x(self.l1) @ self._rot_x(alpha1)
-        T2 = self._rot_z(th2)  @                               self._trans_x(self.l2)
-        T3 = self._rot_z(-th3) @                               self._trans_x(self.l3)
-        T4 = self._rot_z(-th4) @                               self._trans_x(self.l4) @ self._rot_x(alpha4)
-        T5 =                     self._trans_z(self.lambda5) @ self._trans_x(self.l5) @ self._rot_x(alpha5)
+        T1 = self._rot_z(th1)  @ self._trans_z(self.d1) @ self._trans_x(self.a1) @ self._rot_x(alpha1)
+        T2 = self._rot_z(th2)  @                          self._trans_x(self.a2)
+        T3 = self._rot_z(-th3) @                          self._trans_x(self.a3)
+        T4 = self._rot_z(-th4) @                          self._trans_x(self.a4) @ self._rot_x(alpha4)
+        T5 =                     self._trans_z(self.d5) @ self._trans_x(self.a5) @ self._rot_x(alpha5)
 
         origin = np.array([0, 0, 0, 1])
         
@@ -312,8 +310,8 @@ class RobotKinematics:
         R_ik = -R if reverse_base else R
         
         # Pozycja nadgarstka (Silnik E)
-        R_wrist = R_ik - self.l1 - self.L3 * math.cos(phi_corr)
-        Z_wrist = Z - self.lambda1 - self.L3 * math.sin(phi_corr)
+        R_wrist = R_ik - self.a1 - self.L3 * math.cos(phi_corr)
+        Z_wrist = Z - self.d1 - self.L3 * math.sin(phi_corr)
         
         # Weryfikacja osiągalności (zoptymalizowana metoda pitagorasa)
         D_sq = R_wrist**2 + Z_wrist**2
@@ -357,10 +355,10 @@ class RobotKinematics:
         if not (self.limits['th4'][0] <= th4 <= self.limits['th4'][1]): return False
 
         # Kolizja z podłożem (Z < 0)
-        z_elbow = self.lambda1 + self.l2 * math.sin(th2)
+        z_elbow = self.d1 + self.a2 * math.sin(th2)
         if z_elbow < 0: return False
 
-        z_wrist = z_elbow + self.l3 * math.sin(th2 - th3)
+        z_wrist = z_elbow + self.a3 * math.sin(th2 - th3)
         if z_wrist < 0: return False
 
         return True
@@ -374,7 +372,7 @@ class RobotKinematics:
         if q_target is None: return float('inf')
         
         total_dist = 0
-        weights = [5.0, 5.0, 3.0, 1.0] # wagi dla [th1, th2, th3, th4]
+        weights = [1.0, 15.0, 5.0, 1.0] # wagi dla [Oś X, Oś YA, Oś Z, Oś E]
         
         for i in range(4):
             diff = q_target[i] - q_current[i] # Różnica między pozycją docelową a obecną
@@ -413,131 +411,135 @@ class RobotKinematics:
         
         return 2.0 * jl_cost + 1.0 * motion_cost + 3.0 * singularity_cost
 
-    def solve_ik(self, x_target, y_target, z_target, current_angles, phi_deg=None):
+    def solve_ik(self, x, y, z, current_angles, phi_deg=None):
         """
-        Główny algorytm, który szuka najlepszego sposobu na dotarcie robota do celu (XYZ).
-        Przeszukuje wszystkie geometrycznie możliwe ułożenia ramion i wybiera to, 
-        które jest najbezpieczniejsze i wymaga najmniej ruchu.
+        Główny interfejs sterowania. Konwertuje zadanie do postaci macierzowej (T_Goal),
+        a następnie rozwiązuje problem odwrotny.
         """
-        R_target = math.sqrt(x_target**2 + y_target**2)
-        th1_base = math.atan2(y_target, x_target) if R_target > 0.01 else 0.0
+        candidates = []
         
-        all_solutions = []
-        
-        # 1. PRZYGOTOWANIE STRATEGII GEOMETRYCZNYCH (Optymalizacja 1)
-        strategies = [
-            (True, False, "Baza Normalna, Łokieć GÓRA"),
-            (False, False, "Baza Normalna, Łokieć DÓŁ"),
-        ]
-        
-        # Jeśli cel jest z tyłu (x <= 0), bierzemy pod uwagę "Base Reverse".
-        if x_target <= 0:
-            strategies.extend([
-                (True, True, "Baza Odwrócona, Łokieć GÓRA"),
-                (False, True, "Baza Odwrócona, Łokieć DÓŁ")
-            ])
-        
-        # Jeśli Phi jest zadane, nie optymalizujemy – testujemy jedną wartość.
+        # --- WARIANT 1: Zadana orientacja (Jednoznaczna macierz celu) ---
         if phi_deg is not None:
-            phi_range_coarse = [phi_deg]
+            # Tworzymy obiekt matematyczny zadania (Macierz 4x4)
+            T_goal = self._construct_matrix(x, y, z, phi_deg)
+            
+            sol, strategy = self._solve_from_matrix(T_goal, current_angles)
+            return (sol, strategy) if sol else (None, "Cel nieosiągalny")
+
+        # --- WARIANT 2: Auto-orientacja (Optymalizacja macierzy celu) ---
         else:
-            phi_range_coarse = range(-180, 180, 20) # Używamy dwustopniowego przeszukiwania
-        
-        best_cost_coarse = float('inf')
-        best_phi_coarse = 0
-        
-        # Przeszukiwanie Grubej Siatki
-        for phi in phi_range_coarse:
-            for elbow_up, reverse_base, name in strategies:
-                th1_in = ((th1_base + math.pi) + math.pi) % (2*math.pi) - math.pi if reverse_base else th1_base
+            # Przeszukujemy przestrzeń możliwych macierzy T, aby znaleźć tę najkorzystniejszą energetycznie
+            for phi in range(-180, 180, 10):
+                T_candidate = self._construct_matrix(x, y, z, phi)
                 
-                sol = self.inverse_kinematics(R_target, z_target, th1_in, phi, elbow_up, reverse_base)
+                # Sprawdzamy, czy ta konkretna macierz jest osiągalna
+                sol, name = self._solve_from_matrix(T_candidate, current_angles, check_strategies=True)
                 
-                if sol and self.check_constraints(*sol):
+                if sol:
                     cost = self.calculate_configuration_cost(sol, current_angles)
-                    orient_penalty = abs(phi) * 10 if phi_deg is None else 0.0
-                    current_total_cost = cost + orient_penalty
-                    
-                    all_solutions.append((current_total_cost, sol, f"{name}, φ={phi}°"))
-                    
-                    # Śledzenie najlepszego kandydata Phi
-                    if current_total_cost < best_cost_coarse:
-                        best_cost_coarse = current_total_cost
-                        best_phi_coarse = phi
-
-        # Przeszukiwanie Cienkiej Siatki
-        if phi_deg is None and all_solutions:
-            # Definiujemy wąski zakres wokół najlepszego kandydata z Etapu 1
-            search_start = max(-180, best_phi_coarse - 15)
-            search_end = min(180, best_phi_coarse + 15)
-            phi_range_fine = range(search_start, search_end + 1, 2)
-
-            # Unikanie ponownego obliczania tych samych kątów
-            tested_angles = set(phi_range_coarse)
+                    candidates.append((cost, sol, f"{name} (Auto φ={phi}°)"))
             
-            for phi in phi_range_fine:
-                if phi in tested_angles:
-                    continue
-                    
-                for elbow_up, reverse_base, name in strategies:
-                    th1_in = ((th1_base + math.pi) + math.pi) % (2*math.pi) - math.pi if reverse_base else th1_base
-                    
-                    sol = self.inverse_kinematics(R_target, z_target, th1_in, phi, elbow_up, reverse_base)
-                    
-                    if sol and self.check_constraints(*sol):
-                        cost = self.calculate_configuration_cost(sol, current_angles)
-                        orient_penalty = abs(phi) * 10
-                        all_solutions.append((cost + orient_penalty, sol, f"{name}, φ={phi}°"))
-
-
-        # 3. WYBÓR OPTYMALNEGO ROZWIĄZANIA
-        if not all_solutions:
-            return None, "BRAK ROZWIĄZANIA (Cel nieosiągalny lub poza limitami)"
+            if not candidates:
+                return None, "Brak rozwiązania"
             
-        all_solutions.sort(key=lambda x: x[0])
-        return all_solutions[0][1], all_solutions[0][2]
+            # Zwracamy rozwiązanie o najniższym koszcie
+            candidates.sort(key=lambda x: x[0])
+            return candidates[0][1], candidates[0][2]
+
+    def _construct_matrix(self, x, y, z, phi_deg):
+        """Konstrukcja Macierzy Transformacji Jednorodnej (4x4) z danych wejściowych."""
+        yaw = math.atan2(y, x)
+        pitch = math.radians(phi_deg)
+        
+        cy, sy = np.cos(yaw), np.sin(yaw)
+        cp, sp = np.cos(pitch), np.sin(pitch)
+        
+        # Złożenie rotacji: R = RotZ(yaw) * RotY(pitch)
+        R = np.array([
+            [cy * cp, -sy, cy * sp],
+            [sy * cp,  cy, sy * sp],
+            [   -sp,    0,     cp]
+        ])
+        
+        T = np.eye(4)
+        T[:3, :3] = R
+        T[:3, 3] = [x, y, z]
+        return T
+
+    def _solve_from_matrix(self, T, current_angles, check_strategies=False):
+        """Dekompozycja macierzy T i rozwiązanie analityczne układu równań."""
+        
+        # 1. Ekstrakcja danych z macierzy T (Pozycja + Wektor podejścia)
+        p_x, p_y, p_z = T[0, 3], T[1, 3], T[2, 3]
+        
+        # Odtworzenie kąta pochylenia z wektora normalnego (kolumna 3)
+        a_x, a_y, a_z = T[0, 2], T[1, 2], T[2, 2]
+        phi_deg = math.degrees(math.atan2(a_z, math.sqrt(a_x**2 + a_y**2)))
+        
+        # 2. Parametry pomocnicze do solvera geometrycznego
+        R_target = math.sqrt(p_x**2 + p_y**2)
+        th1_base = math.atan2(p_y, p_x)
+
+        # Definicja strategii (Elbow Up/Down, Base Normal/Reverse)
+        strategies = [(True, False), (False, False)]
+        if p_x <= 0: strategies.extend([(True, True), (False, True)])
+
+        best_sol = None
+        min_cost = float('inf')
+        best_name = ""
+
+        for elbow_up, reverse_base in strategies:
+            # Dostosowanie kąta bazy dla trybu wstecznego
+            th1_in = ((th1_base + math.pi) + math.pi) % (2*math.pi) - math.pi if reverse_base else th1_base
+            
+            # Wywołanie solvera analitycznego (Twoja istniejąca metoda inverse_kinematics)
+            sol = self.inverse_kinematics(R_target, p_z, th1_in, phi_deg, elbow_up, reverse_base)
+            
+            if sol and self.check_constraints(*sol):
+                if check_strategies:
+                    return sol, "Auto" # W trybie Auto wystarczy pierwsze poprawne
+                
+                cost = self.calculate_configuration_cost(sol, current_angles)
+                if cost < min_cost:
+                    min_cost = cost
+                    best_sol = sol
+                    best_name = "Elbow Up" if elbow_up else "Elbow Down"
+
+        return (best_sol, best_name) if best_sol else (None, None)
     
 # =====================================================================
 # GUI APPLICATION
 # =====================================================================
 
-POSITION_TOLERANCE = 5.0 # mm
-
 class RobotControlGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Robot Control Interface (Kinematics V2)")
-        self.root.geometry("1400x800")
+        self.root.title("Robot Control Panel")
+        self.root.geometry("1350x700")
 
-        # ========================================================
-        # 1. INICJALIZACJA MODELU KINEMATYCZNEGO
-        # ========================================================
-
+        # Inicjalizacja modelu
         self.kin = RobotKinematics()
 
-        # ========================================================
-        # 2. ZMIENNE STANU APLIKACJI
-        # ========================================================
-        self.last_gui_update_time = 0.0
-        self.last_tcp_pos = np.array([0.0, 0.0, 0.0])
+        self.last_gui_update_time = 0.0 # Timestamp ostatniej aktualizacji GUI
+        self.last_tcp_pos = np.array([0.0, 0.0, 0.0]) # Ostatnia znana pozycja TCP
         
-        # Połączenie ze sprzętem
+        # Komunikacja z robotem
         self.robot = RobotSerial()
         self.robot.gui_callback = self.update_position_display
         
-        # Wizualizacja
+        # Dane do wizualizacji 3D
         self.plot_artists = []
-        # Obliczenie max zasięgu z parametrów kinematyki dla skalowania wykresu
-        self.max_reach = self.kin.l2 + self.kin.l3 + self.kin.l4 + self.kin.l5
+        # Maksymalny zasięg robota (do wizualizacji)
+        self.max_reach = self.kin.a2 + self.kin.a3 + self.kin.a4 + self.kin.a5
         self.control_mode = tk.StringVar(value='position')
         
-        # Stan sterowania
+        # Sterowanie kątami (ciągłe wysyłanie)
         self.angle_send_timer = None
         self.angle_send_active = False
         self._collision_warning_shown = False
         self._last_collision_state = False
         
-        # Sekwencer
+        # Dane do sekwencji ruchów
         self.is_connected = False
         self.sequence_data = []  
         self.sequence_list_frame = None
@@ -549,46 +551,49 @@ class RobotControlGUI:
         self.target_xyz = None 
         self.POSITION_TOLERANCE = 2.0  # mm
 
+        # Inicjalizacja GUI
         self.setup_ui()
         self.setup_3d_plot()
         self.update_3d_visualization()
         
-        # Auto-connect po starcie GUI
+        # Próba automatycznego połączenia z robotem po starcie aplikacji
         self.root.after(100, self.connect_robot)
 
     def setup_ui(self):
-        # Stałe kolorów
+        # Definicja kolorów
         COLORS = {
             'BG': "#2f3347", 'FRAME': "#262a3e", 'BORDER': "#565a6c",
             'TEXT': "#c4cad0", 'ACCENT': "#101122", 'BTN': "#2f3347",
-            'STOP': "#cb0000", 'PLAY': "#008000"
+            'STOP': "#cb0000", 'PLAY': "#046D04", 'STOPHOV': "#cb0000", 'PLAYHOV': "#046D04"
         }
 
-        # Konfiguracja stylu
+        # Podstawowe style dla elementów ttk
         style = ttk.Style()
         style.theme_use('clam')
         style.configure(".", background=COLORS['BG'], foreground=COLORS['TEXT'], fieldbackground=COLORS['FRAME'],
-                        darkcolor=COLORS['FRAME'], lightcolor=COLORS['FRAME'], bordercolor=COLORS['BORDER'])
+                        darkcolor=COLORS['FRAME'], lightcolor=COLORS['FRAME'], bordercolor=COLORS['BORDER'], font=('Arial', 10))
         style.configure("TLabelframe", background=COLORS['FRAME'], bordercolor=COLORS['BORDER'], relief="solid")
-        style.configure("TLabelframe.Label", background=COLORS['FRAME'], foreground=COLORS['TEXT']) 
+        style.configure("Header.TLabel", background=COLORS['FRAME'], foreground=COLORS['TEXT'], padding=2, font=('Arial', 10, 'bold'), anchor='center')
         style.configure("TLabel", background=COLORS['FRAME'], foreground=COLORS['TEXT'])
         style.configure("TEntry", fieldbackground=COLORS['FRAME'], foreground=COLORS['TEXT'], insertcolor=COLORS['TEXT'], bordercolor=COLORS['BORDER'])
+        style.configure("TRadiobutton", background=COLORS['FRAME'], foreground=COLORS['TEXT'])
+        style.map("TRadiobutton", background=[('active', COLORS['FRAME'])], foreground=[('active', COLORS['TEXT'])])
         
-        # Style przycisków
+        # Przyciski
         btn_configs = [
             ("TButton", COLORS['BTN'], COLORS['ACCENT']),
-            ("Play.TButton", COLORS['PLAY'], '#004d00'),
-            ("Stop.TButton", COLORS['STOP'], '#8c0000')
+            ("Play.TButton", COLORS['PLAY'], COLORS['PLAYHOV']),
+            ("Stop.TButton", COLORS['STOP'], COLORS['STOPHOV'])
         ]
         for name, bg, active in btn_configs:
             style.configure(name, background=bg, foreground="white" if name != "TButton" else COLORS['TEXT'], bordercolor=COLORS['BORDER'])
             style.map(name, background=[('active', active)])
 
-        # Główne kontenery (Grid Layout)
+        # Główna ramka
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.grid(row=0, column=0, sticky="nswe")
         
-        # Lewa kolumna (Scrollbar)
+        #  Lewa kolumna - kontrolki
         scroll_canvas = tk.Canvas(main_frame, borderwidth=0, background=COLORS['BG'], highlightthickness=0)
         scroll_canvas.grid(row=0, column=0, sticky="nswe", padx=(0, 5))
         vscrollbar = ttk.Scrollbar(main_frame, orient="vertical", command=scroll_canvas.yview)
@@ -599,32 +604,38 @@ class RobotControlGUI:
         self.content_frame.grid_columnconfigure(0, weight=1) 
         self.canvas_window = scroll_canvas.create_window((0, 0), window=self.content_frame, anchor="nw", width=1) 
         
-        # Obsługa skalowania Canvas
+        # Zmiana rozmiaru zawartości dla scrollbara
         self.content_frame.bind("<Configure>", lambda e: scroll_canvas.configure(scrollregion=scroll_canvas.bbox("all")))
         scroll_canvas.bind("<Configure>", lambda e: scroll_canvas.itemconfig(self.canvas_window, width=e.width - vscrollbar.winfo_width()))
 
-        # Prawa kolumna - 3D
+        # Prawa kolumna - wizualizacja 3D
         right_frame = ttk.Frame(main_frame)
         right_frame.grid(row=0, column=1, sticky="nswe", padx=(5, 0))
         
-        # === ELEMENTY LEWEJ KOLUMNY ===
+        # ================================================
+        # ============ ELEMENTY LEWEJ KOLUMNY ============
+        # ================================================
         
         # 1. Status
-        status_frame = ttk.LabelFrame(self.content_frame, text="Status połączenia", padding="5")
+        header_label = ttk.Label(self.content_frame, text="Status połączenia", style="Header.TLabel")
+        status_frame = ttk.LabelFrame(self.content_frame, labelwidget=header_label, padding="5")
         status_frame.grid(row=0, column=0, sticky="ew", pady=5, padx=5)
         self.status_label = ttk.Label(status_frame, text="Rozłączony", foreground="red")
         self.status_label.grid(row=0, column=0, sticky="w")
         ttk.Button(status_frame, text="Połącz", command=self.connect_robot).grid(row=0, column=1, padx=5)
         
         # 2. Tryb sterowania
-        mode_frame = ttk.LabelFrame(self.content_frame, text="Tryb sterowania", padding="10")
+        mode_header = ttk.Label(self.content_frame, text="Tryb sterowania", style="Header.TLabel")
+        mode_frame = ttk.LabelFrame(self.content_frame, labelwidget=mode_header, padding="5")
         mode_frame.grid(row=1, column=0, sticky="ew", pady=5, padx=5)
-        for i, (txt, val) in enumerate([("Sterowanie pozycją (XYZ)", 'position'), ("Sterowanie kątami (ciągłe)", 'angles')]):
-            ttk.Radiobutton(mode_frame, text=txt, variable=self.control_mode, value=val, 
-                            command=self.switch_control_mode).grid(row=0, column=i, sticky="w", pady=2)
+        ttk.Radiobutton(mode_frame, text="Sterowanie pozycją (XYZ)", variable=self.control_mode, value='position', 
+                        command=self.switch_control_mode, style="TRadiobutton").grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Radiobutton(mode_frame, text="Sterowanie kątami (ciągłe)", variable=self.control_mode, value='angles', 
+                        command=self.switch_control_mode, style="TRadiobutton").grid(row=0, column=1, sticky="w", pady=2)
         
         # 3. Aktualna pozycja
-        pos_frame = ttk.LabelFrame(self.content_frame, text="Aktualna pozycja", padding="10")
+        pos_header = ttk.Label(self.content_frame, text="Aktualna pozycja", style="Header.TLabel")
+        pos_frame = ttk.LabelFrame(self.content_frame, labelwidget=pos_header, padding="5")
         pos_frame.grid(row=2, column=0, sticky="ew", pady=5, padx=5)
         
         self.pos_labels = {}
@@ -645,18 +656,20 @@ class RobotControlGUI:
             self.tcp_labels[axis] = lbl
 
         # 4. Kąty docelowe (IK)
-        self.angles_frame = ttk.LabelFrame(self.content_frame, text="Kąty docelowe (wynik IK)", padding="10")
+        angles_header = ttk.Label(self.content_frame, text="Kąty docelowe (wynik IK)", style="Header.TLabel")
+        self.angles_frame = ttk.LabelFrame(self.content_frame, labelwidget=angles_header, padding="10")
         self.angles_frame.grid(row=3, column=0, sticky="ew", pady=5, padx=5)
         self.angle_labels = {}
         labels_map = ['θ1 (X)', 'θ2 (Y)', 'θ3 (Z)', 'θ4 (E)']
         for i, axis in enumerate(labels_map):
-            ttk.Label(self.angles_frame, text=f"{axis}:").grid(row=0, column=i*2, sticky="e", padx=5, pady=2)
+            ttk.Label(self.angles_frame, text=f"{axis}:").grid(row=0, column=i*2, sticky="e", pady=2)
             lbl = ttk.Label(self.angles_frame, text="0.00°", font=('Arial', 10))
             lbl.grid(row=0, column=i*2+1, sticky="w", padx=5, pady=2)
             self.angle_labels[axis] = lbl
         
         # 5. Sterowanie kątami (Suwaki)
-        self.angle_control_frame = ttk.LabelFrame(self.content_frame, text="Sterowanie kątami [°]", padding="10")
+        control_header = ttk.Label(self.content_frame, text="Sterowanie kątami [°]", style="Header.TLabel")
+        self.angle_control_frame = ttk.LabelFrame(self.content_frame, labelwidget=control_header, padding="10")
         self.angle_control_frame.grid(row=4, column=0, sticky="ew", pady=5, padx=5)
         
         self.angle_sliders = {}
@@ -670,30 +683,31 @@ class RobotControlGUI:
             min_rad, max_rad = self.kin.limits[key]
             
             slider = tk.Scale(self.angle_control_frame, from_=math.degrees(min_rad), to=math.degrees(max_rad),    
-                              orient=tk.HORIZONTAL, resolution=0.1, length=250,
+                              orient=tk.HORIZONTAL, resolution=0.1, length=200,
                               bg=COLORS['FRAME'], fg=COLORS['TEXT'], troughcolor=COLORS['BG'], highlightthickness=0, 
                               command=lambda val, k=key: self.on_angle_slider_change(k, val))
             slider.set(0.0)
             slider.grid(row=i, column=1, padx=5, pady=5)
             self.angle_sliders[key] = slider
             
-            val_lbl = ttk.Label(self.angle_control_frame, text="0.0°", font=('Arial', 10, 'bold'))
+            val_lbl = ttk.Label(self.angle_control_frame, text="0.0°")
             val_lbl.grid(row=i, column=2, padx=5)
             self.angle_value_labels[key] = val_lbl
         
         self.live_control_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(self.angle_control_frame, text="WŁĄCZ LIVE (Transmisja ciągła)",
-                        variable=self.live_control_var, command=self.toggle_live_control).grid(row=len(joint_defs), column=0, columnspan=3, pady=10, sticky="w")
+        ttk.Radiobutton(self.angle_control_frame, text="WŁĄCZ LIVE (Transmisja ciągła)", variable=self.live_control_var, 
+                        command=self.toggle_live_control, style="TRadiobutton").grid(row=len(joint_defs), column=0, columnspan=3, pady=10, sticky="w")
 
         ttk.Button(self.angle_control_frame, text="DODAJ AKTUALNE KĄTY (do sekwencji)", 
                    command=self.add_current_angles_to_sequence).grid(row=len(joint_defs)+1, column=0, columnspan=3, pady=5, sticky="ew")
         
         # 6. Pozycja docelowa (Input XYZ)
-        self.target_frame = ttk.LabelFrame(self.content_frame, text="Pozycja docelowa [mm]", padding="10")
+        target_header = ttk.Label(self.content_frame, text="Pozycja docelowa [mm]", style="Header.TLabel")
+        self.target_frame = ttk.LabelFrame(self.content_frame, labelwidget=target_header, padding="10")
         self.target_frame.grid(row=5, column=0, sticky="ew", pady=5, padx=5)
         
-        input_defs = [("X:", "-87.5", "x_entry"), ("Y:", "0", "y_entry"), 
-                      ("Z:", "372.5", "z_entry"), ("Orientacja φ [°]:", "0", "phi_entry")]
+        input_defs = [("X:", "200", "x_entry"), ("Y:", "-200", "y_entry"), 
+                      ("Z:", "250", "z_entry"), ("Orientacja φ [°]:", "0", "phi_entry")]
         for i, (lbl_txt, def_val, attr_name) in enumerate(input_defs):
             ttk.Label(self.target_frame, text=lbl_txt).grid(row=i, column=0, sticky="w", pady=5)
             entry = ttk.Entry(self.target_frame, width=15)
@@ -702,8 +716,8 @@ class RobotControlGUI:
             setattr(self, attr_name, entry)
         
         self.auto_phi_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(self.target_frame, text="Orientacja automatyczna",
-                        variable=self.auto_phi_var, command=self.toggle_phi_entry).grid(row=4, column=0, columnspan=2, pady=5, sticky="w")
+        ttk.Radiobutton(self.target_frame, text="Orientacja automatyczna",variable=self.auto_phi_var, 
+                        command=self.toggle_phi_entry, style="TRadiobutton").grid(row=4, column=0, columnspan=2, pady=5, sticky="w")
         
         btn_row = ttk.Frame(self.target_frame)
         btn_row.grid(row=5, column=0, columnspan=2, sticky="ew", pady=5)
@@ -714,7 +728,8 @@ class RobotControlGUI:
         self.toggle_phi_entry()
         
         # 7. Log
-        log_frame = ttk.LabelFrame(self.content_frame, text="Log komunikacji", padding="10")
+        log_header = ttk.Label(self.content_frame, text="Log komunikacji", style="Header.TLabel")
+        log_frame = ttk.LabelFrame(self.content_frame, labelwidget=log_header, padding="10")
         log_frame.grid(row=7, column=0, sticky="ew", pady=5, padx=5)
         self.log_text = tk.Text(log_frame, height=10, width=50, bg=COLORS['FRAME'], fg=COLORS['TEXT'], 
                                 insertbackground=COLORS['TEXT'], selectbackground=COLORS['ACCENT'],
@@ -725,10 +740,13 @@ class RobotControlGUI:
         self.log_text['yscrollcommand'] = sb.set
         log_frame.grid_columnconfigure(0, weight=1)
 
-        # 8. Sekwencer
-        self._create_sequence_frame(self.content_frame, 8) 
+        # 8. Programowanie sekwencyjne
+        self._create_sequence_frame(self.content_frame, 8)
 
-        # === WIZUALIZACJA 3D (PRAWA STRONA) ===
+        # ================================================
+        # ============ ELEMENTY PRAWEJ KOLUMNY ===========
+        # ================================================
+
         viz_frame = ttk.LabelFrame(right_frame, text="Wizualizacja 3D", padding="10")
         viz_frame.grid(row=0, column=0, sticky="nswe")
         
@@ -749,8 +767,9 @@ class RobotControlGUI:
         
         # Konfiguracja wag grid
         self.root.columnconfigure(0, weight=1); self.root.rowconfigure(0, weight=1)
-        main_frame.columnconfigure(0, weight=3); main_frame.columnconfigure(1, weight=7) 
-        main_frame.rowconfigure(0, weight=1); right_frame.rowconfigure(0, weight=1)
+        main_frame.columnconfigure(0, weight=1); main_frame.columnconfigure(1, weight=1) 
+        main_frame.rowconfigure(0, weight=1); 
+        right_frame.rowconfigure(0, weight=1); right_frame.columnconfigure(0, weight=1)
         
         self.switch_control_mode()
 
@@ -771,13 +790,6 @@ class RobotControlGUI:
         r = np.arange(-300, 301, 100)
         X, Y = np.meshgrid(r, r)
         self.ax.plot_wireframe(X, Y, np.zeros_like(X), alpha=0.1, color='gray', linewidth=0.5)
-        
-        # Układ współrzędnych
-        al = 100
-        self.ax.quiver(0, 0, 0, al, 0, 0, color='red', arrow_length_ratio=0.1, lw=2, label='X')
-        self.ax.quiver(0, 0, 0, 0, al, 0, color='green', arrow_length_ratio=0.1, lw=2, label='Y')
-        self.ax.quiver(0, 0, 0, 0, 0, al, color='blue', arrow_length_ratio=0.1, lw=2, label='Z')
-        self.ax.legend(loc='upper right')
 
     def reset_3d_view(self):
         self.ax.set_xlim([-self.max_reach, self.max_reach])

@@ -2,11 +2,9 @@
 #include <Wire.h>
 #include <AccelStepper.h>
 
-// ==================== Tryb symulacji ====================
-#define SIMULATION_MODE true
-
 // ==================== Podstawowe ustawienia ====================
 #define BAUD 115200
+#define SIMULATION_MODE true
 
 // ======================= Piny silników ======================
 #define STEP_X 17
@@ -20,45 +18,36 @@
 #define STEP_E 14
 #define DIR_E 27
 
+#define LIMIT_X_PIN 36
+#define LIMIT_Y_PIN 39
+#define LIMIT_Z_PIN 34
+#define LIMIT_E_PIN 35
+
+#define SDA_PIN 21
+#define SCL_PIN 22
+
 AccelStepper motorX(AccelStepper::DRIVER, STEP_X, DIR_X);
 AccelStepper motorY(AccelStepper::DRIVER, STEP_Y, DIR_Y);
 AccelStepper motorA(AccelStepper::DRIVER, STEP_A, DIR_A);
 AccelStepper motorZ(AccelStepper::DRIVER, STEP_Z, DIR_Z);
 AccelStepper motorE(AccelStepper::DRIVER, STEP_E, DIR_E);
 
-#define LIMIT_X_PIN 36
-#define LIMIT_Y_PIN 39
-#define LIMIT_Z_PIN 34
-#define LIMIT_E_PIN 35
+// ===================== Konfiguracja enkoderów [E, Z, Y, A, X] ======================
 
-// ===================== Konfiguracja I2C ======================
-#define SDA_PIN 21
-#define SCL_PIN 22
-
-const int PCA9548A_ADDR = 0x70;
-const int AS5600_ADDR = 0x36;
-const int AS5600_RAW_ANGLE_HIGH = 0x0C;
-
+const float START_ANGLES[5] = {90.0, 90.0, 135.0, 135.0, 0.0}; 
 const bool ENCODER_INVERT[] = {true, false, true, true, false}; // [E, Z, Y, A, X]
 const uint8_t ENCODER_CHANNEL[] = {4, 5, 6, 7, 3};
 const float ENCODER_LEVER[] = {2.0, 3.6, 4.5, 4.5, 4.0};
-
-// ===================== Zmienne współdzielone (z mutex) ======================
-SemaphoreHandle_t xMutex;
-
-// Chronione przez mutex
-volatile float currentAngles[5] = {90.0, 90.0, 135.0, 135.0, 0.0};
-volatile float targetAngles[5] = {90.0, 90.0, 135.0, 135.0, 0.0};
-volatile bool newTargetAvailable = true;
-
-// Dane enkoderów (tylko rdzeń 0)
 uint16_t ENCODER_ZPOS[] = {0, 0, 0, 0, 0};
 int16_t rotationCount[] = {0, 0, 0, 0, 0};
 uint16_t lastRawAngle[] = {0, 0, 0, 0, 0};
 const float angleConst = 360.0 / 4096.0;
 
-// ===================== Kąty startowe ======================
-const float START_ANGLES[5] = {90.0, 90.0, 135.0, 135.0, 0.0}; // [E, Z, Y, A, X]
+// ===================== Zmienne współdzielone (z mutex) ======================
+SemaphoreHandle_t xMutex;
+volatile float currentAngles[5] = {90.0, 90.0, 135.0, 135.0, 0.0};
+volatile float targetAngles[5] = {90.0, 90.0, 135.0, 135.0, 0.0};
+volatile bool newTargetAvailable = true;
 
 // ===================== Parametry sterowania ======================
 const bool AXIS_INVERT[] = {false, false, false, false, false};
@@ -484,22 +473,22 @@ void loop() {
 // =========================================================================
 
 bool selectI2CChannel(uint8_t channel) {
-    Wire.beginTransmission(PCA9548A_ADDR);
+    Wire.beginTransmission(0x70);
     Wire.write(1 << channel);
     return (Wire.endTransmission() == 0);
 }
 
 bool isAS5600Available() {
-    Wire.beginTransmission(AS5600_ADDR);
+    Wire.beginTransmission(0x36);
     return (Wire.endTransmission(true) == 0);
 }
 
 bool readAS5600Raw(uint16_t &angle) {
-    Wire.beginTransmission(AS5600_ADDR);
-    Wire.write(AS5600_RAW_ANGLE_HIGH);
+    Wire.beginTransmission(0x36);
+    Wire.write(0x0C);
     if (Wire.endTransmission(false) != 0) return false;
 
-    Wire.requestFrom(AS5600_ADDR, 2);
+    Wire.requestFrom(0x36, 2);
     if (Wire.available() != 2) return false;
 
     uint8_t high = Wire.read();
