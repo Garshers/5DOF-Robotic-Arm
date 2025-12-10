@@ -267,32 +267,41 @@ class RobotKinematics:
         return np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, d], [0, 0, 0, 1]])
     def _trans_x(self, a):
         return np.array([[1, 0, 0, a], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
-
-    def forward_kinematics(self, th1, th2, th3, th4, alpha5=0.0):
+    def _compute_chain(self, th1, th2, th3, th4, alpha5=0.0):
         """
-        Funkcja obliczająca macierze transformacji kinematyki prostej metodą notacji Denavita-Hartenberga.
-        Parametry oraz struktury macierzy zostały wyznaczone ręcznie.
+        Zwraca listę macierzy transformacji kinematyki prostej
         """
-        alpha1, alpha4 = np.pi / 2, -np.pi / 2
+        T1 = self._rot_z(th1)   @ self._trans_z(self.d1) @ self._trans_x(self.a1) @ self._rot_x(np.pi/2)
+        T2 = self._rot_z(th2)                            @ self._trans_x(self.a2)
+        T3 = self._rot_z(-th3)                           @ self._trans_x(self.a3)
+        T4 = self._rot_z(-th4)                           @ self._trans_x(self.a4) @ self._rot_x(-np.pi / 2)
+        T5 =                      self._trans_z(self.d5) @ self._trans_x(self.a5) @ self._rot_x(alpha5)
+        T6 = self._rot_z(np.pi/2)                                                 @ self._rot_x(np.pi/2)
 
-        # Macierze transformacji
-        T1 = self._rot_z(th1)  @ self._trans_z(self.d1) @ self._trans_x(self.a1) @ self._rot_x(alpha1)
-        T2 = self._rot_z(th2)  @                          self._trans_x(self.a2)
-        T3 = self._rot_z(-th3) @                          self._trans_x(self.a3)
-        T4 = self._rot_z(-th4) @                          self._trans_x(self.a4) @ self._rot_x(alpha4)
-        T5 =                     self._trans_z(self.d5) @ self._trans_x(self.a5) @ self._rot_x(alpha5)
+        T_base = np.eye(4)
+        T1_g = T1
+        T2_g = T1_g @ T2
+        T3_g = T2_g @ T3
+        T4_g = T3_g @ T4
+        T5_g = T4_g @ T5
+        T_TCP = T5_g @ T6
 
-        origin = np.array([0, 0, 0, 1])
-        
-        # Macierze poszczególnych osi
-        p1 = np.array([0, 0, 0])
-        p2 = (T1 @ origin)[:3]
-        p3 = (T1 @ T2 @ origin)[:3]
-        p4 = (T1 @ T2 @ T3 @ origin)[:3]
-        p5 = (T1 @ T2 @ T3 @ T4 @ T5 @ origin)[:3]
+        return [T_base, T1_g, T2_g, T3_g, T4_g, T5_g, T_TCP]
 
-        return np.array([p1, p2, p3, p4, p5])
+    def get_joint_positions(self, th1, th2, th3, th4, alpha5=0.0):
+        """
+        Zwraca tablicę punktów (pozycje węzłów)
+        """
+        matrices = self._compute_chain(th1, th2, th3, th4, alpha5)
+        return np.array([m[:3, 3] for m in matrices])
 
+    def get_tcp_matrix(self, th1, th2, th3, th4, alpha5=0.0):
+        """
+        Zwraca wyłącznie macierz transformacji efektora końcowego (TCP)
+        """
+        chain = self._compute_chain(th1, th2, th3, th4, alpha5)
+        return chain[-1]
+    
     def inverse_kinematics(self, R, Z, th1, phi_deg=0.0, elbow_up=True, reverse_base=False):
         """
         Funkcja rozwiązuje analitycznie zadanie odwrotne kinematyki metodą geometryczną.
@@ -801,7 +810,7 @@ class RobotControlGUI:
     def update_3d_visualization(self):
         """Odświeża pozycję ramienia na wykresie 3D."""
         try:
-            # Usunięcie starych elementów
+            # Usunięcie starych elementów (linii i strzałek)
             for artist in self.plot_artists:
                 if isinstance(artist, list):
                     for i in artist: i.remove()
@@ -813,23 +822,34 @@ class RobotControlGUI:
             angles = self.robot.get_current_angles()
             rads = [math.radians(a) for a in angles[:4]]
             
-            # UŻYCIE KLASY KINEMATYKI
-            positions = self.kin.forward_kinematics(*rads)
-            self.last_tcp_pos = positions[-1]
+            # Pozycje węzłów
+            positions = self.kin.get_joint_positions(*rads)
             
-            # Rysowanie
+            # Orientacja TCP
+            Te = self.kin.get_tcp_matrix(*rads)
+            R = Te[:3, :3]
+            
+            # Szkielet robota
             xs, ys, zs = positions[:, 0], positions[:, 1], positions[:, 2]
-            
             lines = self.ax.plot(xs, ys, zs, 'o-', linewidth=2, markersize=6, color='#377df0', markerfacecolor='lightblue')
             tcp = self.ax.scatter([xs[-1]], [ys[-1]], [zs[-1]], c="#cb0000", s=50, edgecolors='darkred', linewidths=2)
             
-            self.plot_artists.extend([lines, tcp])
+            # Wektory osi (Strzałki)
+            len_vec = 40.0
+            tcp_x, tcp_y, tcp_z = xs[-1], ys[-1], zs[-1]
             
-            # Etykiety węzłów
-            labels = ['Base', 'J1', 'J2', 'J3', 'J4', 'TCP']
+            ax_x = self.ax.quiver(tcp_x, tcp_y, tcp_z, R[0,0], R[1,0], R[2,0], length=len_vec, color='b')
+            ax_y = self.ax.quiver(tcp_x, tcp_y, tcp_z, R[0,1], R[1,1], R[2,1], length=len_vec, color='g')
+            ax_z = self.ax.quiver(tcp_x, tcp_y, tcp_z, R[0,2], R[1,2], R[2,2], length=len_vec, color='r')
+            
+            self.plot_artists.extend([lines, tcp, ax_x, ax_y, ax_z])
+            
+            # Etykiety
+            labels = ['Base', 'T1', 'T2', 'T3', '', '', 'TE']
             for i, pos in enumerate(positions):
-                txt = self.ax.text(pos[0], pos[1], pos[2], f'  {labels[i]}', fontsize=8, color="#c4cad0")
-                self.plot_artists.append(txt)
+                if i < len(labels):
+                    txt = self.ax.text(pos[0], pos[1], pos[2], f'  {labels[i]}', fontsize=8, color="#c4cad0")
+                    self.plot_artists.append(txt)
             
             self.canvas.draw()
             
@@ -899,7 +919,7 @@ class RobotControlGUI:
                 return
             
             # Weryfikacja kolizji końcowej przez FK
-            pos = self.kin.forward_kinematics(*sol)
+            pos = self.kin.get_joint_positions(*sol)
             if pos[3][2] < -0.01 or pos[4][2] < -0.01:
                 messagebox.showerror("Kolizja", "Rozwiązanie koliduje z podłożem!")
                 return
@@ -923,7 +943,7 @@ class RobotControlGUI:
         
         # Szybkie sprawdzenie kolizji dla suwaków przez FK
         rads = [math.radians(self.angle_sliders[k].get()) for k in ['th1','th2','th3','th4']]
-        pos = self.kin.forward_kinematics(*rads)
+        pos = self.kin.get_joint_positions(*rads)
         min_z = np.min(pos[:, 2])
         
         is_collision = min_z < 0
@@ -968,7 +988,7 @@ class RobotControlGUI:
         if not self.angle_send_active: return
         
         rads = [math.radians(self.angle_sliders[k].get()) for k in ['th1','th2','th3','th4']]
-        pos = self.kin.forward_kinematics(*rads)
+        pos = self.kin.get_joint_positions(*rads)
         
         if np.min(pos[:, 2]) < 0:
             if not self._collision_warning_shown:
@@ -1146,7 +1166,7 @@ class RobotControlGUI:
         rads = [math.radians(self.angle_sliders[k].get()) for k in ['th1','th2','th3','th4']]
         
         # Pobranie pozycji przez FK
-        pos = self.kin.forward_kinematics(*rads)[-1]
+        pos = self.kin.get_joint_positions(*rads)[-1]
         fi_rad = math.atan2(math.sin(sum(rads[1:])), math.cos(sum(rads[1:])))
         
         self.sequence_data.append({
