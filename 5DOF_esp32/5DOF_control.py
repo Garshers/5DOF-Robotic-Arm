@@ -30,8 +30,8 @@ class RobotSerial:
         self.running = False        # Flaga kontrolująca pracę wątku odczytu.
         self.reader_thread = None   # Wątek odpowiedzialny za odbiór danych w tle.
 
-        # Aktualne wartości odczytane z kontrolera [X, Y, Z, E, A] w stopniach.
-        self.current_angles = [0.0, 0.0, 0.0, 0.0, 0.0]
+        # Aktualne wartości odczytane z kontrolera [X, Y, Z, E, A, S] w stopniach.
+        self.current_angles = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
         # Lock zabezpiecza dane przy odczycie/zapisie z różnych wątków (mutex w c++)
         self.lock = threading.Lock()
@@ -105,7 +105,14 @@ class RobotSerial:
         Metoda parsuje ramki z danymi kątów i aktualizuje stan robota.
         """
 
-        AXIS_MAP = {"X": 0, "Y": 1, "Z": 2, "E": 3, "A": 4}
+        AXIS_MAP = {
+            "X": 0, 
+            "Y": 1, 
+            "Z": 2, 
+            "E": 3, 
+            "S": 4,
+            "A": 5  # Slave Y
+        }
 
         while self.running and self.ser and self.ser.is_open:
             try:
@@ -171,23 +178,24 @@ class RobotSerial:
         with self.lock:
             return self.current_angles.copy()
 
-    def send_target_angles(self, th1, th2, th3, th4):
+    def send_target_angles(self, th1, th2, th3, th4, th5):
         """
         Wysyła wartości docelowe osi do ESP32.
         Oczekuje wartości w radianach — konwertuje je na stopnie.
-        Format wysyłanej komendy: X...,Y...,Z...,E...
+        Format wysyłanej komendy: X...,Y...,Z...,E...,A...
         """
         if not self.ser or not self.ser.is_open:
             return False, "Port nie jest otwarty"
 
         # Konwersja radianów na stopnie i budowa ramki
-        radians = [th1, th2, th3, th4]
+        radians = [th1, th2, th3, th4, th5]
         degrees = [math.degrees(v) for v in radians]
         cmd = (
             f"X{degrees[0]:.2f},"
             f"Y{degrees[1]:.2f},"
             f"Z{degrees[2]:.2f},"
-            f"E{degrees[3]:.2f}\n"
+            f"E{degrees[3]:.2f},"
+            f"S{degrees[4]:.2f}\n"
         )
 
         try: # Wysłanie ramki i wyświetlenie potwierdzenia
@@ -227,9 +235,9 @@ class RobotKinematics:
         self.a2 = 149.0
         self.a3 = 120.3
         self.a4 = 87.8
-        self.a5 = 23.0
         self.d1 = 110.8
         self.d5 = 10.0
+        self.d6 = 23.0
         
         # Definicja limitów w złączach [rad]
         range_const = math.pi / 2
@@ -237,13 +245,14 @@ class RobotKinematics:
             'th1': (-range_const, range_const), # X
             'th2': (0, range_const * 1.5),      # YA
             'th3': (-range_const, range_const), # Z
-            'th4': (-range_const, range_const)  # E
+            'th4': (-range_const, range_const), # E
+            'th5': (-math.pi, math.pi)          # A
         }
 
         # Prekomputacja stałych
         self.L1 = self.a2
         self.L2 = self.a3
-        self.L3 = math.sqrt((self.a4 + self.a5)**2 + self.d5**2)
+        self.L3 = math.sqrt((self.a4 + self.d6)**2 + self.d5**2)
         
         # Stałe do twierdzenia cosinusów
         self.L1_sq = self.L1**2
@@ -255,8 +264,7 @@ class RobotKinematics:
         self.min_reach_sq = (self.L1 - self.L2)**2
         
         # Przesunięcie środka osi przez serwo
-        self.geo_phi_offset = math.atan2(self.d5, self.a4 + self.a5)
-
+        self.geo_phi_offset = math.atan2(self.d5, self.a4 + self.d6)
     def _rot_z(self, t):
         c, s = np.cos(t), np.sin(t)
         return np.array([[c, -s, 0, 0], [s, c, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
@@ -267,39 +275,39 @@ class RobotKinematics:
         return np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, d], [0, 0, 0, 1]])
     def _trans_x(self, a):
         return np.array([[1, 0, 0, a], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
-    def _compute_chain(self, th1, th2, th3, th4, alpha5=0.0):
+    def _compute_chain(self, th1, th2, th3, th4, th5=0.0):
         """
         Zwraca listę macierzy transformacji kinematyki prostej
         """
-        T1 = self._rot_z(th1)   @ self._trans_z(self.d1) @ self._trans_x(self.a1) @ self._rot_x(np.pi/2)
-        T2 = self._rot_z(th2)                            @ self._trans_x(self.a2)
-        T3 = self._rot_z(-th3)                           @ self._trans_x(self.a3)
-        T4 = self._rot_z(-th4)                           @ self._trans_x(self.a4) @ self._rot_x(-np.pi / 2)
-        T5 =                      self._trans_z(self.d5) @ self._trans_x(self.a5) @ self._rot_x(alpha5)
-        T6 = self._rot_z(np.pi/2)                                                 @ self._rot_x(np.pi/2)
+        A1 = self._rot_z(th1)    @ self._trans_z(self.d1) @ self._trans_x(self.a1) @ self._rot_x(np.pi/2)
+        A2 = self._rot_z(th2)                             @ self._trans_x(self.a2)
+        A3 = self._rot_z(-th3)                            @ self._trans_x(self.a3)
+        A4 = self._rot_z(-th4)                            @ self._trans_x(self.a4) @ self._rot_x(-np.pi / 2)
+        A5 = self._rot_z(np.pi/2)@ self._trans_z(self.d5)                          @ self._rot_x(np.pi / 2)
+        A6 = self._rot_z(-th5)   @ self._trans_z(self.d6)
 
         T_base = np.eye(4)
-        T1_g = T1
-        T2_g = T1_g @ T2
-        T3_g = T2_g @ T3
-        T4_g = T3_g @ T4
-        T5_g = T4_g @ T5
-        T_TCP = T5_g @ T6
+        T1 = A1
+        T2 = T1 @ A2
+        T3 = T2 @ A3
+        T4 = T3 @ A4
+        T5 = T4 @ A5
+        T_E = T5 @ A6
 
-        return [T_base, T1_g, T2_g, T3_g, T4_g, T5_g, T_TCP]
+        return [T_base, T1, T2, T3, T4, T5, T_E]
 
-    def get_joint_positions(self, th1, th2, th3, th4, alpha5=0.0):
+    def get_joint_positions(self, th1, th2, th3, th4, th5=0.0):
         """
         Zwraca tablicę punktów (pozycje węzłów)
         """
-        matrices = self._compute_chain(th1, th2, th3, th4, alpha5)
+        matrices = self._compute_chain(th1, th2, th3, th4, th5)
         return np.array([m[:3, 3] for m in matrices])
 
-    def get_tcp_matrix(self, th1, th2, th3, th4, alpha5=0.0):
+    def get_tcp_matrix(self, th1, th2, th3, th4, th5=0.0):
         """
         Zwraca wyłącznie macierz transformacji efektora końcowego (TCP)
         """
-        chain = self._compute_chain(th1, th2, th3, th4, alpha5)
+        chain = self._compute_chain(th1, th2, th3, th4, th5)
         return chain[-1]
     
     def inverse_kinematics(self, R, Z, th1, phi_deg=0.0, elbow_up=True, reverse_base=False):
@@ -330,7 +338,7 @@ class RobotKinematics:
         # Twierdzenie cosinusów na preliczonych kwadratach
         cos_th3 = (D_sq - self.L1_sq - self.L2_sq) / self.denom
         
-        # Obcięcie wartości wykraczających poza zakres [-1,1] (zabezpieczenie przed błędami float)
+        # Obcięcie wartości wykraczających poza zakres [-1,1] (zabezpieczenie przed błędami float).
         cos_th3 = np.clip(cos_th3, -1.0, 1.0)
         
         # Pozycja ramienia L2 (Silnik Z)
@@ -381,7 +389,7 @@ class RobotKinematics:
         if q_target is None: return float('inf')
         
         total_dist = 0
-        weights = [1.0, 15.0, 5.0, 1.0] # wagi dla [Oś X, Oś YA, Oś Z, Oś E]
+        weights = [1.0, 15.0, 5.0, 1.0, 0] # wagi dla [Oś X, Oś YA, Oś Z, Oś E, Oś A]
         
         for i in range(4):
             diff = q_target[i] - q_current[i] # Różnica między pozycją docelową a obecną
@@ -398,13 +406,13 @@ class RobotKinematics:
         Główna funkcja kosztu oceniająca jakość potencjalnej konfiguracji robota.
         Łączy niezależne koszty (limity, ruch, osobliwości) w jedną ważoną wartość.
         """
-        th1, th2, th3, th4 = angles
+        th1, th2, th3, th4, th5 = angles
         
         ## ---------- KOSZT LIMITÓW ZŁĄCZY ----------
         # Im bliżej limitów złączy, tym większa koszt, co wymusza pracę w bezpiecznym centrum zakresu
         jl_cost = 0
-        vals = [th1, th2, th3, th4]
-        lims = [self.limits['th1'], self.limits['th2'], self.limits['th3'], self.limits['th4']]
+        vals = [th1, th2, th3, th4, th5]
+        lims = [self.limits['th1'], self.limits['th2'], self.limits['th3'], self.limits['th4'], self.limits['th5']]
         
         for v, (mn, mx) in zip(vals, lims):
             norm = (v - mn) / (mx - mn) # Normalizacja do zakresu [0, 1]
@@ -420,24 +428,24 @@ class RobotKinematics:
         
         return 2.0 * jl_cost + 1.0 * motion_cost + 3.0 * singularity_cost
 
-    def solve_ik(self, x, y, z, current_angles, phi_deg=None):
+    def solve_ik(self, x, y, z, current_angles, phi_deg=None, roll_deg=0.0):
         """
         Główny interfejs sterowania. Konwertuje zadanie do postaci macierzowej (T_Goal),
         a następnie rozwiązuje problem odwrotny.
         """
         candidates = []
-        
+        th5_target = math.radians(roll_deg)
+
         # --- WARIANT 1: Zadana orientacja (Jednoznaczna macierz celu) ---
         if phi_deg is not None:
-            # Tworzymy obiekt matematyczny zadania (Macierz 4x4)
+            # Tworzymy macierz 4x4
             T_goal = self._construct_matrix(x, y, z, phi_deg)
-            
             sol, strategy = self._solve_from_matrix(T_goal, current_angles)
-            return (sol, strategy) if sol else (None, "Cel nieosiągalny")
+            return (sol + (th5_target,), strategy) if sol else (None, "Cel nieosiągalny")
 
         # --- WARIANT 2: Auto-orientacja (Optymalizacja macierzy celu) ---
         else:
-            # Przeszukujemy przestrzeń możliwych macierzy T, aby znaleźć tę najkorzystniejszą energetycznie
+            # Przeszukujemy przestrzeń możliwych macierzy T, aby znaleźć tę najbardziej korzystną
             for phi in range(-180, 180, 10):
                 T_candidate = self._construct_matrix(x, y, z, phi)
                 
@@ -445,8 +453,9 @@ class RobotKinematics:
                 sol, name = self._solve_from_matrix(T_candidate, current_angles, check_strategies=True)
                 
                 if sol:
-                    cost = self.calculate_configuration_cost(sol, current_angles)
-                    candidates.append((cost, sol, f"{name} (Auto φ={phi}°)"))
+                    full_sol = sol + (th5_target,)
+                    cost = self.calculate_configuration_cost(full_sol, current_angles)
+                    candidates.append((cost, full_sol, f"{name} (Auto φ={phi}°)"))
             
             if not candidates:
                 return None, "Brak rozwiązania"
@@ -501,14 +510,14 @@ class RobotKinematics:
             # Dostosowanie kąta bazy dla trybu wstecznego
             th1_in = ((th1_base + math.pi) + math.pi) % (2*math.pi) - math.pi if reverse_base else th1_base
             
-            # Wywołanie solvera analitycznego (Twoja istniejąca metoda inverse_kinematics)
+
             sol = self.inverse_kinematics(R_target, p_z, th1_in, phi_deg, elbow_up, reverse_base)
             
             if sol and self.check_constraints(*sol):
                 if check_strategies:
-                    return sol, "Auto" # W trybie Auto wystarczy pierwsze poprawne
+                    return sol, "Auto"
                 
-                cost = self.calculate_configuration_cost(sol, current_angles)
+                cost = self.calculate_configuration_cost(sol + (current_angles[4],), current_angles)
                 if cost < min_cost:
                     min_cost = cost
                     best_sol = sol
@@ -539,7 +548,7 @@ class RobotControlGUI:
         # Dane do wizualizacji 3D
         self.plot_artists = []
         # Maksymalny zasięg robota (do wizualizacji)
-        self.max_reach = self.kin.a2 + self.kin.a3 + self.kin.a4 + self.kin.a5
+        self.max_reach = self.kin.a2 + self.kin.a3 + self.kin.a4 + self.kin.d6
         self.control_mode = tk.StringVar(value='position')
         
         # Sterowanie kątami (ciągłe wysyłanie)
@@ -648,7 +657,7 @@ class RobotControlGUI:
         pos_frame.grid(row=2, column=0, sticky="ew", pady=5, padx=5)
         
         self.pos_labels = {}
-        for i, axis in enumerate(['X', 'Y', 'Z', 'E', 'A']):
+        for i, axis in enumerate(['X', 'Y', 'Z', 'E', 'S', 'A']):
             ttk.Label(pos_frame, text=f"{axis}:").grid(row=0, column=i, sticky="w", pady=2)
             lbl = ttk.Label(pos_frame, text="0.00°", font=('Arial', 10))
             lbl.grid(row=0, column=i, sticky="w", padx=10)
@@ -669,7 +678,7 @@ class RobotControlGUI:
         self.angles_frame = ttk.LabelFrame(self.content_frame, labelwidget=angles_header, padding="10")
         self.angles_frame.grid(row=3, column=0, sticky="ew", pady=5, padx=5)
         self.angle_labels = {}
-        labels_map = ['θ1 (X)', 'θ2 (Y)', 'θ3 (Z)', 'θ4 (E)']
+        labels_map = ['θ1', 'θ2', 'θ3', 'θ4', 'θ5']
         for i, axis in enumerate(labels_map):
             ttk.Label(self.angles_frame, text=f"{axis}:").grid(row=0, column=i*2, sticky="e", pady=2)
             lbl = ttk.Label(self.angles_frame, text="0.00°", font=('Arial', 10))
@@ -683,8 +692,13 @@ class RobotControlGUI:
         
         self.angle_sliders = {}
         self.angle_value_labels = {}
-        joint_defs = [('th1', 'θ1 (X - Baza)'), ('th2', 'θ2 (Y - Ramię L2)'), 
-                      ('th3', 'θ3 (Z - Ramię L3)'), ('th4', 'θ4 (E - Nadgarstek)')]
+        joint_defs = [
+            ('th1', 'θ1 (X - Baza)'), 
+            ('th2', 'θ2 (Y - Ramię L2)'), 
+            ('th3', 'θ3 (Z - Ramię L3)'), 
+            ('th4', 'θ4 (E - Nadgarstek)'),
+            ('th5', 'θ5 (A - Obrót)')
+        ]
         
         for i, (key, label) in enumerate(joint_defs):
             ttk.Label(self.angle_control_frame, text=label).grid(row=i, column=0, sticky="w", pady=5)
@@ -704,7 +718,7 @@ class RobotControlGUI:
             self.angle_value_labels[key] = val_lbl
         
         self.live_control_var = tk.BooleanVar(value=False)
-        ttk.Radiobutton(self.angle_control_frame, text="WŁĄCZ LIVE (Transmisja ciągła)", variable=self.live_control_var, 
+        ttk.Checkbutton(self.angle_control_frame, text="WŁĄCZ LIVE (Transmisja ciągła)", variable=self.live_control_var, 
                         command=self.toggle_live_control, style="TRadiobutton").grid(row=len(joint_defs), column=0, columnspan=3, pady=10, sticky="w")
 
         ttk.Button(self.angle_control_frame, text="DODAJ AKTUALNE KĄTY (do sekwencji)", 
@@ -715,8 +729,13 @@ class RobotControlGUI:
         self.target_frame = ttk.LabelFrame(self.content_frame, labelwidget=target_header, padding="10")
         self.target_frame.grid(row=5, column=0, sticky="ew", pady=5, padx=5)
         
-        input_defs = [("X:", "200", "x_entry"), ("Y:", "-200", "y_entry"), 
-                      ("Z:", "250", "z_entry"), ("Orientacja φ [°]:", "0", "phi_entry")]
+        input_defs = [
+            ("X:", "200", "x_entry"), 
+            ("Y:", "-200", "y_entry"), 
+            ("Z:", "250", "z_entry"), 
+            ("Pitch φ [°]:", "0", "phi_entry"),
+            ("Roll [°]:", "0", "roll_entry")
+        ]
         for i, (lbl_txt, def_val, attr_name) in enumerate(input_defs):
             ttk.Label(self.target_frame, text=lbl_txt).grid(row=i, column=0, sticky="w", pady=5)
             entry = ttk.Entry(self.target_frame, width=15)
@@ -725,11 +744,11 @@ class RobotControlGUI:
             setattr(self, attr_name, entry)
         
         self.auto_phi_var = tk.BooleanVar(value=True)
-        ttk.Radiobutton(self.target_frame, text="Orientacja automatyczna",variable=self.auto_phi_var, 
-                        command=self.toggle_phi_entry, style="TRadiobutton").grid(row=4, column=0, columnspan=2, pady=5, sticky="w")
+        ttk.Checkbutton(self.target_frame, text="Orientacja automatyczna",variable=self.auto_phi_var, 
+                        command=self.toggle_phi_entry, style="TRadiobutton").grid(row=5, column=0, columnspan=2, pady=5, sticky="w")
         
         btn_row = ttk.Frame(self.target_frame)
-        btn_row.grid(row=5, column=0, columnspan=2, sticky="ew", pady=5)
+        btn_row.grid(row=6, column=0, columnspan=2, sticky="ew", pady=5)
         btn_row.columnconfigure((0, 1), weight=1, uniform="g")
         ttk.Button(btn_row, text="WYŚLIJ POZYCJĘ", command=self.send_position).grid(row=0, column=0, padx=(0, 2), sticky="ew")
         ttk.Button(btn_row, text="DODAJ PUNKT", command=self.add_point_to_sequence).grid(row=0, column=1, padx=(2, 0), sticky="ew")
@@ -820,7 +839,7 @@ class RobotControlGUI:
             
             # Pobranie pozycji
             angles = self.robot.get_current_angles()
-            rads = [math.radians(a) for a in angles[:4]]
+            rads = [math.radians(a) for a in angles[:5]]
             
             # Pozycje węzłów
             positions = self.kin.get_joint_positions(*rads)
@@ -877,13 +896,17 @@ class RobotControlGUI:
             
             if angles:
                 # Aktualizacja etykiet kątów
-                for i, axis in enumerate(['X', 'Y', 'Z', 'E', 'A']):
-                    self.pos_labels[axis].config(text=f"{angles[i]:.2f}°")
+                for i, axis in enumerate(['X', 'Y', 'Z', 'E', 'S', 'A']):
+                    if i < len(angles):
+                        self.pos_labels[axis].config(text=f"{angles[i]:.2f}°")
                 
-                # Aktualizacja etykiet TCP
-                tcp = self.last_tcp_pos
+                # Obliczanie pozycji tcp
+                current_rads = [math.radians(a) for a in angles[:5]]
+                tcp_matrix = self.kin.get_tcp_matrix(*current_rads)
+                current_xyz = tcp_matrix[:3, 3]
+                self.last_tcp_pos = current_xyz
                 for i, axis in enumerate(['TCP_X', 'TCP_Y', 'TCP_Z']):
-                    self.tcp_labels[axis].config(text=f"{tcp[i]:.2f}")
+                    self.tcp_labels[axis].config(text=f"{current_xyz[i]:.2f}")
 
         # Limitowanie częstotliwości odświeżania GUI (throttle)
         now = time.time() * 1000.0
@@ -905,44 +928,60 @@ class RobotControlGUI:
     
     def send_position(self):
         try:
-            x = float(self.x_entry.get()); y = float(self.y_entry.get()); z = float(self.z_entry.get())
-            phi = None if self.auto_phi_var.get() else float(self.phi_entry.get())
+            def safe_float(entry, default=0.0):
+                txt = entry.get().strip().replace(',', '.')
+                return float(txt) if txt else default
+
+            x = safe_float(self.x_entry)
+            y = safe_float(self.y_entry)
+            z = safe_float(self.z_entry)
+
+            if self.auto_phi_var.get():
+                phi = None 
+            else:
+                phi = safe_float(self.phi_entry)
+
+            roll = safe_float(self.roll_entry)
+
+            self.log(f"IK dla: X={x}, Y={y}, Z={z}, R={roll}")
+            cur_rads = [math.radians(a) for a in self.robot.get_current_angles()[:5]]
             
-            self.log(f"IK dla: X={x}, Y={y}, Z={z}")
-            cur_rads = [math.radians(a) for a in self.robot.get_current_angles()[:4]]
-            
-            # UŻYCIE KLASY KINEMATYKI (Metoda solve_ik)
-            sol, name = self.kin.solve_ik(x, y, z, tuple(cur_rads), phi_deg=phi)
+            sol, name = self.kin.solve_ik(x, y, z, tuple(cur_rads), phi_deg=phi, roll_deg=roll)
             
             if sol is None:
                 messagebox.showerror("Błąd IK", "Pozycja poza zasięgiem.")
                 return
             
-            # Weryfikacja kolizji końcowej przez FK
             pos = self.kin.get_joint_positions(*sol)
             if pos[3][2] < -0.01 or pos[4][2] < -0.01:
                 messagebox.showerror("Kolizja", "Rozwiązanie koliduje z podłożem!")
                 return
             
-            # Aktualizacja wyświetlacza kątów docelowych
-            for i, (val, lbl) in enumerate(zip(sol, ['θ1 (X)', 'θ2 (Y)', 'θ3 (Z)', 'θ4 (E)'])):
+            labels = ['θ1', 'θ2', 'θ3', 'θ4', 'θ5']
+            for i, (val, lbl) in enumerate(zip(sol, labels)):
                 self.angle_labels[lbl].config(text=f"{math.degrees(val):.2f}°")
             
             ok, msg = self.robot.send_target_angles(*sol)
-            if ok: self.log(f"Wysłano konfigurację: {name}")
-            else: messagebox.showerror("Błąd komunikacji", msg)
+            if ok: 
+                self.log(f"Wysłano konfigurację: {name}")
+            else: 
+                messagebox.showerror("Błąd komunikacji", msg)
                 
-        except ValueError:
-            messagebox.showerror("Błąd", "Niepoprawne dane wejściowe")
+        except ValueError as e:
+            messagebox.showerror("Błąd danych", str(e))
+        except KeyError as e:
+            messagebox.showerror("Błąd GUI", f"Brak klucza w słowniku etykiet: {e}")
+            self.log(f"DEBUG: Dostępne klucze: {list(self.angle_labels.keys())}")
         except Exception as e:
-            self.log(f"Błąd: {e}")
+            self.log(f"Nieoczekiwany błąd: {e}")
+            messagebox.showerror("Błąd krytyczny", str(e))
     
     def on_angle_slider_change(self, key, val):
         angle = float(val)
         self.angle_value_labels[key].config(text=f"{angle:.1f}°")
         
         # Szybkie sprawdzenie kolizji dla suwaków przez FK
-        rads = [math.radians(self.angle_sliders[k].get()) for k in ['th1','th2','th3','th4']]
+        rads = [math.radians(self.angle_sliders[k].get()) for k in ['th1','th2','th3','th4','th5']]
         pos = self.kin.get_joint_positions(*rads)
         min_z = np.min(pos[:, 2])
         
@@ -987,7 +1026,7 @@ class RobotControlGUI:
     def send_angles_continuously(self):
         if not self.angle_send_active: return
         
-        rads = [math.radians(self.angle_sliders[k].get()) for k in ['th1','th2','th3','th4']]
+        rads = [math.radians(self.angle_sliders[k].get()) for k in ['th1','th2','th3','th4','th5']]
         pos = self.kin.get_joint_positions(*rads)
         
         if np.min(pos[:, 2]) < 0:
@@ -1118,14 +1157,17 @@ class RobotControlGUI:
         
         try:
             if pt.get('Joints'):
-                rads = [math.radians(d) for d in pt['Joints']]
+                raw_joints = pt['Joints']
+                if len(raw_joints) == 4: raw_joints.append(0.0)
+                rads = [math.radians(d) for d in raw_joints]
                 self.robot.send_target_angles(*rads)
             else:
                 cur = [math.radians(a) for a in self.robot.get_current_angles()[:4]]
                 phi = pt['Fi'] if not pt['Auto_Fi'] else None
-                
+                roll = pt.get('Rol', 0.0)
+
                 # UŻYCIE KLASY KINEMATYKI
-                sol, _ = self.kin.solve_ik(pt['X'], pt['Y'], pt['Z'], tuple(cur), phi_deg=phi)
+                sol, _ = self.kin.solve_ik(pt['X'], pt['Y'], pt['Z'], tuple(cur), phi_deg=phi, roll_deg=roll)
                 
                 if sol: self.robot.send_target_angles(*sol)
                 else: raise Exception("Brak IK")
@@ -1149,29 +1191,34 @@ class RobotControlGUI:
             x, y, z = float(self.x_entry.get()), float(self.y_entry.get()), float(self.z_entry.get())
             auto = self.auto_phi_var.get()
             phi = None if auto else float(self.phi_entry.get())
-            
-            cur = [math.radians(a) for a in self.robot.get_current_angles()[:4]]
+            roll = float(self.roll_entry.get())
+
+            cur = [math.radians(a) for a in self.robot.get_current_angles()[:5]]
             
             # Weryfikacja osiągalności przed dodaniem
-            sol, _ = self.kin.solve_ik(x, y, z, tuple(cur), phi_deg=phi)
+            sol, _ = self.kin.solve_ik(x, y, z, tuple(cur), phi_deg=phi, roll_deg=roll)
             
             if sol:
-                self.sequence_data.append({"X":x, "Y":y, "Z":z, "Fi":phi if phi else 0, "Auto_Fi":auto})
+                self.sequence_data.append({"X":x, "Y":y, "Z":z, "Fi":phi if phi else 0, "Auto_Fi":auto,"Rol": roll,})
                 self._update_sequence_display()
             else:
                 messagebox.showerror("Błąd", "Pozycja nieosiągalna")
         except ValueError: pass
 
     def add_current_angles_to_sequence(self):
-        rads = [math.radians(self.angle_sliders[k].get()) for k in ['th1','th2','th3','th4']]
+        rads = [math.radians(self.angle_sliders[k].get()) for k in ['th1','th2','th3','th4','th5']]
         
         # Pobranie pozycji przez FK
         pos = self.kin.get_joint_positions(*rads)[-1]
-        fi_rad = math.atan2(math.sin(sum(rads[1:])), math.cos(sum(rads[1:])))
+        fi_rad = math.atan2(math.sin(sum(rads[1:4])), math.cos(sum(rads[1:4])))
         
+        roll_val = self.angle_sliders['th5'].get()
+
         self.sequence_data.append({
             "X": round(pos[0], 2), "Y": round(pos[1], 2), "Z": round(pos[2], 2),
-            "Fi": round(math.degrees(fi_rad), 2), "Auto_Fi": False,
+            "Fi": round(math.degrees(fi_rad), 2),
+            "Rol": round(roll_val, 2),
+            "Auto_Fi": False,
             "Joints": [math.degrees(r) for r in rads]
         })
         self._update_sequence_display()

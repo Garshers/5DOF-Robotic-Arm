@@ -7,6 +7,8 @@
 #define SIMULATION_MODE true
 
 // ======================= Piny silników ======================
+#define SERVO_PIN 14
+
 #define STEP_X 17
 #define DIR_X 16
 #define STEP_Y 23
@@ -37,7 +39,7 @@ AccelStepper motorE(AccelStepper::DRIVER, STEP_E, DIR_E);
 const float START_ANGLES[5] = {90.0, 90.0, 135.0, 135.0, 0.0}; 
 const bool ENCODER_INVERT[] = {true, false, true, true, false}; // [E, Z, Y, A, X]
 const uint8_t ENCODER_CHANNEL[] = {4, 5, 6, 7, 3};
-const float ENCODER_LEVER[] = {2.0, 3.6, 4.5, 4.5, 4.0};
+const float ENCODER_LEVER[] = {2.0, 3.6, 4.5, 4.5, 1.0}; // [E, Z, Y, A, X]
 uint16_t ENCODER_ZPOS[] = {0, 0, 0, 0, 0};
 int16_t rotationCount[] = {0, 0, 0, 0, 0};
 uint16_t lastRawAngle[] = {0, 0, 0, 0, 0};
@@ -47,6 +49,8 @@ const float angleConst = 360.0 / 4096.0;
 SemaphoreHandle_t xMutex;
 volatile float currentAngles[5] = {90.0, 90.0, 135.0, 135.0, 0.0};
 volatile float targetAngles[5] = {90.0, 90.0, 135.0, 135.0, 0.0};
+volatile float targetServoAngle = 0.0; // Stan serwonapędu
+volatile float currentServoAngle = 0.0;
 volatile bool newTargetAvailable = true;
 
 // ===================== Parametry sterowania ======================
@@ -117,10 +121,12 @@ void parsePythonCommand(String cmd) {
     int startIdx = 0;
     bool validCommand = false;
     float newTargets[5];
+    float newServo;
     
     // Kopiuj aktualne cele
     if (xSemaphoreTake(xMutex, portMAX_DELAY)) {
         memcpy(newTargets, (void*)targetAngles, sizeof(newTargets));
+        newServo = targetServoAngle;
         xSemaphoreGive(xMutex);
     }
     
@@ -160,6 +166,10 @@ void parsePythonCommand(String cmd) {
                 newTargets[0] = relativeAngle;
                 validCommand = true;
                 break;
+            case 'S': case 's':
+                newServo = relativeAngle;       
+                validCommand = true; 
+                break;
         }
     }
     
@@ -167,6 +177,7 @@ void parsePythonCommand(String cmd) {
     if (validCommand) {
         if (xSemaphoreTake(xMutex, portMAX_DELAY)) {
             memcpy((void*)targetAngles, newTargets, sizeof(newTargets));
+            targetServoAngle = newServo;
             newTargetAvailable = true;
             xSemaphoreGive(xMutex);
         }
@@ -179,14 +190,17 @@ void parsePythonCommand(String cmd) {
 
 void sendPositionToPython() {
     float angles[5];
+    float srv;
     
     // Bezpieczne skopiowanie danych
     if (xSemaphoreTake(xMutex, portMAX_DELAY)) {
         memcpy(angles, (void*)currentAngles, sizeof(angles));
+        srv = currentServoAngle;
         xSemaphoreGive(xMutex);
     }
     
     String frame = "<";
+    frame += "S" + String(srv, 2) + ",";
     frame += "E" + String(angles[0], 2) + ",";
     frame += "Z" + String(angles[1], 2) + ",";
     frame += "Y" + String(angles[2], 2) + ",";
@@ -202,29 +216,60 @@ void readEncoders() {
         // SYMULACJA
         static uint32_t lastUpdate = 0;
         uint32_t now = millis();
+        float dt = (now - lastUpdate) / 1000.0;
         
-        if (now - lastUpdate > 50) {
-            float dt = (now - lastUpdate) / 1000.0;
+        // Zabezpieczenie przed pierwszym uruchomieniem lub błędem zegara
+        if (dt <= 0 || dt > 1.0) {
             lastUpdate = now;
+            return;
+        }
+        lastUpdate = now;
+
+        float tempCurrent[5], tempTarget[5];
+        float tempServoCur, tempServoTar;
+
+        // 1. Pobranie danych
+        if (xSemaphoreTake(xMutex, portMAX_DELAY)) {
+            memcpy(tempCurrent, (void*)currentAngles, sizeof(tempCurrent));
+            memcpy(tempTarget, (void*)targetAngles, sizeof(tempTarget));
             
-            float tempCurrent[5], tempTarget[5];
+            // [POPRAWKA] Pobranie stanu serwa
+            tempServoCur = currentServoAngle;
+            tempServoTar = targetServoAngle;
             
-            if (xSemaphoreTake(xMutex, portMAX_DELAY)) {
-                memcpy(tempCurrent, (void*)currentAngles, sizeof(tempCurrent));
-                memcpy(tempTarget, (void*)targetAngles, sizeof(tempTarget));
-                xSemaphoreGive(xMutex);
+            xSemaphoreGive(xMutex);
+        }
+
+        // 2. Symulacja silników krokowych
+        float stepperSpeed = 60.0;
+        for (int i = 0; i < 5; i++) {
+            float diff = tempTarget[i] - tempCurrent[i];
+            if (abs(diff) < 0.1) {
+                tempCurrent[i] = tempTarget[i];
+            } else {
+                float step = stepperSpeed * dt;
+                if (diff > 0) tempCurrent[i] += min(diff, step);
+                else tempCurrent[i] += max(diff, -step);
             }
-            
-            for (int i = 0; i < 5; i++) {
-                float error = tempTarget[i] - tempCurrent[i];
-                float velocity = constrain(error * 2.0, -50.0, 50.0);
-                tempCurrent[i] += velocity * dt;
-            }
-            
-            if (xSemaphoreTake(xMutex, portMAX_DELAY)) {
-                memcpy((void*)currentAngles, tempCurrent, sizeof(tempCurrent));
-                xSemaphoreGive(xMutex);
-            }
+        }
+
+        // 3. Symulacja Serwa
+        float servoSpeed = 120.0;
+        float sDiff = tempServoTar - tempServoCur;
+        
+        if (abs(sDiff) < 0.1) {
+            tempServoCur = tempServoTar;
+        } else {
+            float step = servoSpeed * dt;
+            if (sDiff > 0) tempServoCur += min(sDiff, step);
+            else tempServoCur += max(sDiff, -step);
+        }
+
+        // 4. Zapisanie wyników symulacji
+        if (xSemaphoreTake(xMutex, portMAX_DELAY)) {
+            memcpy((void*)currentAngles, tempCurrent, sizeof(tempCurrent));
+            currentServoAngle = tempServoCur;
+            xSemaphoreGive(xMutex);
         }
     #else
         // PRAWDZIWE ENKODERY
