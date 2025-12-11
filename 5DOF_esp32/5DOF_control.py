@@ -265,6 +265,16 @@ class RobotKinematics:
         
         # Przesunięcie środka osi przez serwo
         self.geo_phi_offset = math.atan2(self.d5, self.a4 + self.d6)
+
+        # współczynniki do wyznaczania punktu krytycznego
+        self.radius = 16.0
+        if self.a4 > 0:
+            self.crit_axial_factor = 65.2 / self.a4  # Proporcja wzdłuż osi
+            self.crit_offset_factor = 29.2 / self.a4 # Proporcja prostopadła do osi
+        else:
+            self.crit_axial_factor = 0
+            self.crit_offset_factor = 0
+
     def _rot_z(self, t):
         c, s = np.cos(t), np.sin(t)
         return np.array([[c, -s, 0, 0], [s, c, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
@@ -309,6 +319,35 @@ class RobotKinematics:
         """
         chain = self._compute_chain(th1, th2, th3, th4, th5)
         return chain[-1]
+    
+    def get_jacobian(self, th1, th2, th3, th4, th5):
+        """
+        Oblicza Jakobian geometryczny (6x5) dla aktualnej konfiguracji.
+        Zwraca macierz wiążącą prędkości złączy z prędkościami efektora.
+        """
+
+        matrices = self._compute_chain(th1, th2, th3, th4, th5) # Pobranie łańcucha kinematycznego
+        p_e = matrices[-1][:3, 3] # Pozycja końcówki (TCP)
+        J = np.zeros((6, 5)) # Inicjalizacja pustej macierzy
+        
+        # Iterujemy przez 5 złączy
+        for i in range(5):
+            # Pobieramy macierz transformacji poprzedniego układu współrzędnych
+            T_prev = matrices[i] 
+            
+            # Oś obrotu Z to zawsze 3 kolumna macierzy rotacji
+            z_axis = T_prev[:3, 2]
+            
+            # Pozycja środka układu współrzędnych
+            p_curr = T_prev[:3, 3]
+            
+            # --- Część liniowa ---
+            vec_diff = p_e - p_curr
+            J[:3, i] = np.cross(z_axis, vec_diff)
+            
+            # --- Część kątowa ---
+            J[3:, i] = z_axis
+        return J
     
     def inverse_kinematics(self, R, Z, th1, phi_deg=0.0, elbow_up=True, reverse_base=False):
         """
@@ -363,20 +402,42 @@ class RobotKinematics:
         
         return (th1, th2, th3, th4)
 
-    def check_constraints(self, th1, th2, th3, th4):
-        """Weryfikacja limitów i kolizji z podłożem."""
-        # Zakres ruchu
+    def check_constraints(self, angles, positions):
+        """
+        Weryfikacja limitów i kolizji z podłożem.
+        :param angles: krotka kątów (th1, th2, th3, th4)
+        :param positions: tablica pozycji węzłów zwrócona przez get_joint_positions
+        """
+        th1, th2, th3, th4 = angles
+
+        # --- Zakres ruchu ---
         if not (self.limits['th1'][0] <= th1 <= self.limits['th1'][1]): return False
         if not (self.limits['th2'][0] <= th2 <= self.limits['th2'][1]): return False
         if not (self.limits['th3'][0] <= th3 <= self.limits['th3'][1]): return False
         if not (self.limits['th4'][0] <= th4 <= self.limits['th4'][1]): return False
 
-        # Kolizja z podłożem (Z < 0)
-        z_elbow = self.d1 + self.a2 * math.sin(th2)
-        if z_elbow < 0: return False
+        # --- Kolizja z podłożem ---
+        # Sprawdzenie Łokcia (T3) (16mm)
+        if positions[3][2] - self.radius < 0: return False 
+        
+        # Sprawdzenie Efektora (TCP/TE)
+        if positions[-1][2] < 0: return False 
 
-        z_wrist = z_elbow + self.a3 * math.sin(th2 - th3)
-        if z_wrist < 0: return False
+        # Sprawdzenie Punktu Krytycznego
+        p3 = positions[3]
+        p4 = positions[4]
+
+        vec_x = p4[0] - p3[0]
+        vec_y = p4[1] - p3[1]
+        vec_z = p4[2] - p3[2]
+
+        # Przejście wzdłuż wektora T3-T4 (65.2mm od T3)
+        z_axial = p3[2] + vec_z * self.crit_axial_factor
+        
+        # Rzutowanie offsetu grubości ramienia (29.2mm) na oś Z
+        len_xy_raw = math.sqrt(vec_x**2 + vec_y**2)
+        z_critical = z_axial - (len_xy_raw * self.crit_offset_factor)
+        if z_critical < 0: return False
 
         return True
 
@@ -408,25 +469,35 @@ class RobotKinematics:
         """
         th1, th2, th3, th4, th5 = angles
         
-        ## ---------- KOSZT LIMITÓW ZŁĄCZY ----------
+        ## ---------- KOSZT LIMITÓW ZŁĄCZY [0.0 - 50.0] ----------
         # Im bliżej limitów złączy, tym większa koszt, co wymusza pracę w bezpiecznym centrum zakresu
-        jl_cost = 0
+        # - Środek zakresu: koszt = 0
+        # - 50% zakresu: koszt zaniedbywalny (~0.16 na złącze)
+        # - 75% zakresu: koszt mały (~1.78 na złącze)
+        # - 100% zakresu: koszt rośnie gwałtownie do 10.0 na złącze
+
+        limit_cost = 0
         vals = [th1, th2, th3, th4, th5]
         lims = [self.limits['th1'], self.limits['th2'], self.limits['th3'], self.limits['th4'], self.limits['th5']]
         
         for v, (mn, mx) in zip(vals, lims):
             norm = (v - mn) / (mx - mn) # Normalizacja do zakresu [0, 1]
-            jl_cost += (norm - 0.5)**2  #Daje zero idealnie na środku, a największą karę na krańcach.
+            centered = (norm - 0.5) * 2.0 # Normalizacja do zakresu [-1, 1]
+            barrier = centered ** 6
+            limit_cost += barrier * 10.0
             
-        ## ---------- KOSZT RUCHU ----------
+        ## ---------- KOSZT RUCHU [1.0 - 50.0+] ----------
         # Im większy ruch musi wykonać, tym większy koszt
-        motion_cost = self.calculate_joint_distance(current_angles, angles)
+        motion_cost = 2.0 * self.calculate_joint_distance(current_angles, angles)
             
-        ## ---------- KOSZT OSOBLIWOŚCI ----------
-        # Utrzymanie robota z dala od punktów, w których traci stopnie swobody
-        singularity_cost = 1.0 / (abs(th3) + 0.1)
+        ## ---------- KOSZT OSOBLIWOŚCI [0.0 - 1000.0] ----------
+        J = self.get_jacobian(th1, th2, th3, th4, th5)
+        # J(q) = 1/sqrt(det(J * J_T))
+        J_pos = J[:3, :]
+        manipulability = math.sqrt(np.linalg.det(J_pos @ J_pos.T))
+        singularity_cost = 1.0 / (manipulability + 0.001)
         
-        return 2.0 * jl_cost + 1.0 * motion_cost + 3.0 * singularity_cost
+        return limit_cost + motion_cost + singularity_cost
 
     def solve_ik(self, x, y, z, current_angles, phi_deg=None, roll_deg=0.0):
         """
@@ -500,7 +571,7 @@ class RobotKinematics:
 
         # Definicja strategii (Elbow Up/Down, Base Normal/Reverse)
         strategies = [(True, False), (False, False)]
-        if p_x <= 0: strategies.extend([(True, True), (False, True)])
+        if p_x <= 50: strategies.extend([(True, True), (False, True)])
 
         best_sol = None
         min_cost = float('inf')
@@ -513,15 +584,17 @@ class RobotKinematics:
 
             sol = self.inverse_kinematics(R_target, p_z, th1_in, phi_deg, elbow_up, reverse_base)
             
-            if sol and self.check_constraints(*sol):
-                if check_strategies:
-                    return sol, "Auto"
-                
-                cost = self.calculate_configuration_cost(sol + (current_angles[4],), current_angles)
-                if cost < min_cost:
-                    min_cost = cost
-                    best_sol = sol
-                    best_name = "Elbow Up" if elbow_up else "Elbow Down"
+            if sol:
+                fk_positions = self.get_joint_positions(*sol)
+                if self.check_constraints(sol, fk_positions):
+                    if check_strategies:
+                        return sol, "Auto"
+                    
+                    cost = self.calculate_configuration_cost(sol + (current_angles[4],), current_angles)
+                    if cost < min_cost:
+                        min_cost = cost
+                        best_sol = sol
+                        best_name = "Elbow Up" if elbow_up else "Elbow Down"
 
         return (best_sol, best_name) if best_sol else (None, None)
     
@@ -953,7 +1026,7 @@ class RobotControlGUI:
                 return
             
             pos = self.kin.get_joint_positions(*sol)
-            if pos[3][2] < -0.01 or pos[4][2] < -0.01:
+            if pos[5][2] < -0.01 or pos[6][2] < -0.01:
                 messagebox.showerror("Kolizja", "Rozwiązanie koliduje z podłożem!")
                 return
             
