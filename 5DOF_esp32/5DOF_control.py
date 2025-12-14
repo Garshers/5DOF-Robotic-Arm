@@ -1279,8 +1279,14 @@ class RobotControlGUI:
             return
         
         pt = self.sequence_data[self.current_sequence_index]
-        self.log(f"Krok {self.current_sequence_index+1}: {pt['X'], pt['Y'], pt['Z']}")
-        self.target_xyz = np.array([pt['X'], pt['Y'], pt['Z']])
+        try:
+            x, y, z = float(pt['X']), float(pt['Y']), float(pt['Z'])
+        except ValueError:
+            self.stop_sequence("Błąd danych: Nieprawidłowy format współrzędnych X/Y/Z")
+            return
+
+        self.log(f"Krok {self.current_sequence_index+1}: {x, y, z}")
+        self.target_xyz = np.array([x, y, z])
         self._update_sequence_display(self.current_sequence_index)
         
         try:
