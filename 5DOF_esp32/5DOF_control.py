@@ -460,9 +460,9 @@ class RobotKinematics:
         if q_target is None: return float('inf')
         
         total_dist = 0
-        weights = [1.0, 15.0, 5.0, 1.0, 0] # wagi dla [Oś X, Oś YA, Oś Z, Oś E, Oś A]
+        weights = [1.0, 5.0, 3.0, 1.0, 1.0] # wagi dla [Oś X, Oś YA, Oś Z, Oś E, Oś S]
         
-        for i in range(4):
+        for i in range(5):
             diff = q_target[i] - q_current[i] # Różnica między pozycją docelową a obecną
             
             # Upewnienie się, że zawsze mierzymy najkrótszą drogę.
@@ -524,26 +524,71 @@ class RobotKinematics:
             sol, strategy = self._solve_from_matrix(T_goal, current_angles)
             return (sol + (th5_target,), strategy) if sol else (None, "Cel nieosiągalny")
 
-        # --- WARIANT 2: Auto-orientacja (Optymalizacja macierzy celu) ---
+        # --- WARIANT 2: Auto-orientacja (Grid Search + Golden Section Search) ---
         else:
-            # Przeszukujemy przestrzeń możliwych macierzy T, aby znaleźć tę najbardziej korzystną
-            for phi in range(-180, 180, 10):
-                T_candidate = self._construct_matrix(x, y, z, phi)
-                
-                # Sprawdzamy, czy ta konkretna macierz jest osiągalna
-                sol, name = self._solve_from_matrix(T_candidate, current_angles, check_strategies=True)
-                
-                if sol:
-                    full_sol = sol + (th5_target,)
-                    cost = self.calculate_configuration_cost(full_sol, current_angles)
-                    candidates.append((cost, full_sol, f"{name} (Auto φ={phi}°)"))
+            # Funkcja pomocnicza obliczająca koszt dla zadanego kąta phi
+            def evaluate_phi(phi_val):
+                phi_norm = (phi_val + 180) % 360 - 180
+                T_c = self._construct_matrix(x, y, z, phi_norm)
+                s_sol, s_name = self._solve_from_matrix(T_c, current_angles, check_strategies=True)
+                if s_sol:
+                    c = self.calculate_configuration_cost(s_sol + (th5_target,), current_angles)
+                    return c, s_sol, s_name, phi_norm
+                return float('inf'), None, None, phi_norm
+
+            # ETAP 1: Skanowanie zgrubne (Global Search)
+            # Identyfikacja regionu z minimum globalnym
+            best_phi_coarse = 0.0
+            min_cost = float('inf')
+            found_valid = False
+
+            # Krok 40 stopni wystarczy, by znaleźć ogólny kierunek orientacji
+            for phi in range(-180, 180, 40):
+                cost, _, _, _ = evaluate_phi(phi)
+                if cost < min_cost:
+                    min_cost = cost
+                    best_phi_coarse = phi
+                    found_valid = True
+
+            if not found_valid:
+                return None, "Brak rozwiązania (zasięg/kolizja)"
+
+            # ETAP 2: Metoda Złotego Podziału
+    
+            GR = 0.61803398875 # Stała (sqrt(5) - 1) / 2
+            # Definicja przedziału poszukiwań [a, b] wokół zgrubnego wyniku
+            # Szerokość +/- 45 stopni pokrywa lukę z poprzedniego kroku z zapasem
+            a = best_phi_coarse - 45.0
+            b = best_phi_coarse + 45.0
             
-            if not candidates:
-                return None, "Brak rozwiązania"
+            tol = 0.5  # Tolerancja zakończenia obliczeń
             
-            # Zwracamy rozwiązanie o najniższym koszcie
-            candidates.sort(key=lambda x: x[0])
-            return candidates[0][1], candidates[0][2]
+            # Punkty wewnętrzne
+            c = b - (b - a) * GR
+            d = a + (b - a) * GR
+            
+            while abs(b - a) > tol:
+                cost_c, _, _, _ = evaluate_phi(c)
+                cost_d, _, _, _ = evaluate_phi(d)
+                
+                if cost_c < cost_d:
+                    b = d
+                    d = c
+                    c = b - (b - a) * GR
+                else:
+                    a = c
+                    c = d
+                    d = a + (b - a) * GR
+
+            # Pobranie ostatecznego wyniku dla środka wyznaczonego przedziału
+            final_phi = (a + b) / 2
+            final_cost, final_sol, final_name, final_phi_norm = evaluate_phi(final_phi)
+
+            if final_sol:
+                full_sol = final_sol + (th5_target,)
+                return full_sol, f"{final_name} (φ={final_phi_norm:.1f}°)"
+            else:
+                return None, "Błąd optymalizacji"
 
     def _construct_matrix(self, x, y, z, phi_deg):
         """Konstrukcja Macierzy Transformacji Jednorodnej (4x4) z danych wejściowych."""
@@ -1245,7 +1290,7 @@ class RobotControlGUI:
                 rads = [math.radians(d) for d in raw_joints]
                 self.robot.send_target_angles(*rads)
             else:
-                cur = [math.radians(a) for a in self.robot.get_current_angles()[:4]]
+                cur = [math.radians(a) for a in self.robot.get_current_angles()[:5]]
                 phi = pt['Fi'] if not pt['Auto_Fi'] else None
                 roll = pt.get('Rol', 0.0)
 
