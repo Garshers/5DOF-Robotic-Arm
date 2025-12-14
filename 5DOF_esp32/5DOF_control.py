@@ -182,21 +182,31 @@ class RobotSerial:
         """
         Wysyła wartości docelowe osi do ESP32.
         Oczekuje wartości w radianach — konwertuje je na stopnie.
-        Format wysyłanej komendy: X...,Y...,Z...,E...,A...
+        Format wysyłanej komendy: X...,Y...,Z...,E...,A...*CS
         """
         if not self.ser or not self.ser.is_open:
             return False, "Port nie jest otwarty"
 
-        # Konwersja radianów na stopnie i budowa ramki
+        # Konwersja radianów na stopnie
         radians = [th1, th2, th3, th4, th5]
         degrees = [math.degrees(v) for v in radians]
-        cmd = (
+        
+        # Budowa właściwej części danych (payload)
+        payload = (
             f"X{degrees[0]:.2f},"
             f"Y{degrees[1]:.2f},"
             f"Z{degrees[2]:.2f},"
             f"E{degrees[3]:.2f},"
-            f"S{degrees[4]:.2f}\n"
+            f"S{degrees[4]:.2f}"
         )
+        
+        # Generowanie sumy kontrolnej (XOR) dla weryfikacji integralności
+        checksum = 0
+        for char in payload:
+            checksum ^= ord(char)
+            
+        # Finalizacja ramki: Payload + Separator + Suma (HEX) + Terminator
+        cmd = f"{payload}*{checksum:02X}\n"
 
         try: # Wysłanie ramki i wyświetlenie potwierdzenia
             self.ser.write(cmd.encode("utf-8"))

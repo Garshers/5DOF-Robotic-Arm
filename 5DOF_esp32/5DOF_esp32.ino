@@ -35,7 +35,6 @@ AccelStepper motorZ(AccelStepper::DRIVER, STEP_Z, DIR_Z);
 AccelStepper motorE(AccelStepper::DRIVER, STEP_E, DIR_E);
 
 // ===================== Konfiguracja enkoderów [E, Z, Y, A, X] ======================
-
 const float START_ANGLES[5] = {90.0, 90.0, 135.0, 135.0, 0.0}; 
 const bool ENCODER_INVERT[] = {true, false, true, true, false}; // [E, Z, Y, A, X]
 const uint8_t ENCODER_CHANNEL[] = {4, 5, 6, 7, 3};
@@ -59,11 +58,6 @@ const float ANGLE_TOLERANCE = 0.05;
 const unsigned long ENCODER_READ_INTERVAL = 50;
 const unsigned long PYTHON_SEND_INTERVAL = 50;
 
-// ================== Parametry silnika krokowego ==================
-const float STEPS_PER_REV = 200.0;  // Silnik 1.8 stopnia
-const float MICROSTEPS = 16.0;//16.0;      // Ustawienie sterownika
-const float STEPS_PER_MOTOR_REV = STEPS_PER_REV * MICROSTEPS; // 3200 kroków/obrót silnika
-
 // Bufory komunikacji (tylko rdzeń 0)
 String serialBuffer = "";
 
@@ -76,7 +70,7 @@ void communicationTask(void *parameter) {
     unsigned long lastEncoderRead = 0;
     unsigned long lastPythonSend = 0;
     
-    Serial.println("✓ Rdzeń 0: Task komunikacyjny uruchomiony");
+    Serial.println("Rdzeń 0: Task komunikacyjny uruchomiony");
     
     while (true) {
         unsigned long now = millis();
@@ -115,8 +109,32 @@ void readSerialCommands() {
     }
 }
 
+byte calculateChecksum(String data) {
+    // Funkcja pomocnicza do obliczania sumy kontrolnej XOR
+    byte checksum = 0;
+    for (int i = 0; i < data.length(); i++) {
+        checksum ^= data.charAt(i);
+    }
+    return checksum;
+}
+
 void parsePythonCommand(String cmd) {
     cmd.trim();
+    
+    // Weryfikacja integralności danych (Suma kontrolna)
+    int starIdx = cmd.lastIndexOf('*');
+    if (starIdx == -1) return; // Odrzuć ramkę, jeśli brak separatora sumy kontrolnej
+
+    String payload = cmd.substring(0, starIdx);
+    String receivedChecksumHex = cmd.substring(starIdx + 1);
+    
+    byte calculatedChecksum = calculateChecksum(payload);
+    byte receivedChecksum = (byte) strtol(receivedChecksumHex.c_str(), NULL, 16);
+    
+    if (calculatedChecksum != receivedChecksum) {
+        Serial.println("Error: Checksum mismatch!"); 
+        return; // Odrzuć ramkę w przypadku błędu transmisji
+    }
     
     int startIdx = 0;
     bool validCommand = false;
@@ -125,21 +143,22 @@ void parsePythonCommand(String cmd) {
     
     // Kopiuj aktualne cele
     if (xSemaphoreTake(xMutex, portMAX_DELAY)) {
+        // Bezpieczny dostęp do danych współdzielonych tworząc lokalne kopie
         memcpy(newTargets, (void*)targetAngles, sizeof(newTargets));
         newServo = targetServoAngle;
-        xSemaphoreGive(xMutex);
+        xSemaphoreGive(xMutex); // Zwolnienie blokady
     }
     
-    // Parsowanie
-    while (startIdx < cmd.length()) {
-        int commaIdx = cmd.indexOf(',', startIdx);
+    // Parsowanie (Operujemy na zweryfikowanym 'payload', a nie surowym 'cmd')
+    while (startIdx < payload.length()) {
+        int commaIdx = payload.indexOf(',', startIdx);
         String axisData;
         
         if (commaIdx == -1) {
-            axisData = cmd.substring(startIdx);
-            startIdx = cmd.length();
+            axisData = payload.substring(startIdx);
+            startIdx = payload.length();
         } else {
-            axisData = cmd.substring(startIdx, commaIdx);
+            axisData = payload.substring(startIdx, commaIdx);
             startIdx = commaIdx + 1;
         }
         
@@ -182,7 +201,7 @@ void parsePythonCommand(String cmd) {
             xSemaphoreGive(xMutex);
         }
         
-        Serial.println("✓ Nowe kąty docelowe:");
+        Serial.println("Nowe kąty docelowe:");
         Serial.printf("   E=%.2f° Z=%.2f° Y=%.2f° X=%.2f°\n", 
                       newTargets[0], newTargets[1], newTargets[3], newTargets[4]);
     }
@@ -254,7 +273,7 @@ void readEncoders() {
         }
 
         // 3. Symulacja Serwa
-        float servoSpeed = 120.0;
+        float servoSpeed = 240.0;
         float sDiff = tempServoTar - tempServoCur;
         
         if (abs(sDiff) < 0.1) {
@@ -306,7 +325,7 @@ void readEncoders() {
 }
 
 // =========================================================================
-// ----------------------------- RDZEŃ 1 -----------------------------------
+// ------------------------------ RDZEŃ 1 ----------------------------------
 // ------------------------ STEROWANIE SILNIKAMI ---------------------------
 // =========================================================================
 
@@ -316,14 +335,34 @@ void motorControlTask(void *parameter) {
     float localCurrentAngles[5];
     float stepsPerDegree[5];
     
+    // Współczynniki regulatora P
+    const float KP_MAIN = 1.0;              // Standardowe osie
+    const float KP_SLAVE_TRACKING = 1.0;    // Slave śledzi cel Mastera
+    const float KP_SLAVE_SYNC = 0.15;       // Łagodna synchronizacja
+    
+    // Limity bezpieczeństwa
+    const long MAX_CORRECTION_STEPS = 500;
+    
+    // Tolerancja desynchronizacji Master-Slave
+    const float SYNC_DEADBAND = 0.3;        // Ignoruj błędy sync < 0.3°stopnia
+    const float SYNC_MAX_CORRECTION = 2.0;  // Maksymalna korekta sync za cykl [stopnie]
+    
+    // Strefa krytyczna (wokół pionu)
+    const float CRITICAL_ZONE_MIN = 80.0;
+    const float CRITICAL_ZONE_MAX = 110.0;
+    const float CRITICAL_ZONE_DAMPING = 0.5; // Redukcja sync do 50% w strefie krytycznej
+    
     // Niezależne timery dla każdej osi w celu uniknięcia oscylacji
     unsigned long lastAxisCorrectionTime[5] = {0, 0, 0, 0, 0};
-    const unsigned long CORRECTION_INTERVAL = 200; 
+    const unsigned long CORRECTION_INTERVAL = 50; 
     
     // Wskaźniki na obiekty silników
     AccelStepper* motors[5] = {&motorE, &motorZ, &motorY, &motorA, &motorX};
 
     // Konfiguracja silników
+    const float STEPS_PER_REV = 200.0;  // Silnik 1.8 stopnia
+    const float MICROSTEPS = 16.0;     // Ustawienie sterownika
+    const float STEPS_PER_MOTOR_REV = STEPS_PER_REV * MICROSTEPS; // 3200 kroków/obrót silnika
     float baseSpeed = 50.0 * MICROSTEPS;
     float baseAcceleration = baseSpeed / 4.0;
     
@@ -333,7 +372,7 @@ void motorControlTask(void *parameter) {
         stepsPerDegree[i] = (STEPS_PER_MOTOR_REV * ENCODER_LEVER[i]) / 360.0;
     }
     
-    Serial.println("✓ Rdzeń 1: Task sterowania z absolutną korekcją (moveTo) uruchomiony");
+    Serial.println("Rdzeń 1: Task sterowania uruchomiony");
     
     while (true) {
         unsigned long currentMillis = millis();
@@ -355,6 +394,11 @@ void motorControlTask(void *parameter) {
         for (int i = 0; i < 5; i++) {
             // Pomiń niezależne obliczenia dla osi A (indeks 3), która jest Slavem
             if (i == 3) continue;
+            
+            // Sprawdzanie CORRECTION_INTERVAL
+            if (currentMillis - lastAxisCorrectionTime[i] < CORRECTION_INTERVAL) {
+                continue;
+            }
 
             // Obliczenie uchybu: e(t) = wartość_zadana - wartość_mierzona
             float error = localTargetAngles[i] - localCurrentAngles[i];
@@ -362,7 +406,10 @@ void motorControlTask(void *parameter) {
             // Weryfikacja strefy nieczułości (deadband)
             if (abs(error) > ANGLE_TOLERANCE) {
                 
-                long stepsCorrection = (long)(error * stepsPerDegree[i]);
+                long stepsCorrection = (long)(error * KP_MAIN * stepsPerDegree[i]);
+                
+                // Limitowanie korekty
+                stepsCorrection = constrain(stepsCorrection, -MAX_CORRECTION_STEPS, MAX_CORRECTION_STEPS);
 
                 if (AXIS_INVERT[i]) {
                     stepsCorrection = -stepsCorrection;
@@ -375,8 +422,34 @@ void motorControlTask(void *parameter) {
                 if (i == 2) {
                     // Obliczenie uchybu dla A z detekcją desynchronizacji
                     float errorA = localTargetAngles[2] - localCurrentAngles[3];
-                    float syncDeviation = localCurrentAngles[2] - localCurrentAngles[3]; 
-                    long stepsCorrectionA = (long)((errorA + syncDeviation) * stepsPerDegree[3]);
+                    float syncDeviation = localCurrentAngles[2] - localCurrentAngles[3];
+                    
+                    // Dead-zone dla synchronizacji
+                    float syncCorrection = 0.0;
+                    if (abs(syncDeviation) > SYNC_DEADBAND) {
+                        // Ogranicz korektę sync do maksymalnej wartości
+                        syncCorrection = constrain(
+                            syncDeviation * KP_SLAVE_SYNC, 
+                            -SYNC_MAX_CORRECTION, 
+                            SYNC_MAX_CORRECTION
+                        );
+                    }
+                    
+                    // Tłumienie w strefie krytycznej (wokół pionu)
+                    float currentMasterAngle = localCurrentAngles[2];
+                    if (currentMasterAngle >= CRITICAL_ZONE_MIN && 
+                        currentMasterAngle <= CRITICAL_ZONE_MAX) {
+                        syncCorrection *= CRITICAL_ZONE_DAMPING; // Redukcja do 50%
+                    }
+                    
+                    // Slave śledzi cel + łagodna synchronizacja
+                    float totalCorrectionA = errorA * KP_SLAVE_TRACKING + syncCorrection;
+                    
+                    // Konwersja na kroki
+                    long stepsCorrectionA = (long)(totalCorrectionA * stepsPerDegree[3]);
+                    
+                    // Limitowanie Slave
+                    stepsCorrectionA = constrain(stepsCorrectionA, -MAX_CORRECTION_STEPS, MAX_CORRECTION_STEPS);
 
                     // Aplikacja ruchu dla A
                     if (AXIS_INVERT[3]) {
@@ -399,30 +472,8 @@ void motorControlTask(void *parameter) {
     }
 }
 
-long calculateMotorSteps(int axisIndex, float targetAxisAngle) {
-    // 1. Oblicz różnicę kątową względem pozycji startowej
-    float angleDifference = targetAxisAngle - START_ANGLES[axisIndex];
-    
-    // 2. Uwzględnij odwrócenie kierunku
-    if (AXIS_INVERT[axisIndex]) {
-        angleDifference = -angleDifference;
-    }
-    
-    // 3. Oblicz liczbę obrotów OSI
-    float axisRevolutions = angleDifference / 360.0;
-    
-    // 4. Oblicz liczbę obrotów SILNIKA (uwzględniając przekładnię)
-    // Jeśli oś robi 1 obrót, silnik musi zrobić GEAR_RATIO obrotów
-    float motorRevolutions = axisRevolutions * ENCODER_LEVER[axisIndex];
-    
-    // 5. Przelicz na obrót silnika
-    long totalSteps = (long)(motorRevolutions * STEPS_PER_MOTOR_REV);
-    
-    return totalSteps;
-}
-
 // =========================================================================
-// ------------------------------ SETUP I LOOP------------------------------
+// ---------------------------- SETUP I LOOP -------------------------------
 // =========================================================================
 
 void setup() {
@@ -470,7 +521,7 @@ void setup() {
             ENCODER_ZPOS[i] = 0;
         } else {
             ENCODER_ZPOS[i] = rawReading;
-            Serial.printf("✓ Enkoder %s: raw=%d (start=%.1f°)\n", 
+            Serial.printf("Enkoder %s: raw=%d (start=%.1f°)\n", 
                           axisNames[i], ENCODER_ZPOS[i], START_ANGLES[i]);
         }
         
@@ -483,10 +534,10 @@ void setup() {
     // Uruchomienie tasków na osobnych rdzeniach
     Serial.println("Uruchamianie tasków...");
     
-    // Task komunikacyjny na rdzeniu 0 (ten sam co loop())
+    // wątek na rdzeniu 0
     xTaskCreatePinnedToCore(
-        communicationTask,   // Funkcja
-        "Communication",     // Nazwa
+        communicationTask,  // Funkcja
+        "Communication",    // Nazwa
         10000,              // Stack size (bajty)
         NULL,               // Parametr
         1,                  // Priorytet
@@ -494,24 +545,21 @@ void setup() {
         0                   // Rdzeń 0
     );
     
-    // Task sterowania na rdzeniu 1
+    // wątek na rdzeniu 1
     xTaskCreatePinnedToCore(
         motorControlTask,
         "MotorControl",
         10000,
         NULL,
-        2,                  // Wyższy priorytet
+        2, 
         NULL,
-        1                   // Rdzeń 1
+        1
     );
     
-    Serial.println("✓ System uruchomiony!");
+    Serial.println("System uruchomiony!");
 }
 
-void loop() {
-    // Loop może pozostać pusty - wszystko dzieje się w taskach
-    vTaskDelay(1000 / portTICK_PERIOD_MS);
-}
+void loop() {} // Wszystko dzieje się w taskach
 
 // =========================================================================
 // ------------------------ FUNKCJE ENKODERÓW ------------------------------
