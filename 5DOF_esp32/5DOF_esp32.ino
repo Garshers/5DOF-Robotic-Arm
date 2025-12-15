@@ -7,7 +7,7 @@
 #define SIMULATION_MODE true
 
 // ======================= Piny silników ======================
-#define SERVO_PIN 14
+#define SERVO_PIN 13
 
 #define STEP_X 17
 #define DIR_X 16
@@ -36,9 +36,9 @@ AccelStepper motorE(AccelStepper::DRIVER, STEP_E, DIR_E);
 
 // ===================== Konfiguracja enkoderów [E, Z, Y, A, X] ======================
 const float START_ANGLES[5] = {90.0, 90.0, 135.0, 135.0, 0.0}; 
-const bool ENCODER_INVERT[] = {true, false, true, true, false}; // [E, Z, Y, A, X]
+const bool ENCODER_INVERT[] = {true, false, true, true, false};
 const uint8_t ENCODER_CHANNEL[] = {4, 5, 6, 7, 3};
-const float ENCODER_LEVER[] = {2.0, 3.6, 4.5, 4.5, 1.0}; // [E, Z, Y, A, X]
+const float ENCODER_LEVER[] = {2.0, 3.6, 4.5, 4.5, 1.0};
 uint16_t ENCODER_ZPOS[] = {0, 0, 0, 0, 0};
 int16_t rotationCount[] = {0, 0, 0, 0, 0};
 uint16_t lastRawAngle[] = {0, 0, 0, 0, 0};
@@ -55,7 +55,7 @@ volatile bool newTargetAvailable = true;
 // ===================== Parametry sterowania ======================
 const bool AXIS_INVERT[] = {false, false, false, false, false};
 const float ANGLE_TOLERANCE = 0.05;
-const unsigned long ENCODER_READ_INTERVAL = 50;
+const unsigned long ENCODER_READ_INTERVAL = 20;
 const unsigned long PYTHON_SEND_INTERVAL = 50;
 
 // Bufory komunikacji (tylko rdzeń 0)
@@ -505,25 +505,29 @@ void setup() {
     // Utworzenie mutexu
     xMutex = xSemaphoreCreateMutex();
     if (xMutex == NULL) {
-        Serial.println("❌ BŁĄD: Nie można utworzyć mutexu!");
+        Serial.println("BŁĄD: Nie można utworzyć mutexu!");
         while(1);
     }
     
     // Kalibracja enkoderów
     Serial.println("Kalibracja enkoderów...");
+
+    
+
+    // === funkcja weryfikująca pozycję startową ===
+    if (!verifyHomingPosition()) {
+        Serial.println("BŁĄD KRYTYCZNY: Robot nie jest w pozycji startowej (krańcówki nienaciśnięte)!");
+        while(true) vTaskDelay(100); 
+    }
+
+    // Kalibracja enkoderów (po weryfikacji)
+    Serial.println("Kalibracja enkoderów...");
     const char* axisNames[] = {"E", "Z", "Y", "A", "X"};
+    calibration(axisNames);
     
     for(int i = 0; i < 5; i++) {
-        uint16_t rawReading = getEncoderRawAngle(ENCODER_CHANNEL[i]);
-        
-        if(rawReading == 0xFFFF) {
-            Serial.printf("❌ BŁĄD: Enkoder %s nie odpowiada!\n", axisNames[i]);
-            ENCODER_ZPOS[i] = 0;
-        } else {
-            ENCODER_ZPOS[i] = rawReading;
-            Serial.printf("Enkoder %s: raw=%d (start=%.1f°)\n", 
-                          axisNames[i], ENCODER_ZPOS[i], START_ANGLES[i]);
-        }
+        Serial.printf("Enkoder %s: Ustawiona stała RAW=%d (start=%.1f°)\n", 
+                      axisNames[i], ENCODER_ZPOS[i], START_ANGLES[i]);
         
         lastRawAngle[i] = ENCODER_ZPOS[i];
         rotationCount[i] = 0;
@@ -557,6 +561,56 @@ void setup() {
     );
     
     Serial.println("System uruchomiony!");
+}
+
+bool verifyHomingPosition() {
+    bool allLimitsPressed = true;
+    if (digitalRead(LIMIT_X_PIN) != LOW) {
+        Serial.println("Limit X nieaktywny!");
+        allLimitsPressed = false;
+    }
+    if (digitalRead(LIMIT_Y_PIN) != LOW) {
+        Serial.println("Limit Y nieaktywny!");
+        allLimitsPressed = false;
+    }
+    if (digitalRead(LIMIT_Z_PIN) != LOW) {
+        Serial.println("Limit Z nieaktywny!");
+        allLimitsPressed = false;
+    }
+    if (digitalRead(LIMIT_E_PIN) != LOW) {
+        Serial.println("Limit E nieaktywny!");
+        allLimitsPressed = false;
+    }
+    
+    if (allLimitsPressed) {
+        Serial.println("Pomyślna weryfikacja pozycji bazowej. Można kalibrować.");
+    }
+    
+    return allLimitsPressed;
+}
+
+void calibration(char* axisNames) {
+    unsigned long lastPrint = 0;
+    
+    while (true) { 
+        if (millis() - lastPrint >= 500) {
+            lastPrint = millis();
+            String output = "";
+            
+            for (int i = 0; i < 5; i++) {
+                // Wywołanie funkcji odczytującej surowy kąt
+                uint16_t rawAngle = getEncoderRawAngle(ENCODER_CHANNEL[i]); 
+                
+                if (rawAngle != 0xFFFF) {
+                    output += String(axisNames[i]) + ":" + String(rawAngle) + " ";
+                } else {
+                    output += String(axisNames[i]) + ": ERROR ";
+                }
+            }
+            
+            Serial.println(output);
+        }
+    }
 }
 
 void loop() {} // Wszystko dzieje się w taskach
