@@ -4,7 +4,7 @@
 
 // ==================== Podstawowe ustawienia ====================
 #define BAUD 115200
-#define SIMULATION_MODE true
+#define SIMULATION_MODE false
 
 // ======================= Piny silników ======================
 #define SERVO_PIN 13
@@ -25,8 +25,8 @@
 #define LIMIT_Z_PIN 34
 #define LIMIT_E_PIN 35
 
-#define SDA_PIN 21
-#define SCL_PIN 22
+#define SDA_PIN 22
+#define SCL_PIN 21
 
 AccelStepper motorX(AccelStepper::DRIVER, STEP_X, DIR_X);
 AccelStepper motorY(AccelStepper::DRIVER, STEP_Y, DIR_Y);
@@ -36,10 +36,10 @@ AccelStepper motorE(AccelStepper::DRIVER, STEP_E, DIR_E);
 
 // ===================== Konfiguracja enkoderów [E, Z, Y, A, X] ======================
 const float START_ANGLES[5] = {90.0, 90.0, 135.0, 135.0, 0.0}; 
-const bool ENCODER_INVERT[] = {true, false, true, true, false};
+const bool ENCODER_INVERT[] = {true, false, false, true, false};
 const uint8_t ENCODER_CHANNEL[] = {4, 5, 6, 7, 3};
-const float ENCODER_LEVER[] = {2.0, 3.6, 4.5, 4.5, 1.0};
-uint16_t ENCODER_ZPOS[] = {0, 0, 0, 0, 0};
+const float ENCODER_LEVER[] = {2.0, 3.6, 4.5, 4.5, 4.0};
+const uint16_t ENCODER_ZPOS[] = {3777, 3982, 2763, 2415, 1800}; // -40
 int16_t rotationCount[] = {0, 0, 0, 0, 0};
 uint16_t lastRawAngle[] = {0, 0, 0, 0, 0};
 const float angleConst = 360.0 / 4096.0;
@@ -53,13 +53,23 @@ volatile float currentServoAngle = 0.0;
 volatile bool newTargetAvailable = true;
 
 // ===================== Parametry sterowania ======================
-const bool AXIS_INVERT[] = {false, false, false, false, false};
+const bool AXIS_INVERT[] = {false, true, true, true, true};
 const float ANGLE_TOLERANCE = 0.05;
-const unsigned long ENCODER_READ_INTERVAL = 20;
+const unsigned long ENCODER_READ_INTERVAL = 5;
 const unsigned long PYTHON_SEND_INTERVAL = 50;
 
 // Bufory komunikacji (tylko rdzeń 0)
 String serialBuffer = "";
+
+// Deklaracje funkcji (prototypy)
+void readSerialCommands();
+void parsePythonCommand(String cmd);
+void sendPositionToPython();
+void readEncoders();
+uint16_t getEncoderRawAngle(uint8_t channel);
+void updateRotationCount(int axisIndex, uint16_t currentRaw);
+bool verifyHomingPosition();
+void calibration(const char* axisNames[]);
 
 // =========================================================================
 // ----------------------------- RDZEŃ 0 -----------------------------------
@@ -335,36 +345,36 @@ void motorControlTask(void *parameter) {
     float localCurrentAngles[5];
     float stepsPerDegree[5];
     
-    // Współczynniki regulatora P
-    const float KP_MAIN = 1.0;              // Standardowe osie
-    const float KP_SLAVE_TRACKING = 1.0;    // Slave śledzi cel Mastera
-    const float KP_SLAVE_SYNC = 0.15;       // Łagodna synchronizacja
+    // ================== KONFIGURACJA BACKLASH (LUZU) ==================
+    const float BACKLASH_X_DEG = 1.3;       
     
-    // Limity bezpieczeństwa
-    const long MAX_CORRECTION_STEPS = 500;
+    // Zmienne stanu dla kompensacji (Static, aby pamiętały stan między pętlami)
+    static float lastTargetX = 0.0;         // Poprzedni cel (do wykrywania kierunku zmian)
+    static float activeBacklashX = 0.0;     // Aktualnie przyłożony offset (stały dla danego ruchu)
+    static bool isFirstRun = true;          // Do inicjalizacji przy starcie
+
+    const float KP_MAIN = 1.0;              
+    const float KP_SLAVE_TRACKING = 1.0;    
+    const float KP_SLAVE_SYNC = 0.15;       
     
-    // Tolerancja desynchronizacji Master-Slave
-    const float SYNC_DEADBAND = 0.3;        // Ignoruj błędy sync < 0.3°stopnia
-    const float SYNC_MAX_CORRECTION = 2.0;  // Maksymalna korekta sync za cykl [stopnie]
+    const float SYNC_DEADBAND = 0.05;       
+    const float SYNC_MAX_CORRECTION = 2.0;  
     
-    // Strefa krytyczna (wokół pionu)
-    const float CRITICAL_ZONE_MIN = 80.0;
-    const float CRITICAL_ZONE_MAX = 110.0;
-    const float CRITICAL_ZONE_DAMPING = 0.5; // Redukcja sync do 50% w strefie krytycznej
+    const float CRIT_ZONE_MIN = 0.0;
+    const float CRIT_ZONE_MAX = 45.0;
+    const float CRIT_ZONE_DAMPING = 0.5; 
     
-    // Niezależne timery dla każdej osi w celu uniknięcia oscylacji
     unsigned long lastAxisCorrectionTime[5] = {0, 0, 0, 0, 0};
-    const unsigned long CORRECTION_INTERVAL = 50; 
+    const unsigned long CORRECTION_INTERVAL = 20; 
     
-    // Wskaźniki na obiekty silników
     AccelStepper* motors[5] = {&motorE, &motorZ, &motorY, &motorA, &motorX};
 
-    // Konfiguracja silników
-    const float STEPS_PER_REV = 200.0;  // Silnik 1.8 stopnia
-    const float MICROSTEPS = 16.0;     // Ustawienie sterownika
-    const float STEPS_PER_MOTOR_REV = STEPS_PER_REV * MICROSTEPS; // 3200 kroków/obrót silnika
-    float baseSpeed = 50.0 * MICROSTEPS;
-    float baseAcceleration = baseSpeed / 4.0;
+    const float STEPS_PER_REV = 200.0;  
+    const float MICROSTEPS = 16.0;     
+    const float STEPS_PER_MOTOR_REV = STEPS_PER_REV * MICROSTEPS; 
+    const long MAX_CORRECTION_STEPS = long(STEPS_PER_MOTOR_REV / 36); 
+    float baseSpeed = 5.0 * STEPS_PER_MOTOR_REV;
+    float baseAcceleration = baseSpeed / 8.0;
     
     for(int i=0; i<5; i++) {
         motors[i]->setMaxSpeed(baseSpeed * ENCODER_LEVER[i]);
@@ -372,89 +382,102 @@ void motorControlTask(void *parameter) {
         stepsPerDegree[i] = (STEPS_PER_MOTOR_REV * ENCODER_LEVER[i]) / 360.0;
     }
     
-    Serial.println("Rdzeń 1: Task sterowania uruchomiony");
+    // Inicjalizacja zmiennej startowej dla X (żeby nie szarpnęło przy starcie)
+    lastTargetX = START_ANGLES[4];
+
+    Serial.println("Rdzeń 1: Task sterowania uruchomiony (Logika: Target Hysteresis)");
     
     while (true) {
         unsigned long currentMillis = millis();
 
-        // ===== 1. Pobieranie danych (Setpoints & Feedback) =====
-        bool hasNewTarget = false;
+        // ===== 1. Pobieranie danych i OBSŁUGA LOGIKI BACKLASH =====
         if (xSemaphoreTake(xMutex, 10 / portTICK_PERIOD_MS)) {
             if (newTargetAvailable) {
+                // Kopiujemy nowe cele
                 memcpy(localTargetAngles, (void*)targetAngles, sizeof(localTargetAngles));
                 newTargetAvailable = false;
-                hasNewTarget = true;
+                
+                // === Obsługa backlash osi X ===
+                float newX = localTargetAngles[4];
+                
+                if (isFirstRun) {
+                    lastTargetX = newX;
+                    isFirstRun = false;
+                }
+
+                // Porównujemy nowy cel z poprzednim zapamiętanym
+                if (abs(newX - lastTargetX) > 0.01) { // Tolerancja na float
+                    if (newX > lastTargetX) {
+                        activeBacklashX = BACKLASH_X_DEG;   // Ruch w stronę dodatnią
+                    } 
+                    else if (newX < lastTargetX) {
+                        activeBacklashX = -BACKLASH_X_DEG;  // Ruch w stronę ujemną
+                    }
+                    lastTargetX = newX;
+                }
+                // ==========================================================
             }
-            // Aktualizacja sprzężenia zwrotnego pozycji
+            
+            // Aktualizacja pozycji bieżącej
             memcpy(localCurrentAngles, (void*)currentAngles, sizeof(localCurrentAngles));
             xSemaphoreGive(xMutex);
         }
         
-        // ===== 2. Sterowanie w pętli zamkniętej (Real-time Closed Loop) =====
+        // ===== 2. Sterowanie w pętli zamkniętej =====
         for (int i = 0; i < 5; i++) {
-            // Pomiń niezależne obliczenia dla osi A (indeks 3), która jest Slavem
-            if (i == 3) continue;
+            if (i == 3) continue; // Pomiń Slave A
             
-            // Sprawdzanie CORRECTION_INTERVAL
             if (currentMillis - lastAxisCorrectionTime[i] < CORRECTION_INTERVAL) {
                 continue;
             }
 
-            // Obliczenie uchybu: e(t) = wartość_zadana - wartość_mierzona
-            float error = localTargetAngles[i] - localCurrentAngles[i];
+            // Ustalenie efektywnego celu
+            float effectiveTarget = localTargetAngles[i];
+            
+            // DLA OSI X: Dodaj obliczony wcześniej stały offset
+            if (i == 4) {
+                effectiveTarget += activeBacklashX;
+            }
 
-            // Weryfikacja strefy nieczułości (deadband)
+            // Obliczenie błędu względem zmodyfikowanego celu
+            float error = effectiveTarget - localCurrentAngles[i];
+
             if (abs(error) > ANGLE_TOLERANCE) {
                 
                 long stepsCorrection = (long)(error * KP_MAIN * stepsPerDegree[i]);
                 
-                // Limitowanie korekty
                 stepsCorrection = constrain(stepsCorrection, -MAX_CORRECTION_STEPS, MAX_CORRECTION_STEPS);
 
                 if (AXIS_INVERT[i]) {
                     stepsCorrection = -stepsCorrection;
                 }
 
-                // Aplikacja ruchu dla silnika bieżącego
                 motors[i]->moveTo(motors[i]->currentPosition() + stepsCorrection);
                 
-                // --- LOGIKA MASTER-SLAVE DLA OSI A (Z DETEKCJĄ DESYNCHRONIZACJI) ---
+                // --- LOGIKA MASTER-SLAVE DLA OSI A ---
                 if (i == 2) {
-                    // Obliczenie uchybu dla A z detekcją desynchronizacji
                     float errorA = localTargetAngles[2] - localCurrentAngles[3];
                     float syncDeviation = localCurrentAngles[2] - localCurrentAngles[3];
                     
-                    // Dead-zone dla synchronizacji
-                    float syncCorrection = 0.0;
+                    float syncCorr = 0.0;
                     if (abs(syncDeviation) > SYNC_DEADBAND) {
-                        // Ogranicz korektę sync do maksymalnej wartości
-                        syncCorrection = constrain(
-                            syncDeviation * KP_SLAVE_SYNC, 
-                            -SYNC_MAX_CORRECTION, 
-                            SYNC_MAX_CORRECTION
-                        );
+                        float effectiveError = (syncDeviation > SYNC_DEADBAND) ? 
+                                               (syncDeviation - SYNC_DEADBAND) : 
+                                               (syncDeviation + SYNC_DEADBAND);
+                        syncCorr = effectiveError * KP_SLAVE_SYNC;
+                        syncCorr = constrain(syncCorr, -SYNC_MAX_CORRECTION, SYNC_MAX_CORRECTION);
                     }
                     
-                    // Tłumienie w strefie krytycznej (wokół pionu)
                     float currentMasterAngle = localCurrentAngles[2];
-                    if (currentMasterAngle >= CRITICAL_ZONE_MIN && 
-                        currentMasterAngle <= CRITICAL_ZONE_MAX) {
-                        syncCorrection *= CRITICAL_ZONE_DAMPING; // Redukcja do 50%
+                    if (currentMasterAngle >= CRIT_ZONE_MIN && currentMasterAngle <= CRIT_ZONE_MAX) {
+                        syncCorr = 0.5 * CRIT_ZONE_DAMPING;
                     }
                     
-                    // Slave śledzi cel + łagodna synchronizacja
-                    float totalCorrectionA = errorA * KP_SLAVE_TRACKING + syncCorrection;
-                    
-                    // Konwersja na kroki
+                    float totalCorrectionA = errorA * KP_SLAVE_TRACKING + syncCorr;
                     long stepsCorrectionA = (long)(totalCorrectionA * stepsPerDegree[3]);
-                    
-                    // Limitowanie Slave
                     stepsCorrectionA = constrain(stepsCorrectionA, -MAX_CORRECTION_STEPS, MAX_CORRECTION_STEPS);
 
-                    // Aplikacja ruchu dla A
-                    if (AXIS_INVERT[3]) {
-                        stepsCorrectionA = -stepsCorrectionA;
-                    }
+                    if (AXIS_INVERT[3]) stepsCorrectionA = -stepsCorrectionA;
 
                     motors[3]->moveTo(motors[3]->currentPosition() + stepsCorrectionA);
                 }
@@ -463,12 +486,12 @@ void motorControlTask(void *parameter) {
             }
         }
         
-        // ===== 3. Wykonanie kroków (Motion Profiling) =====
+        // ===== 3. Wykonanie kroków =====
         for(int i=0; i<5; i++) {
             motors[i]->run();
         }
         
-        vTaskDelay(1); 
+        yield();
     }
 }
 
@@ -512,18 +535,19 @@ void setup() {
     // Kalibracja enkoderów
     Serial.println("Kalibracja enkoderów...");
 
-    
-
     // === funkcja weryfikująca pozycję startową ===
     if (!verifyHomingPosition()) {
         Serial.println("BŁĄD KRYTYCZNY: Robot nie jest w pozycji startowej (krańcówki nienaciśnięte)!");
-        while(true) vTaskDelay(100); 
+        while(!verifyHomingPosition()) vTaskDelay(1000);
     }
 
-    // Kalibracja enkoderów (po weryfikacji)
+    const char* axisNames[] = {"E", "Z", "Y", "A", "X"};    
+    
+    /*
+    // Kalibracja enkoderów
     Serial.println("Kalibracja enkoderów...");
-    const char* axisNames[] = {"E", "Z", "Y", "A", "X"};
     calibration(axisNames);
+    */
     
     for(int i = 0; i < 5; i++) {
         Serial.printf("Enkoder %s: Ustawiona stała RAW=%d (start=%.1f°)\n", 
@@ -533,7 +557,9 @@ void setup() {
         rotationCount[i] = 0;
         currentAngles[i] = START_ANGLES[i];
         targetAngles[i] = START_ANGLES[i];
+        vTaskDelay(100);
     }
+    
     
     // Uruchomienie tasków na osobnych rdzeniach
     Serial.println("Uruchamianie tasków...");
@@ -548,6 +574,7 @@ void setup() {
         NULL,               // Handle
         0                   // Rdzeń 0
     );
+    
     
     // wątek na rdzeniu 1
     xTaskCreatePinnedToCore(
@@ -565,14 +592,10 @@ void setup() {
 
 bool verifyHomingPosition() {
     bool allLimitsPressed = true;
-    if (digitalRead(LIMIT_X_PIN) != LOW) {
-        Serial.println("Limit X nieaktywny!");
-        allLimitsPressed = false;
-    }
-    if (digitalRead(LIMIT_Y_PIN) != LOW) {
-        Serial.println("Limit Y nieaktywny!");
-        allLimitsPressed = false;
-    }
+    //if (digitalRead(LIMIT_Y_PIN) != LOW) {  
+    //    Serial.println("Limit Y nieaktywny!");
+    //    allLimitsPressed = false;
+    //}
     if (digitalRead(LIMIT_Z_PIN) != LOW) {
         Serial.println("Limit Z nieaktywny!");
         allLimitsPressed = false;
@@ -583,13 +606,13 @@ bool verifyHomingPosition() {
     }
     
     if (allLimitsPressed) {
-        Serial.println("Pomyślna weryfikacja pozycji bazowej. Można kalibrować.");
+        Serial.println("Pomyślna weryfikacja pozycji bazowej");
     }
     
     return allLimitsPressed;
 }
 
-void calibration(char* axisNames) {
+void calibration(const char* axisNames[]) {
     unsigned long lastPrint = 0;
     
     while (true) { 
@@ -613,7 +636,9 @@ void calibration(char* axisNames) {
     }
 }
 
-void loop() {} // Wszystko dzieje się w taskach
+void loop() { // Wszystko dzieje się w taskach
+ // Zostawiamy puste
+} 
 
 // =========================================================================
 // ------------------------ FUNKCJE ENKODERÓW ------------------------------
