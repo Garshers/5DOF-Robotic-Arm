@@ -11,17 +11,9 @@ from matplotlib.figure import Figure
 import math
 import numpy as np
 
-# =====================================================================
-# KOMUNIKACJA SERIAL Z ESP-32
-# =====================================================================
+# -------------------- KOMUNIKACJA UART Z ESP-32 ----------------------
 
 class RobotSerial:
-    """
-    Klasa odpowiedzialna za komunikację szeregową z modułem ESP-32.
-    Obejmuje otwieranie portu, nasłuchiwanie danych w tle oraz wysyłanie komend sterujących.
-    Zaprojektowana tak, aby reszta aplikacji mogła korzystać z aktualnych danych bez blokowania GUI.
-    """
-
     def __init__(self, port=None, baudrate=115200):
         self.port_name = port
         self.baudrate = baudrate
@@ -33,7 +25,7 @@ class RobotSerial:
         # Aktualne wartości odczytane z kontrolera [X, Y, Z, E, A, S] w stopniach.
         self.current_angles = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
-        # Lock zabezpiecza dane przy odczycie/zapisie z różnych wątków (mutex w c++)
+        # mutex w c++
         self.lock = threading.Lock()
 
         # Miejsce na funkcję, która zaktualizuje liczby i wykresy w oknie aplikacji.
@@ -41,9 +33,6 @@ class RobotSerial:
         self.gui_callback = None
 
     def find_esp32_port(self):
-        """
-        Przeszukaj wszystkie dostępne porty COM, starając się wykryć ESP32.
-        """
         # W naszym przypadku to "CP210x USB to UART Bridge (COM9)". 
         ports = serial.tools.list_ports.comports()
         for p in ports:
@@ -53,12 +42,9 @@ class RobotSerial:
         return None # None — jeśli urządzenie nie zostało znalezione
 
     def connect(self):
-        """
-        Nawiązuje połączenie z urządzeniem ESP-32 przez port szeregowy.
-        Zamyka poprzednie połączenie, wykrywa odpowiedni port, otwiera go,
-        inicjalizuje mikrokontroler i uruchamia wątek odczytu.
-        Zwraca: (bool, str) - informacja o powodzeniu operacji.
-        """
+        # Nawiązuje połączenie z urządzeniem ESP-32 przez port szeregowy.
+        # Zamyka poprzednie połączenie, wykrywa odpowiedni port, otwiera go,
+        # inicjalizuje mikrokontroler i uruchamia wątek odczytu.
 
         # Jeśli istnieje wcześniejsze połączenie
         # Zamknij, aby nie blokować portu lub wątku w tle.
@@ -99,11 +85,7 @@ class RobotSerial:
             return False, f"Błąd połączenia: {e}"
 
     def _continuous_read(self):
-        """
-        Wątek odbierający dane z portu szeregowego.
-        Odczyt działa blokująco, dzięki czemu w spoczynku nie obciąża procesora.
-        Metoda parsuje ramki z danymi kątów i aktualizuje stan robota.
-        """
+        # Wątek odbierający dane z portu szeregowego.
 
         AXIS_MAP = {
             "X": 0, 
@@ -171,19 +153,13 @@ class RobotSerial:
                 break
 
     def get_current_angles(self):
-        """
-        Zwraca aktualne kąty jako listę.
-        Tworzona jest kopia, aby zapobiec przypadkowej modyfikacji danych przez inne moduły.
-        """
         with self.lock:
             return self.current_angles.copy()
 
     def send_target_angles(self, th1, th2, th3, th4, th5):
-        """
-        Wysyła wartości docelowe osi do ESP32.
-        Oczekuje wartości w radianach — konwertuje je na stopnie.
-        Format wysyłanej komendy: X...,Y...,Z...,E...,A...*CS
-        """
+        # Wysyła wartości docelowe osi do ESP32.
+        # Format: X...,Y...,Z...,E...,A...*CS
+
         if not self.ser or not self.ser.is_open:
             return False, "Port nie jest otwarty"
 
@@ -215,9 +191,8 @@ class RobotSerial:
             return False, f"Błąd wysyłania: {e}"
 
     def close(self):
-        """
-        Zatrzymuje wątek odczytu i zamyka port.
-        """
+        # Zatrzymuje wątek odczytu i zamyka port.
+        
         self.running = False
 
         # Czekamy na zakończenie wątku, żeby uniknąć wycieków wątków.
@@ -230,9 +205,7 @@ class RobotSerial:
                 self.ser.close()
         except: pass
 
-# =====================================================================
-# KINEMATYKA (Model matematyczny robota 5-DOF)
-# =====================================================================
+# ---------- KINEMATYKA (Model matematyczny robota 5-DOF) -------------
 
 class RobotKinematics:
     def __init__(self):
@@ -245,12 +218,13 @@ class RobotKinematics:
         self.d6 = 10.2 + 58.87
 
         range_const = math.pi / 2
+        dR = math.pi / 180.0 # 1 stopień marginesu
         self.limits = {
-            'th1': (-range_const, range_const),   # X
-            'th2': (0, range_const * 1.5),        # Y/A
-            'th3': (-range_const, range_const),   # Z
-            'th4': (-range_const, range_const),   # E
-            'th5': (-math.pi, math.pi)            # S
+            'th1': (-range_const - dR, range_const + dR),   # X
+            'th2': (0 - dR, range_const * 1.5  + dR),       # Y/A
+            'th3': (-range_const - dR, range_const + dR),   # Z
+            'th4': (-range_const - dR, range_const + dR),   # E
+            'th5': (-math.pi - dR, math.pi + dR)            # S
         }
 
         self.L1 = self.a2
@@ -334,7 +308,7 @@ class RobotKinematics:
         return J
     
     def inverse_kinematics(self, R, Z, th1, phi_deg=0.0, elbow_up=True, reverse_base=False):
-        phi_rad = math.radians(phi_deg)
+        phi_rad = self._normalize_angle(math.radians(phi_deg + 270.0))
         phi_corr = phi_rad - self.geo_phi_offset
         
         R_ik = -R if reverse_base else R
@@ -344,6 +318,9 @@ class RobotKinematics:
         
         D_sq = R_wrist**2 + Z_wrist**2
         if D_sq > self.max_reach_sq or D_sq < self.min_reach_sq:
+            # D = math.sqrt(D_sq)
+            # Max = math.sqrt(self.max_reach_sq)
+            # print(f"[IK] Poza zasięgiem! Dist={D:.1f} vs Max={Max:.1f} (R_w={R_wrist:.1f}, Z_w={Z_wrist:.1f})")
             return None
         
         cos_th3 = (D_sq - self.L1_sq - self.L2_sq) / self.denom
@@ -365,6 +342,8 @@ class RobotKinematics:
         th3 = self._normalize_angle(th3)
         th4 = self._normalize_angle(th4)
         
+        # print(f"[IK] Przeszło weryfikację D_sq. Zwracane kąty to: th1={math.degrees(th1):.1f}°, th2={math.degrees(th2):.1f}°, th3={math.degrees(th3):.1f}°, th4={math.degrees(th4):.1f}°")
+
         return (th1, th2, th3, th4)
 
     def check_constraints(self, angles, positions):
@@ -403,7 +382,7 @@ class RobotKinematics:
         z_critical = z_axial - (len_xy * self.crit_offset_factor)
         
         if z_critical < 0: 
-            print(f"DEBUG: Odrzucono - Punkt krytyczny (kolizja z bazą)! Val={z_critical:.2f}")
+            # print(f"DEBUG: Odrzucono - Punkt krytyczny (kolizja z bazą)! Val={z_critical:.2f}")
             return False, f"Kolizja z bazą (Crit={z_critical:.1f})"
 
         return True, "OK"
@@ -446,26 +425,22 @@ class RobotKinematics:
     def solve_ik(self, x, y, z, current_angles, phi_deg=None, roll_deg=0.0):
         th5_target = math.radians(roll_deg)
 
-        # --- WARIANT 1: Zadana orientacja (Pitch podany wprost) ---
         if phi_deg is not None:
             T_goal = self._construct_matrix(x, y, z, phi_deg)
             sol, strategy = self._solve_from_matrix(T_goal, current_angles)
-            return (sol + (th5_target,), strategy) if sol else (None, "Cel nieosiągalny")
+            return (sol + (th5_target,), strategy) if sol else (None, "Cel nieosiągalny - Spróbuj użyć Auto-orientacji")
 
-        # --- WARIANT 2: Auto-orientacja (Szukanie najlepszego Pitch) ---
         else:
             def evaluate_phi(phi_val):
-                phi_norm = self._normalize_angle(math.radians(phi_val))
-                T_c = self._construct_matrix(x, y, z, math.degrees(phi_norm))
+                T_c = self._construct_matrix(x, y, z, phi_val)
                 s_sol, s_name = self._solve_from_matrix(T_c, current_angles, check_strategies=True)
-                
+            
                 if s_sol:
                     c = self.calculate_configuration_cost(s_sol + (th5_target,), current_angles)
-                    return c, s_sol, s_name, math.degrees(phi_norm)
-                return float('inf'), None, None, math.degrees(phi_norm)
+                    return c, s_sol, s_name, phi_val
+                
+                return float('inf'), None, None, phi_val
 
-            # ETAP 1: Skanowanie zgrubne (Coarse Search)
-            # Przeszukujemy pełny zakres co 1 stopień, aby znaleźć "dolinę" poprawnego rozwiązania
             best_phi_coarse = 0.0
             min_cost = float('inf')
             found_valid = False
@@ -478,20 +453,14 @@ class RobotKinematics:
                     found_valid = True
 
             if not found_valid:
-                return None, "Brak rozwiązania (zasięg/kolizja)"
+                return None, "Brak rozwiązania (zasięg/kolizja) - Odrzucone na poziomie skanowania zgrubnego"
 
-            # ETAP 2: Precyzyjne dostrajanie (Metoda Złotego Podziału)
-            # POPRAWKA: Ponieważ skanujemy zgrubnie co 1 stopień, optimum jest bardzo blisko.
-            # Zawężamy zakres poszukiwań do +/- 2.0 stopnie.
-            # Wcześniejszy zakres +/- 45.0 powodował, że punkty próbne wypadały poza obszar
-            # dopuszczalny (zwracały inf), co psuło algorytm.
-            
             search_span = 2.0 
             a = best_phi_coarse - search_span
             b = best_phi_coarse + search_span
             
             GR = 0.61803398875
-            tol = 0.01  # Wymagana precyzja
+            tol = 0.01
             
             c = b - (b - a) * GR
             d = a + (b - a) * GR
@@ -500,15 +469,12 @@ class RobotKinematics:
                 cost_c, _, _, _ = evaluate_phi(c)
                 cost_d, _, _, _ = evaluate_phi(d)
                 
-                # ZABEZPIECZENIE: Jeśli oba punkty trafiły w "ścianę" (rozwiązanie niemożliwe),
-                # algorytm nie wie, w którą stronę iść. Wtedy kurczymy zakres
-                # w stronę bezpiecznego środka (best_phi_coarse), o którym wiemy, że działa.
                 if cost_c == float('inf') and cost_d == float('inf'):
-                     a = (a + best_phi_coarse) / 2
-                     b = (b + best_phi_coarse) / 2
-                     c = b - (b - a) * GR
-                     d = a + (b - a) * GR
-                     continue
+                    a = (a + best_phi_coarse) / 2
+                    b = (b + best_phi_coarse) / 2
+                    c = b - (b - a) * GR
+                    d = a + (b - a) * GR
+                    continue
 
                 if cost_c < cost_d:
                     b = d
@@ -525,13 +491,11 @@ class RobotKinematics:
             if final_sol:
                 return final_sol + (th5_target,), f"{final_name} (φ={final_phi_norm:.2f}°)"
             else:
-                # Fallback: Jeśli optymalizacja z jakiegoś powodu "uciekła" w obszar błędu,
-                # zwracamy najlepszy wynik zgrubny (który na pewno był poprawny).
                 cost_rough, sol_rough, name_rough, phi_rough = evaluate_phi(best_phi_coarse)
                 if sol_rough:
                     return sol_rough + (th5_target,), f"{name_rough} (φ={phi_rough:.2f}°)"
                 
-                return None, "Błąd optymalizacji"
+                return None, f"Błąd optymalizacji (Best coarse: {best_phi_coarse}°) - Nie znaleziono rozwiązania metodą złotego podziału"
 
     def _construct_matrix(self, x, y, z, phi_deg):
         yaw = math.atan2(y, x)
@@ -589,9 +553,7 @@ class RobotKinematics:
 
         return (best_sol, best_name) if best_sol else (None, None)
     
-# =====================================================================
-# GUI APPLICATION
-# =====================================================================
+# -------------------------------- GUI APP ---------------------------------
 
 class RobotControlGUI:
     def __init__(self, root):
@@ -615,7 +577,7 @@ class RobotControlGUI:
         self.max_reach = self.kin.a2 + self.kin.a3 + math.atan2(self.kin.d5, self.kin.a4 + self.kin.d6)
         self.control_mode = tk.StringVar(value='position')
         
-        # Sterowanie kątami (ciągłe wysyłanie)
+        # Sterowanie kątami
         self.angle_send_timer = None
         self.angle_send_active = False
         self._collision_warning_shown = False
@@ -631,7 +593,7 @@ class RobotControlGUI:
         self.sequence_timer = None
         self.play_button = None 
         self.target_xyz = None 
-        self.POSITION_TOLERANCE = 5.0  # mm
+        self.POSITION_TOLERANCE = 10.0  # mm
 
         # Inicjalizacja GUI
         self.setup_ui()
@@ -642,7 +604,7 @@ class RobotControlGUI:
         self.root.after(100, self.connect_robot)
 
     def setup_ui(self):
-        # Definicja kolorów
+        # Kolory
         COLORS = {
             'BG': "#2f3347", 'FRAME': "#262a3e", 'BORDER': "#565a6c",
             'TEXT': "#c4cad0", 'ACCENT': "#101122", 'BTN': "#2f3347",
@@ -695,7 +657,7 @@ class RobotControlGUI:
         right_frame.grid(row=0, column=1, sticky="nswe", padx=(5, 0))
         
         # ================================================
-        # ============ ELEMENTY LEWEJ KOLUMNY ============
+        # ================= LEWA KOLUMNA =================
         # ================================================
         
         # 1. Status
@@ -766,10 +728,9 @@ class RobotControlGUI:
         
         for i, (key, label) in enumerate(joint_defs):
             ttk.Label(self.angle_control_frame, text=label).grid(row=i, column=0, sticky="w", pady=5)
-            # UŻYCIE LIMITÓW Z KLASY KINEMATYKI
             min_rad, max_rad = self.kin.limits[key]
             
-            slider = tk.Scale(self.angle_control_frame, from_=math.degrees(min_rad), to=math.degrees(max_rad),    
+            slider = tk.Scale(self.angle_control_frame, from_=math.degrees(min_rad  + math.pi/180), to=math.degrees(max_rad - math.pi/180),    
                               orient=tk.HORIZONTAL, resolution=0.01, length=200,
                               bg=COLORS['FRAME'], fg=COLORS['TEXT'], troughcolor=COLORS['BG'], highlightthickness=0, 
                               command=lambda val, k=key: self.on_angle_slider_change(k, val))
@@ -836,7 +797,7 @@ class RobotControlGUI:
         self._create_sequence_frame(self.content_frame, 8)
 
         # ================================================
-        # ============ ELEMENTY PRAWEJ KOLUMNY ===========
+        # ================= PRAWA KOLUMNA ===============
         # ================================================
 
         viz_frame = ttk.LabelFrame(right_frame, text="Wizualizacja 3D", padding="10")
@@ -866,7 +827,6 @@ class RobotControlGUI:
         self.switch_control_mode()
 
     def setup_3d_plot(self):
-        """Inicjalizacja statycznych elementów wykresu."""
         L_COL = "#c4cad0"
         self.ax.set_xlabel('X [mm]', color=L_COL)
         self.ax.set_ylabel('Y [mm]', color=L_COL)
@@ -891,7 +851,6 @@ class RobotControlGUI:
         self.canvas.draw()
 
     def update_3d_visualization(self):
-        """Odświeża pozycję ramienia na wykresie 3D."""
         try:
             # Usunięcie starych elementów (linii i strzałek)
             for artist in self.plot_artists:
@@ -917,7 +876,7 @@ class RobotControlGUI:
             lines = self.ax.plot(xs, ys, zs, 'o-', linewidth=2, markersize=6, color='#377df0', markerfacecolor='lightblue')
             tcp = self.ax.scatter([xs[-1]], [ys[-1]], [zs[-1]], c="#cb0000", s=50, edgecolors='darkred', linewidths=2)
             
-            # Wektory osi (Strzałki)
+            # Strzałki osi TCP
             len_vec = 40.0
             tcp_x, tcp_y, tcp_z = xs[-1], ys[-1], zs[-1]
             
@@ -948,8 +907,6 @@ class RobotControlGUI:
         self.log_text.see(tk.END)
 
     def update_position_display(self, angles=None, log_message=None):
-        """Callback z wątku serial."""
-        
         def _update_ui():
             if log_message:
                 if log_message == "#CONNECTION_LOST#":
@@ -972,7 +929,7 @@ class RobotControlGUI:
                 for i, axis in enumerate(['TCP_X', 'TCP_Y', 'TCP_Z']):
                     self.tcp_labels[axis].config(text=f"{current_xyz[i]:.2f}")
 
-        # Limitowanie częstotliwości odświeżania GUI (throttle)
+        # Limitowanie częstotliwości odświeżania GUI
         now = time.time() * 1000.0
         if log_message or (now - self.last_gui_update_time >= 200.0):
             self.last_gui_update_time = now
@@ -1009,11 +966,13 @@ class RobotControlGUI:
 
             self.log(f"IK dla: X={x}, Y={y}, Z={z}, R={roll}")
             cur_rads = [math.radians(a) for a in self.robot.get_current_angles()[:5]]
-            
-            sol, name = self.kin.solve_ik(x, y, z, tuple(cur_rads), phi_deg=phi, roll_deg=roll)
+
+            sol, info_msg = self.kin.solve_ik(x, y, z, tuple(cur_rads), phi_deg=phi, roll_deg=roll)
             
             if sol is None:
-                messagebox.showerror("Błąd IK", "Pozycja poza zasięgiem.")
+                error_text = info_msg if info_msg else "Nieznany błąd IK"
+                messagebox.showerror("Błąd IK", f"Nie znaleziono rozwiązania:\n{error_text}")
+                self.log(f"Błąd IK: {error_text}")
                 return
             
             pos = self.kin.get_joint_positions(*sol)
@@ -1027,7 +986,7 @@ class RobotControlGUI:
             
             ok, msg = self.robot.send_target_angles(*sol)
             if ok: 
-                self.log(f"Wysłano konfigurację: {name}")
+                self.log(f"Wysłano konfigurację: {info_msg}")
             else: 
                 messagebox.showerror("Błąd komunikacji", msg)
                 
@@ -1266,13 +1225,14 @@ class RobotControlGUI:
             cur = [math.radians(a) for a in self.robot.get_current_angles()[:5]]
             
             # Weryfikacja osiągalności przed dodaniem
-            sol, _ = self.kin.solve_ik(x, y, z, tuple(cur), phi_deg=phi, roll_deg=roll)
+            sol, info_msg = self.kin.solve_ik(x, y, z, tuple(cur), phi_deg=phi, roll_deg=roll)
             
             if sol:
                 self.sequence_data.append({"X":x, "Y":y, "Z":z, "Fi":phi if phi else 0, "Auto_Fi":auto,"Rol": roll,})
                 self._update_sequence_display()
+                self.log(f"Dodano punkt: {info_msg}")
             else:
-                messagebox.showerror("Błąd", "Pozycja nieosiągalna")
+                messagebox.showerror("Błąd", f"Pozycja nieosiągalna:\n{info_msg}")
         except ValueError: pass
 
     def add_current_angles_to_sequence(self):

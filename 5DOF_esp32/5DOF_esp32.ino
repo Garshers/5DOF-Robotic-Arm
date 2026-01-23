@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <AccelStepper.h>
+#include <ESP32Servo.h>
 
 // ==================== Podstawowe ustawienia ====================
 #define BAUD 115200
@@ -8,6 +9,7 @@
 
 // ======================= Piny silników ======================
 #define SERVO_PIN 13
+Servo gripperServo;
 
 #define STEP_X 17
 #define DIR_X 16
@@ -39,7 +41,7 @@ const float START_ANGLES[5] = {90.0, 90.0, 135.0, 135.0, 0.0};
 const bool ENCODER_INVERT[] = {true, false, false, true, false};
 const uint8_t ENCODER_CHANNEL[] = {4, 5, 6, 7, 3};
 const float ENCODER_LEVER[] = {2.0, 3.6, 4.5, 4.5, 4.0};
-const uint16_t ENCODER_ZPOS[] = {3777, 3982, 2763, 2415, 1800}; // -40
+const uint16_t ENCODER_ZPOS[] = {3777 + 45, 3982, 2763 + 135, 2415 + 40, 1800};
 int16_t rotationCount[] = {0, 0, 0, 0, 0};
 uint16_t lastRawAngle[] = {0, 0, 0, 0, 0};
 const float angleConst = 360.0 / 4096.0;
@@ -52,29 +54,29 @@ volatile float targetServoAngle = 0.0; // Stan serwonapędu
 volatile float currentServoAngle = 0.0;
 volatile bool newTargetAvailable = true;
 
+// ===================== Bufor komunikacyjny =======================
+#define RX_BUF_SIZE 64
+char inputBuffer[RX_BUF_SIZE];
+uint8_t inputIdx = 0;
+
 // ===================== Parametry sterowania ======================
 const bool AXIS_INVERT[] = {false, true, true, true, true};
 const float ANGLE_TOLERANCE = 0.05;
 const unsigned long ENCODER_READ_INTERVAL = 5;
 const unsigned long PYTHON_SEND_INTERVAL = 50;
 
-// Bufory komunikacji (tylko rdzeń 0)
-String serialBuffer = "";
-
 // Deklaracje funkcji (prototypy)
 void readSerialCommands();
 void parsePythonCommand(String cmd);
 void sendPositionToPython();
 void readEncoders();
-uint16_t getEncoderRawAngle(uint8_t channel);
+uint16_t getEncoderRawAngle(uint8_t channel); 
 void updateRotationCount(int axisIndex, uint16_t currentRaw);
-bool verifyHomingPosition();
+bool isStartPosition();
 void calibration(const char* axisNames[]);
 
-// =========================================================================
 // ----------------------------- RDZEŃ 0 -----------------------------------
 // ---------------------- KOMUNIKACJA I ENKODERY ---------------------------
-// =========================================================================
 
 void communicationTask(void *parameter) {
     unsigned long lastEncoderRead = 0;
@@ -84,125 +86,110 @@ void communicationTask(void *parameter) {
     
     while (true) {
         unsigned long now = millis();
-        
-        // ===== Odczyt komend z Pythona =====
+
+        // Odczyt komend z Pythona 
         readSerialCommands();
         
-        // ===== Odczyt enkoderów =====
+        // Odczyt enkoderów
         if (now - lastEncoderRead >= ENCODER_READ_INTERVAL) {
             lastEncoderRead = now;
             readEncoders();
         }
         
-        // ===== Wysyłanie pozycji do Pythona =====
+        // Wysyłanie pozycji do Pythona
         if (now - lastPythonSend >= PYTHON_SEND_INTERVAL) {
             lastPythonSend = now;
             sendPositionToPython();
         }
         
-        vTaskDelay(1); // Oddanie czasu procesorowi (1ms)
+        vTaskDelay(1); // Oddanie czasu WDT
     }
-}
-
+}   
+  
 void readSerialCommands() {
     while (Serial.available() > 0) {
         char c = Serial.read();
         
+        // Wykrycie końca linii (koniec ramki)
         if (c == '\n' || c == '\r') {
-            if (serialBuffer.length() > 0) {
-                parsePythonCommand(serialBuffer);
-                serialBuffer = "";
+            if (inputIdx > 0) {
+                inputBuffer[inputIdx] = '\0'; // Terminacja ciągu
+                parsePythonCommand(inputBuffer);
+                inputIdx = 0; // Reset indeksu
             }
         } else {
-            serialBuffer += c;
+            // Zabezpieczenie przed przepełnieniem bufora
+            if (inputIdx < RX_BUF_SIZE - 1) {
+                inputBuffer[inputIdx] = c;
+                inputIdx++;
+            }
         }
     }
 }
 
-byte calculateChecksum(String data) {
-    // Funkcja pomocnicza do obliczania sumy kontrolnej XOR
+byte calculateChecksum(const char* data) {
     byte checksum = 0;
-    for (int i = 0; i < data.length(); i++) {
-        checksum ^= data.charAt(i);
+    while (*data) {
+        checksum ^= *data++;
     }
     return checksum;
 }
 
-void parsePythonCommand(String cmd) {
-    cmd.trim();
-    
-    // Weryfikacja integralności danych (Suma kontrolna)
-    int starIdx = cmd.lastIndexOf('*');
-    if (starIdx == -1) return; // Odrzuć ramkę, jeśli brak separatora sumy kontrolnej
+void parsePythonCommand(char* cmd) {
+    // 1. Weryfikacja sumy kontrolnej
+    char* starPtr = strrchr(cmd, '*');
+    if (starPtr == NULL) return; // Brak separatora sumy
 
-    String payload = cmd.substring(0, starIdx);
-    String receivedChecksumHex = cmd.substring(starIdx + 1);
-    
-    byte calculatedChecksum = calculateChecksum(payload);
-    byte receivedChecksum = (byte) strtol(receivedChecksumHex.c_str(), NULL, 16);
+    *starPtr = '\0'; // Rozdzielenie payloadu od sumy (wpisanie null terminator w miejsce *)
+    char* checksumStr = starPtr + 1; // Wskaźnik na tekst sumy kontrolnej
+
+    byte calculatedChecksum = calculateChecksum(cmd);
+    byte receivedChecksum = (byte) strtol(checksumStr, NULL, 16);
     
     if (calculatedChecksum != receivedChecksum) {
         Serial.println("Error: Checksum mismatch!"); 
-        return; // Odrzuć ramkę w przypadku błędu transmisji
+        return; 
     }
     
-    int startIdx = 0;
+    // 2. Parsowanie danych (tokenizacja)
     bool validCommand = false;
     float newTargets[5];
     float newServo;
     
-    // Kopiuj aktualne cele
+    // Pobranie aktualnych celów, aby nie nadpisać niezmienianych osi
     if (xSemaphoreTake(xMutex, portMAX_DELAY)) {
-        // Bezpieczny dostęp do danych współdzielonych tworząc lokalne kopie
         memcpy(newTargets, (void*)targetAngles, sizeof(newTargets));
         newServo = targetServoAngle;
-        xSemaphoreGive(xMutex); // Zwolnienie blokady
+        xSemaphoreGive(xMutex);
     }
     
-    // Parsowanie (Operujemy na zweryfikowanym 'payload', a nie surowym 'cmd')
-    while (startIdx < payload.length()) {
-        int commaIdx = payload.indexOf(',', startIdx);
-        String axisData;
-        
-        if (commaIdx == -1) {
-            axisData = payload.substring(startIdx);
-            startIdx = payload.length();
-        } else {
-            axisData = payload.substring(startIdx, commaIdx);
-            startIdx = commaIdx + 1;
+    char* token = strtok(cmd, ","); // Pobierz pierwszy token
+    
+    while (token != NULL) {
+        // Format tokena np: "X12.5"
+        if (strlen(token) >= 2) {
+            char axis = token[0];
+            float val = atof(token + 1); // Konwersja od drugiego znaku
+            
+            switch (axis) {
+                case 'X': case 'x':
+                    newTargets[4] = val; validCommand = true; break;
+                case 'Y': case 'y': // Sprzężenie kinematyczne Y/A
+                    newTargets[3] = val; 
+                    newTargets[2] = val; 
+                    validCommand = true; break;
+                case 'Z': case 'z':
+                    newTargets[1] = val; validCommand = true; break;
+                case 'E': case 'e':
+                    newTargets[0] = val; validCommand = true; break;
+                case 'S': case 's':
+                    newServo = val; validCommand = true; break;
+            }
         }
-        
-        if (axisData.length() < 2) continue;
-        
-        char axis = axisData.charAt(0);
-        float relativeAngle = axisData.substring(1).toFloat();
-        
-        switch (axis) {
-            case 'X': case 'x':
-                newTargets[4] = relativeAngle;
-                validCommand = true;
-                break;
-            case 'Y': case 'y':
-                newTargets[3] = relativeAngle;
-                newTargets[2] = relativeAngle;
-                validCommand = true;
-                break;
-            case 'Z': case 'z':
-                newTargets[1] = relativeAngle;
-                validCommand = true;
-                break;
-            case 'E': case 'e':
-                newTargets[0] = relativeAngle;
-                validCommand = true;
-                break;
-            case 'S': case 's':
-                newServo = relativeAngle;       
-                validCommand = true; 
-                break;
-        }
+        token = strtok(NULL, ","); // Pobierz kolejny token
     }
     
-    // Zapisz nowe cele (chronione mutexem)
+    // 3. Aktualizacja zmiennych sterujących
     if (validCommand) {
         if (xSemaphoreTake(xMutex, portMAX_DELAY)) {
             memcpy((void*)targetAngles, newTargets, sizeof(newTargets));
@@ -211,8 +198,7 @@ void parsePythonCommand(String cmd) {
             xSemaphoreGive(xMutex);
         }
         
-        Serial.println("Nowe kąty docelowe:");
-        Serial.printf("   E=%.2f° Z=%.2f° Y=%.2f° X=%.2f°\n", 
+        Serial.printf("Nowe cele: E=%.2f Z=%.2f Y=%.2f X=%.2f\n", 
                       newTargets[0], newTargets[1], newTargets[3], newTargets[4]);
     }
 }
@@ -221,28 +207,28 @@ void sendPositionToPython() {
     float angles[5];
     float srv;
     
-    // Bezpieczne skopiowanie danych
     if (xSemaphoreTake(xMutex, portMAX_DELAY)) {
         memcpy(angles, (void*)currentAngles, sizeof(angles));
         srv = currentServoAngle;
         xSemaphoreGive(xMutex);
     }
     
-    String frame = "<";
-    frame += "S" + String(srv, 2) + ",";
-    frame += "E" + String(angles[0], 2) + ",";
-    frame += "Z" + String(angles[1], 2) + ",";
-    frame += "Y" + String(angles[2], 2) + ",";
-    frame += "A" + String(angles[3], 2) + ",";
-    frame += "X" + String(angles[4], 2);
-    frame += ">";
+    char txBuffer[128]; // Statyczny bufor nadawczy
     
-    Serial.println(frame);
+    // Formatowanie ramki: <Sval,Eval,Zval,Yval,Aval,Xval>
+    int len = snprintf(txBuffer, sizeof(txBuffer), 
+             "<S%.2f,E%.2f,Z%.2f,Y%.2f,A%.2f,X%.2f>",
+             srv, angles[0], angles[1], angles[2], angles[3], angles[4]);
+             
+    if (len > 0) {
+        Serial.println(txBuffer);
+    }
 }
 
 void readEncoders() {
     #if SIMULATION_MODE
-        // SYMULACJA
+        // SYMULACJA - wykorzystywana do programowania części python bez 
+        // dostępu do manipulatora (konieczne jest podpięcie do esp) 
         static uint32_t lastUpdate = 0;
         uint32_t now = millis();
         float dt = (now - lastUpdate) / 1000.0;
@@ -257,12 +243,11 @@ void readEncoders() {
         float tempCurrent[5], tempTarget[5];
         float tempServoCur, tempServoTar;
 
-        // 1. Pobranie danych
+        // Pobranie danych
         if (xSemaphoreTake(xMutex, portMAX_DELAY)) {
             memcpy(tempCurrent, (void*)currentAngles, sizeof(tempCurrent));
             memcpy(tempTarget, (void*)targetAngles, sizeof(tempTarget));
             
-            // [POPRAWKA] Pobranie stanu serwa
             tempServoCur = currentServoAngle;
             tempServoTar = targetServoAngle;
             
@@ -282,7 +267,7 @@ void readEncoders() {
             }
         }
 
-        // 3. Symulacja Serwa
+        // Symulacja Serwa
         float servoSpeed = 240.0;
         float sDiff = tempServoTar - tempServoCur;
         
@@ -294,7 +279,7 @@ void readEncoders() {
             else tempServoCur += max(sDiff, -step);
         }
 
-        // 4. Zapisanie wyników symulacji
+        // Zapisanie wyników symulacji
         if (xSemaphoreTake(xMutex, portMAX_DELAY)) {
             memcpy((void*)currentAngles, tempCurrent, sizeof(tempCurrent));
             currentServoAngle = tempServoCur;
@@ -334,46 +319,41 @@ void readEncoders() {
     #endif
 }
 
-// =========================================================================
 // ------------------------------ RDZEŃ 1 ----------------------------------
 // ------------------------ STEROWANIE SILNIKAMI ---------------------------
-// =========================================================================
 
 void motorControlTask(void *parameter) {
     long targetSteps[5] = {0, 0, 0, 0, 0};
     float localTargetAngles[5];
     float localCurrentAngles[5];
     float stepsPerDegree[5];
-    
-    // ================== KONFIGURACJA BACKLASH (LUZU) ==================
-    const float BACKLASH_X_DEG = 1.3;       
-    
-    // Zmienne stanu dla kompensacji (Static, aby pamiętały stan między pętlami)
-    static float lastTargetX = 0.0;         // Poprzedni cel (do wykrywania kierunku zmian)
-    static float activeBacklashX = 0.0;     // Aktualnie przyłożony offset (stały dla danego ruchu)
-    static bool isFirstRun = true;          // Do inicjalizacji przy starcie
+    float localTargetServo = 0.0;
+    float localCurrentServo = 0.0;
 
-    const float KP_MAIN = 1.0;              
-    const float KP_SLAVE_TRACKING = 1.0;    
-    const float KP_SLAVE_SYNC = 0.15;       
+    // Zmienne stanu dla kompensacji osi X
+    const float BACKLASH_X_DEG = 1.3; 
+    static float lastTargetX = 0.0;
+    static float activeBacklashX = 0.0;
+    static bool isFirstRun = true;
+
+    const float KP_MAIN = 1.0;          // Wzmocnienie proporcjonalne dla osi          
+    const float KP_SLAVE_TRACKING = 1.0;// Wzmocnienie śledzenia osi Slave
+    const float KP_SLAVE_SYNC = 0.15;   // Wzmocnienie błędu synchronizacji    
     
-    const float SYNC_DEADBAND = 0.05;       
-    const float SYNC_MAX_CORRECTION = 2.0;  
+    const float SYNC_DEADBAND = 0.05;       // Strefa nieczułości dla błędu synchronicznego
+    const float SYNC_MAX_CORR = 2.0;  // Siła korekty  
     
-    const float CRIT_ZONE_MIN = 0.0;
-    const float CRIT_ZONE_MAX = 45.0;
-    const float CRIT_ZONE_DAMPING = 0.5; 
-    
-    unsigned long lastAxisCorrectionTime[5] = {0, 0, 0, 0, 0};
-    const unsigned long CORRECTION_INTERVAL = 20; 
+    unsigned long lastAxisCorrTime[5] = {0, 0, 0, 0, 0};
+    const unsigned long CORR_INTERVAL = 20; // Okres próbkowania regulatora
     
     AccelStepper* motors[5] = {&motorE, &motorZ, &motorY, &motorA, &motorX};
 
+    // Konfiguracja kinematyki i profilowanie
     const float STEPS_PER_REV = 200.0;  
-    const float MICROSTEPS = 16.0;     
+    const float MICROSTEPS = 64.0;     
     const float STEPS_PER_MOTOR_REV = STEPS_PER_REV * MICROSTEPS; 
-    const long MAX_CORRECTION_STEPS = long(STEPS_PER_MOTOR_REV / 36); 
-    float baseSpeed = 5.0 * STEPS_PER_MOTOR_REV;
+    const long MAX_CORR_STEPS = long(STEPS_PER_MOTOR_REV / 9); 
+    float baseSpeed = 2.0 * STEPS_PER_MOTOR_REV;
     float baseAcceleration = baseSpeed / 8.0;
     
     for(int i=0; i<5; i++) {
@@ -390,14 +370,16 @@ void motorControlTask(void *parameter) {
     while (true) {
         unsigned long currentMillis = millis();
 
-        // ===== 1. Pobieranie danych i OBSŁUGA LOGIKI BACKLASH =====
+        // ===== Pobieranie danych i obsługa backlash osi X =====
         if (xSemaphoreTake(xMutex, 10 / portTICK_PERIOD_MS)) {
             if (newTargetAvailable) {
                 // Kopiujemy nowe cele
                 memcpy(localTargetAngles, (void*)targetAngles, sizeof(localTargetAngles));
                 newTargetAvailable = false;
+
+                currentServoAngle = localCurrentServo;
                 
-                // === Obsługa backlash osi X ===
+                // Obsługa backlash osi X
                 float newX = localTargetAngles[4];
                 
                 if (isFirstRun) {
@@ -406,7 +388,7 @@ void motorControlTask(void *parameter) {
                 }
 
                 // Porównujemy nowy cel z poprzednim zapamiętanym
-                if (abs(newX - lastTargetX) > 0.01) { // Tolerancja na float
+                if (abs(newX - lastTargetX) > 0.1) { // Tolerancja na float
                     if (newX > lastTargetX) {
                         activeBacklashX = BACKLASH_X_DEG;   // Ruch w stronę dodatnią
                     } 
@@ -423,36 +405,38 @@ void motorControlTask(void *parameter) {
             xSemaphoreGive(xMutex);
         }
         
-        // ===== 2. Sterowanie w pętli zamkniętej =====
+        // ===== Sterowanie silnikami krokowymi oraz serwomechanizmem =====
+        if (abs(localTargetServo - localCurrentServo) > 0.5) {
+            gripperServo.write((int)localTargetServo); // Zapis do sprzętu
+            localCurrentServo = localTargetServo;      // Aktualizacja stanu
+        }
+
         for (int i = 0; i < 5; i++) {
             if (i == 3) continue; // Pomiń Slave A
             
-            if (currentMillis - lastAxisCorrectionTime[i] < CORRECTION_INTERVAL) {
+            if (currentMillis - lastAxisCorrTime[i] < CORR_INTERVAL) {
                 continue;
             }
 
-            // Ustalenie efektywnego celu
+            // Obliczanie odchyłki od celu
             float effectiveTarget = localTargetAngles[i];
-            
-            // DLA OSI X: Dodaj obliczony wcześniej stały offset
-            if (i == 4) {
+            if (i == 4) { //Oś X
                 effectiveTarget += activeBacklashX;
             }
-
-            // Obliczenie błędu względem zmodyfikowanego celu
             float error = effectiveTarget - localCurrentAngles[i];
 
+            // =============== Regulator P ===============
             if (abs(error) > ANGLE_TOLERANCE) {
                 
-                long stepsCorrection = (long)(error * KP_MAIN * stepsPerDegree[i]);
+                long stepsCorr = (long)(error * KP_MAIN * stepsPerDegree[i]);
                 
-                stepsCorrection = constrain(stepsCorrection, -MAX_CORRECTION_STEPS, MAX_CORRECTION_STEPS);
+                stepsCorr = constrain(stepsCorr, -MAX_CORR_STEPS, MAX_CORR_STEPS);
 
                 if (AXIS_INVERT[i]) {
-                    stepsCorrection = -stepsCorrection;
+                    stepsCorr = -stepsCorr;
                 }
 
-                motors[i]->moveTo(motors[i]->currentPosition() + stepsCorrection);
+                motors[i]->moveTo(motors[i]->currentPosition() + stepsCorr);
                 
                 // --- LOGIKA MASTER-SLAVE DLA OSI A ---
                 if (i == 2) {
@@ -460,44 +444,40 @@ void motorControlTask(void *parameter) {
                     float syncDeviation = localCurrentAngles[2] - localCurrentAngles[3];
                     
                     float syncCorr = 0.0;
+
+                    // Strefa nieczułości
                     if (abs(syncDeviation) > SYNC_DEADBAND) {
                         float effectiveError = (syncDeviation > SYNC_DEADBAND) ? 
                                                (syncDeviation - SYNC_DEADBAND) : 
                                                (syncDeviation + SYNC_DEADBAND);
                         syncCorr = effectiveError * KP_SLAVE_SYNC;
-                        syncCorr = constrain(syncCorr, -SYNC_MAX_CORRECTION, SYNC_MAX_CORRECTION);
+                        syncCorr = constrain(syncCorr, -SYNC_MAX_CORR, SYNC_MAX_CORR);
                     }
                     
-                    float currentMasterAngle = localCurrentAngles[2];
-                    if (currentMasterAngle >= CRIT_ZONE_MIN && currentMasterAngle <= CRIT_ZONE_MAX) {
-                        syncCorr = 0.5 * CRIT_ZONE_DAMPING;
-                    }
-                    
-                    float totalCorrectionA = errorA * KP_SLAVE_TRACKING + syncCorr;
-                    long stepsCorrectionA = (long)(totalCorrectionA * stepsPerDegree[3]);
-                    stepsCorrectionA = constrain(stepsCorrectionA, -MAX_CORRECTION_STEPS, MAX_CORRECTION_STEPS);
+                    // Całkowity sygnał sterujący dla Slave
+                    float totalCorrA = errorA * KP_SLAVE_TRACKING + syncCorr;
+                    long stepsCorrA = (long)(totalCorrA * stepsPerDegree[3]);
+                    stepsCorrA = constrain(stepsCorrA, -MAX_CORR_STEPS, MAX_CORR_STEPS);
 
-                    if (AXIS_INVERT[3]) stepsCorrectionA = -stepsCorrectionA;
+                    if (AXIS_INVERT[3]) stepsCorrA = -stepsCorrA;
 
-                    motors[3]->moveTo(motors[3]->currentPosition() + stepsCorrectionA);
+                    motors[3]->moveTo(motors[3]->currentPosition() + stepsCorrA);
                 }
                 
-                lastAxisCorrectionTime[i] = currentMillis;
+                lastAxisCorrTime[i] = currentMillis;
             }
         }
         
-        // ===== 3. Wykonanie kroków =====
+        // Wykonanie kroków - MUSI BYĆ JAK NAJCZĘŚCIEJ
         for(int i=0; i<5; i++) {
             motors[i]->run();
         }
         
-        yield();
+        yield(); // oddanie WDT
     }
 }
 
-// =========================================================================
 // ---------------------------- SETUP I LOOP -------------------------------
-// =========================================================================
 
 void setup() {
     Serial.begin(BAUD);
@@ -531,14 +511,14 @@ void setup() {
         Serial.println("BŁĄD: Nie można utworzyć mutexu!");
         while(1);
     }
-    
+
     // Kalibracja enkoderów
     Serial.println("Kalibracja enkoderów...");
 
     // === funkcja weryfikująca pozycję startową ===
-    if (!verifyHomingPosition()) {
+    if (!isStartPosition()) {
         Serial.println("BŁĄD KRYTYCZNY: Robot nie jest w pozycji startowej (krańcówki nienaciśnięte)!");
-        while(!verifyHomingPosition()) vTaskDelay(1000);
+        while(!isStartPosition()) vTaskDelay(1000);
     }
 
     const char* axisNames[] = {"E", "Z", "Y", "A", "X"};    
@@ -560,7 +540,10 @@ void setup() {
         vTaskDelay(100);
     }
     
-    
+    // Inicjalizacja serwo
+    gripperServo.attach(SERVO_PIN); 
+    gripperServo.write(0);
+
     // Uruchomienie tasków na osobnych rdzeniach
     Serial.println("Uruchamianie tasków...");
     
@@ -590,12 +573,12 @@ void setup() {
     Serial.println("System uruchomiony!");
 }
 
-bool verifyHomingPosition() {
+bool isStartPosition() {
     bool allLimitsPressed = true;
-    //if (digitalRead(LIMIT_Y_PIN) != LOW) {  
-    //    Serial.println("Limit Y nieaktywny!");
-    //    allLimitsPressed = false;
-    //}
+    /*if (digitalRead(LIMIT_Y_PIN) != LOW) {  
+        Serial.println("Limit Y nieaktywny!");
+        allLimitsPressed = false;
+    }*/
     if (digitalRead(LIMIT_Z_PIN) != LOW) {
         Serial.println("Limit Z nieaktywny!");
         allLimitsPressed = false;
@@ -612,27 +595,105 @@ bool verifyHomingPosition() {
     return allLimitsPressed;
 }
 
+void calibrateX() {
+    Serial.println(F("\nRozpoczynanie sekwencji bazowania osi X"));
+    
+    motorX.setMaxSpeed(400);
+    motorX.setAcceleration(500);
+
+    // 1. Lewy ogranicznik
+    Serial.println(F("Szukanie lewej krancowki: "));
+    motorX.setSpeed(-200); 
+    
+    while (digitalRead(LIMIT_X_PIN) == HIGH) { 
+        motorX.runSpeed();
+        vTaskDelay(1); 
+    }
+    motorX.stop();
+    vTaskDelay(500); 
+    
+    uint16_t rawMin = getEncoderRawAngle(ENCODER_CHANNEL[4]); 
+    Serial.printf("MIN RAW: %d\n", rawMin);
+
+    // Bezpieczny odjazd
+    motorX.move(300);
+    while (motorX.distanceToGo() != 0) {
+        motorX.run();
+        vTaskDelay(1);
+    }
+
+    // 2. Prawy ogranicznik
+    Serial.println(F("Szukanie prawej krancowki: "));
+    motorX.setSpeed(200); 
+    
+    while (digitalRead(LIMIT_X_PIN) == HIGH) {
+        motorX.runSpeed();
+        vTaskDelay(1);
+    }
+    motorX.stop();
+    vTaskDelay(500);
+    
+    uint16_t rawMax = getEncoderRawAngle(ENCODER_CHANNEL[4]);
+    Serial.printf("MAX RAW: %d\n", rawMax);
+
+    // 3. Obliczenie środka z uwzględnieniem przejścia przez zero
+    long virtualMax = rawMax;
+
+    if (virtualMax < rawMin) {
+        virtualMax += 4096; // Korekta obrotu
+    }
+
+    long centerRaw = (long(rawMin) + virtualMax) / 2;
+
+    // Normalizacja do zakresu 12-bit
+    if (centerRaw >= 4096) {
+        centerRaw -= 4096;
+    }
+    
+    Serial.printf("[WYNIK] Obliczony XOffset: %ld\n", centerRaw);
+}
+
 void calibration(const char* axisNames[]) {
     unsigned long lastPrint = 0;
     
+    Serial.println(F("Wyslij 'x' aby uruchomic bazowanie osi X."));
+    
+    // Statyczny bufor dla logów - wystarczający na 5 osi
+    char logBuffer[128]; 
+
     while (true) { 
+        if (Serial.available() > 0) {
+            char cmd = Serial.read();
+            if (cmd == 'x' || cmd == 'X') {
+                calibrateX();
+            }
+        }
+
         if (millis() - lastPrint >= 500) {
             lastPrint = millis();
-            String output = "";
             
+            // Wyczyszczenie bufora i przygotowanie wskaźnika przesunięcia
+            int offset = 0;
+            logBuffer[0] = '\0';
+
             for (int i = 0; i < 5; i++) {
-                // Wywołanie funkcji odczytującej surowy kąt
                 uint16_t rawAngle = getEncoderRawAngle(ENCODER_CHANNEL[i]); 
                 
+                // Bezpieczne dopisywanie do bufora (append)
                 if (rawAngle != 0xFFFF) {
-                    output += String(axisNames[i]) + ":" + String(rawAngle) + " ";
+                    offset += snprintf(logBuffer + offset, sizeof(logBuffer) - offset, 
+                                       "%s:%d ", axisNames[i], rawAngle);
                 } else {
-                    output += String(axisNames[i]) + ": ERROR ";
+                    offset += snprintf(logBuffer + offset, sizeof(logBuffer) - offset, 
+                                       "%s:ERROR ", axisNames[i]);
                 }
+                
+                // Zabezpieczenie przed wyjściem poza bufor
+                if (offset >= sizeof(logBuffer)) break; 
             }
-            
-            Serial.println(output);
+            Serial.println(logBuffer);
         }
+        vTaskDelay(10);
     }
 }
 
@@ -640,9 +701,7 @@ void loop() { // Wszystko dzieje się w taskach
  // Zostawiamy puste
 } 
 
-// =========================================================================
 // ------------------------ FUNKCJE ENKODERÓW ------------------------------
-// =========================================================================
 
 bool selectI2CChannel(uint8_t channel) {
     Wire.beginTransmission(0x70);
