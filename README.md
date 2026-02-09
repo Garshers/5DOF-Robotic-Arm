@@ -33,20 +33,45 @@ The software is divided into two primary layers to ensure low latency and a rich
 
 ---
 
-## Mathematical Foundations
+## Control Theory and System Implementation
 
-### Forward Kinematics (DH Notation)
-The spatial configuration is defined by the transformation matrix $A_i$:
+### 1. Kinematic Solution Verification and Selection
+The system does not only calculate potential positions but actively filers them through a rigorous verification engine. The `solve_ik` module ensures operational stability by:
+* **Eliminating Unreachable Solutions:** Automatic rejection of coordinates outside the mechanical workspace or joint limits.
+* **Optimal Configuration Selection:** When multiple solutions exist (e.g., different elbow orientations), the algorithm selects the one that:
+    * **Minimizes Displacement:** Chooses the configuration closest to the current joint state to ensure fluid motion.
+    * **Avoids Singularities:** Identifies and bypasses configurations where the manipulator loses a degree of freedom.
+    * **Respects Range Constraints:** Ensures no motor exceeds its physical hard-stops.
 
-$$A_i = \begin{bmatrix} \cos\theta_i & -\sin\theta_i\cos\alpha_i & \sin\theta_i\sin\alpha_i & a_i\cos\theta_i \\ \sin\theta_i & \cos\theta_i\cos\alpha_i & -\cos\theta_i\sin\alpha_i & a_i\sin\theta_i \\ 0 & \sin\alpha_i & \cos\alpha_i & d_i \\ 0 & 0 & 0 & 1 \end{bmatrix}$$
+### 2. Communication Protocol (NMEA 0183 Standard)
+To ensure data integrity between the Python GUI and the ESP32, the system implements a communication fail-safe based on the industrial **NMEA 0183** standard:
+* **Input Validation:** Every incoming packet is verified for structural correctness before processing.
+* **Checksum Mechanism:** A high-reliability 8-bit XOR checksum is calculated for all data characters preceding the `*` separator. If the calculated checksum does not match the transmitted value, the command is discarded to prevent erratic movements.
 
-The total transformation from base to end-effector is:
-$$T_5^0 = A_1 A_2 A_3 A_4 A_5$$
+### 3. Advanced Motor Control
+* **Proportional Controller:** Used for precise position tracking and smooth velocity ramping.
+* **Backlash Compensation:** The software includes an offset-correction algorithm to compensate for mechanical play (backlash) in the gearboxes, significantly increasing the precision of the TCP (Tool Center Point) positioning.
 
-### Inverse Kinematics
-To enable Cartesian control, the base angle is first isolated:
-$$\theta_1 = \operatorname{atan2}(Y, X)$$
-The remaining joint angles ($\theta_2, \theta_3, \theta_4$) are solved using the Law of Cosines within the radial plane, ensuring instantaneous calculation without the need for iterative numerical solvers.
+### 4. Master-Slave Synchronization
+The architecture utilizes a **Master-Slave** implementation to manage multi-axis coordination. The system continuously monitors the execution state of each joint and applies **desynchronization correction** to ensure that all 5 axes reach their target waypoints simultaneously, preventing path distortion during complex moves.
+
+### 5. Orientation Optimization Algorithm
+In automatic mode, where the effector orientation angle ($\phi$) is not manually defined, the system performs a one-dimensional optimization to find the most efficient approach:
+* **Global Search (Exploration):** The system iteratively scans the $[-180^\circ, 180^\circ]$ range with a $1^\circ$ step to identify the global minimum and discard mechanically unreachable zones.
+* **Golden Section Search:** Once a coarse global minimum is found, the algorithm narrows the window to $\pm 2.0^\circ$ and applies the Golden Section Search method. This achieves a final precision of $0.01^\circ$ without excessive CPU load, ensuring a perfectly optimized grip orientation.
+
+### 6. Sequential Motion and Path Planning
+The system implements a **Teach-In** programming method, allowing users to define complex trajectories:
+* **Point-To-Point (PTP) Execution:** The robot moves through a list of waypoints stored in the `sequence_data` vector.
+* **Programming Modes:**
+    * **Cartesian Space (XYZ):** User defines $X, Y, Z$ and orientation. The system runs real-time IK verification before saving the point.
+    * **Joint Space ($\theta_1 \dots \theta_5$):** Direct manipulation of joint angles via sliders for maximum manual control.
+* **Persistence:** Sequences are serialized into **JSON** format, allowing for saving, loading, and sharing motion profiles across different sessions via `save_sequence_to_json` and `load_sequence_from_json`.
+
+---
+
+## Summary
+The developed system successfully integrates a 5-DOF manipulator with a dual-layer control architecture, combining advanced orientation optimization with robust industrial communication standards. Through the application of a hybrid optimization algorithm and real-time kinematic verification, the project achieves high-precision motion execution and reliable sequential programming.
 
 ---
 
