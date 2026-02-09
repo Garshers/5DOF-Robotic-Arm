@@ -38,10 +38,10 @@ AccelStepper motorE(AccelStepper::DRIVER, STEP_E, DIR_E);
 
 // ===================== Konfiguracja enkoderów [E, Z, Y, A, X] ======================
 const float START_ANGLES[5] = {90.0, 90.0, 135.0, 135.0, 0.0}; 
-const bool ENCODER_INVERT[] = {true, false, false, true, false};
+const bool ENCODER_INVERT[] = {true, false, true, true, false};
 const uint8_t ENCODER_CHANNEL[] = {4, 5, 6, 7, 3};
 const float ENCODER_LEVER[] = {2.0, 3.6, 4.5, 4.5, 4.0};
-const uint16_t ENCODER_ZPOS[] = {3777 + 45, 3982, 2763 + 135, 2415 + 40, 1800};
+const uint16_t ENCODER_ZPOS[] = {3822, 3982, 1280+20, 2908+20, 1800};
 int16_t rotationCount[] = {0, 0, 0, 0, 0};
 uint16_t lastRawAngle[] = {0, 0, 0, 0, 0};
 const float angleConst = 360.0 / 4096.0;
@@ -81,14 +81,34 @@ void calibration(const char* axisNames[]);
 void communicationTask(void *parameter) {
     unsigned long lastEncoderRead = 0;
     unsigned long lastPythonSend = 0;
+
+    // Zapobiega zawieszeniu
+    Wire.setTimeOut(10); 
     
     Serial.println("Rdzeń 0: Task komunikacyjny uruchomiony");
     
     while (true) {
         unsigned long now = millis();
 
-        // Odczyt komend z Pythona 
-        readSerialCommands();
+        // Odczyt komend z Pythona
+        int maxBytes = 64; 
+        while (Serial.available() > 0 && maxBytes > 0) {
+            char c = Serial.read();
+            
+            if (c == '\n' || c == '\r') {
+                if (inputIdx > 0) {
+                    inputBuffer[inputIdx] = '\0';
+                    parsePythonCommand(inputBuffer);
+                    inputIdx = 0;
+                }
+            } else {
+                if (inputIdx < RX_BUF_SIZE - 1) {
+                    inputBuffer[inputIdx] = c;
+                    inputIdx++;
+                }
+            }
+            maxBytes--;
+        }
         
         // Odczyt enkoderów
         if (now - lastEncoderRead >= ENCODER_READ_INTERVAL) {
@@ -104,8 +124,8 @@ void communicationTask(void *parameter) {
         
         vTaskDelay(1); // Oddanie czasu WDT
     }
-}   
-  
+}
+
 void readSerialCommands() {
     while (Serial.available() > 0) {
         char c = Serial.read();
@@ -197,6 +217,8 @@ void parsePythonCommand(char* cmd) {
             newTargetAvailable = true;
             xSemaphoreGive(xMutex);
         }
+
+        Serial.println("CMD_OK");
         
         Serial.printf("Nowe cele: E=%.2f Z=%.2f Y=%.2f X=%.2f\n", 
                       newTargets[0], newTargets[1], newTargets[3], newTargets[4]);
@@ -336,15 +358,15 @@ void motorControlTask(void *parameter) {
     static float activeBacklashX = 0.0;
     static bool isFirstRun = true;
 
-    const float KP_MAIN = 1.0;          // Wzmocnienie proporcjonalne dla osi          
-    const float KP_SLAVE_TRACKING = 1.0;// Wzmocnienie śledzenia osi Slave
+    const float KP_MAIN = 0.8;          // Wzmocnienie proporcjonalne dla osi          
+    const float KP_SLAVE_TRACKING = 0.8;// Wzmocnienie śledzenia osi Slave
     const float KP_SLAVE_SYNC = 0.15;   // Wzmocnienie błędu synchronizacji    
     
-    const float SYNC_DEADBAND = 0.05;       // Strefa nieczułości dla błędu synchronicznego
-    const float SYNC_MAX_CORR = 2.0;  // Siła korekty  
+    const float SYNC_DEADBAND = 0.2;       // Strefa nieczułości dla błędu synchronicznego
+    const float SYNC_MAX_CORR = 0.8;  // Siła korekty  
     
     unsigned long lastAxisCorrTime[5] = {0, 0, 0, 0, 0};
-    const unsigned long CORR_INTERVAL = 20; // Okres próbkowania regulatora
+    const unsigned long CORR_INTERVAL = 10; // Okres próbkowania regulatora
     
     AccelStepper* motors[5] = {&motorE, &motorZ, &motorY, &motorA, &motorX};
 
@@ -355,6 +377,13 @@ void motorControlTask(void *parameter) {
     const long MAX_CORR_STEPS = long(STEPS_PER_MOTOR_REV / 9); 
     float baseSpeed = 2.0 * STEPS_PER_MOTOR_REV;
     float baseAcceleration = baseSpeed / 8.0;
+    const float AXIS_LIMITS[5][2] = {
+        {-90.0, 90.0}, // Oś E
+        {-90.0, 90.0}, // Oś Z
+        {0.0,  135.0}, // Oś Y
+        {0.0,  135.0}, // Oś A
+        {-90.0, 90.0}  // Oś X
+    };
     
     for(int i=0; i<5; i++) {
         motors[i]->setMaxSpeed(baseSpeed * ENCODER_LEVER[i]);
@@ -365,21 +394,30 @@ void motorControlTask(void *parameter) {
     // Inicjalizacja zmiennej startowej dla X (żeby nie szarpnęło przy starcie)
     lastTargetX = START_ANGLES[4];
 
-    Serial.println("Rdzeń 1: Task sterowania uruchomiony (Logika: Target Hysteresis)");
+    Serial.println("Rdzeń 1: Task sterowania uruchomiony (Logika: Target Hysteresis + Soft Limits)");
     
     while (true) {
         unsigned long currentMillis = millis();
 
-        // ===== Pobieranie danych i obsługa backlash osi X =====
+        // ===== Pobieranie danych, limitowanie i obsługa backlash osi X =====
         if (xSemaphoreTake(xMutex, 10 / portTICK_PERIOD_MS)) {
             if (newTargetAvailable) {
-                // Kopiujemy nowe cele
+                // 1. Kopiujemy surowe nowe cele
                 memcpy(localTargetAngles, (void*)targetAngles, sizeof(localTargetAngles));
                 newTargetAvailable = false;
 
+                // 2. Aplikacja limitów programowych (Clamping)
+                for (int i = 0; i < 5; i++) {
+                    if (localTargetAngles[i] < AXIS_LIMITS[i][0]) {
+                        localTargetAngles[i] = AXIS_LIMITS[i][0];
+                    } else if (localTargetAngles[i] > AXIS_LIMITS[i][1]) {
+                        localTargetAngles[i] = AXIS_LIMITS[i][1];
+                    }
+                }
+
                 currentServoAngle = localCurrentServo;
                 
-                // Obsługa backlash osi X
+                // 3. Obsługa backlash osi X (na podstawie zweryfikowanych limitów)
                 float newX = localTargetAngles[4];
                 
                 if (isFirstRun) {
@@ -761,5 +799,4 @@ void updateRotationCount(int axisIndex, uint16_t currentRaw) {
         rotationCount[axisIndex]--;
     }
     
-    lastRawAngle[axisIndex] = currentRaw;
-}
+    lastRawAngle[axisIndex] = currentRaw;}

@@ -18,156 +18,176 @@ class RobotSerial:
         self.port_name = port
         self.baudrate = baudrate
 
-        self.ser = None             # Obiekt Serial (utworzony dopiero w connect()).
-        self.running = False        # Flaga kontrolująca pracę wątku odczytu.
-        self.reader_thread = None   # Wątek odpowiedzialny za odbiór danych w tle.
+        self.ser = None             # Obiekt Serial
+        self.running = False        # Flaga pracy wątku
+        self.reader_thread = None   # Wątek odbioru
 
-        # Aktualne wartości odczytane z kontrolera [X, Y, Z, E, A, S] w stopniach.
+        # Aktualne wartości [X, Y, Z, E, A, S]
         self.current_angles = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
-        # mutex w c++
+        # Mutex do bezpiecznego dostępu do danych z różnych wątków
         self.lock = threading.Lock()
-
-        # Miejsce na funkcję, która zaktualizuje liczby i wykresy w oknie aplikacji.
-        # Dzięki temu robot może poinformować GUI, że ma nowe dane do wyświetlenia.
+        
+        # Zdarzenie do synchronizacji wysyłania komend (Handshake)
+        self.cmd_ok_event = threading.Event()
+        
+        # Callback do GUI (aktualizacja wykresów i logów)
         self.gui_callback = None
 
+        # WATCHDOG: Czas ostatniego poprawnego pakietu
+        self.last_packet_time = 0.0
+
     def find_esp32_port(self):
-        # W naszym przypadku to "CP210x USB to UART Bridge (COM9)". 
+        """Automatyczne wyszukiwanie portu z ESP32/CP210x/CH340."""
         ports = serial.tools.list_ports.comports()
         for p in ports:
-            if "CP210" in p.description: 
+            # Szukamy typowych sterowników USB-UART
+            if "CP210" in p.description or "CH340" in p.description or "USB Serial" in p.description: 
                 return p.device
-
-        return None # None — jeśli urządzenie nie zostało znalezione
+        return None
 
     def connect(self):
-        # Nawiązuje połączenie z urządzeniem ESP-32 przez port szeregowy.
-        # Zamyka poprzednie połączenie, wykrywa odpowiedni port, otwiera go,
-        # inicjalizuje mikrokontroler i uruchamia wątek odczytu.
-
-        # Jeśli istnieje wcześniejsze połączenie
-        # Zamknij, aby nie blokować portu lub wątku w tle.
+        """Nawiązuje połączenie i startuje wątek nasłuchujący."""
         if self.ser and self.ser.is_open:
             self.close()
 
-        # Wybór portu do użycia. Dopiero po udanej inicjalizacji trafia do self.port_name.
         target_port = self.port_name or self.find_esp32_port()
         if target_port is None:
             return False, "Nie znaleziono urządzenia ESP-32"
 
         try:
-            # Otwarcie portu. Timeout zapobiega zawieszeniu odczytu.
-            self.ser = serial.Serial(target_port, self.baudrate, timeout=1)
-
-            # ESP32 wykonuje reset po zestawieniu połączenia (sygnał DTR).
-            # Krótki odstęp pozwala mu się ponownie uruchomić.
-            time.sleep(2)
-
-            # Czyścimy bufor, aby uniknąć pracy na śmieciowych danych po resecie.
+            # Timeout=0.1s - krótki timeout, aby pętla szybko sprawdzała warunki
+            self.ser = serial.Serial(target_port, self.baudrate, timeout=0.1)
+            
+            # Reset ESP32 przez DTR
+            time.sleep(2) 
+            
             self.ser.reset_input_buffer()
             self.ser.reset_output_buffer()
 
-            # Start wątku odpowiedzialnego za odbiór ramek z kontrolera
+            # Resetujemy czas watchdoga na start
+            self.last_packet_time = time.time()
+
             self.running = True
             self.reader_thread = threading.Thread(
                 target=self._continuous_read,
-                daemon=True # Zabija wątek przy zamknięciu aplikacji
+                daemon=True
             )
             self.reader_thread.start()
 
-            self.port_name = target_port # Port uznajemy za działający.
+            self.port_name = target_port
             return True, f"Połączono z {self.port_name}"
 
         except Exception as e:
-            # Sprzątanie w razie błędu – metoda close() zabezpiecza wszystkie zasoby
             self.close()
             return False, f"Błąd połączenia: {e}"
 
     def _continuous_read(self):
-        # Wątek odbierający dane z portu szeregowego.
+        """
+        Główna pętla odbiorcza. 
+        Zawiera filtrację zakłóceń (EMI) i WATCHDOG danych.
+        """
+        AXIS_MAP = {"X": 0, "Y": 1, "Z": 2, "E": 3, "S": 4, "A": 5}
+        
+        failure_count = 0 
+        MAX_FAILURES = 20  
+        
+        # WATCHDOG: Limit czasu bez danych (w sekundach)
+        DATA_TIMEOUT = 2.0 
 
-        AXIS_MAP = {
-            "X": 0, 
-            "Y": 1, 
-            "Z": 2, 
-            "E": 3, 
-            "S": 4,
-            "A": 5  # Slave Y
-        }
+        # Odświeżamy czas na wejściu, żeby nie wyrzuciło błędu od razu
+        self.last_packet_time = time.time()
 
         while self.running and self.ser and self.ser.is_open:
             try:
-                # Blokujący odczyt z UART — czeka na pełną linię lub timeout.
-                raw_line = self.ser.readline()
-                if not raw_line: continue
+                # --- 1. SPRAWDZENIE WATCHDOGA (CZY DANE PŁYNĄ?) ---
+                if time.time() - self.last_packet_time > DATA_TIMEOUT:
+                    raise TimeoutError(f"Brak danych z ESP32 przez {DATA_TIMEOUT}s (Zwis?)")
 
-                # Dekodowanie odebranych danych.
+                # --- 2. ODCZYT FIZYCZNY ---
+                try:
+                    raw_line = self.ser.readline()
+                    # Sukces fizycznego odczytu (nawet pustego) zeruje licznik błędów I/O
+                    failure_count = 0 
+                except (serial.SerialException, OSError) as e:
+                    failure_count += 1
+                    if failure_count > MAX_FAILURES:
+                        raise e 
+                    time.sleep(0.05) 
+                    continue
+                except Exception:
+                    continue 
+
+                if not raw_line: 
+                    continue # Pusta linia (timeout readline'a), wracamy do początku pętli (i sprawdzamy watchdoga)
+                
+                # Dekodowanie
                 line = raw_line.decode("utf-8", errors="ignore").strip()
                 if not line: continue
 
-                # Obsługa ramek danych (<X...,Y...,Z...,E...,A...>)
-                if line.startswith("<") and line.endswith(">"):
-                    updates = []
-                    items = line[1:-1].split(',')
+                # --- 3. OBSŁUGA LOGIKI ---
+                
+                # Wykrycie potwierdzenia komendy
+                if line == "CMD_OK":
+                    self.cmd_ok_event.set()
+                    self.last_packet_time = time.time() # To też jest znak życia
+                    continue
 
-                    # Parsowanie
-                    for item in items:
-                        if len(item) >= 2 and item[0] in AXIS_MAP:
-                            try:
-                                updates.append((AXIS_MAP[item[0]], float(item[1:])))
-                            except ValueError: pass
-
-                    # Aktualizacja współdzielonego stanu z blokadą
-                    if updates: # Czy mamy nowe dane do zapisania?
-                        with self.lock: # Blokada na czas zapisu i kopiowania
-                            for idx, val in updates: # Zapisywanie nowych wartości
-                                self.current_angles[idx] = val
-                            # Zrobiona kopia do wysłania do GUI
-                            data_to_send = self.current_angles.copy() if self.gui_callback else None
-
-                        # Callback poza blokadą, żeby nie wieszać wątku, jeżeli GUI byłoby wolne
-                        if self.gui_callback and data_to_send:
-                            self.gui_callback(data_to_send)
+                # Wykrycie ramki danych telemetrycznych <...>
+                if '<' in line and '>' in line:
+                    try:
+                        start = line.find('<')
+                        end = line.find('>')
+                        if end > start:
+                            content = line[start+1 : end]
+                            items = content.split(',')
+                            updates = []
+                            for item in items:
+                                if len(item) >= 2:
+                                    axis = item[0].upper()
+                                    if axis in AXIS_MAP:
+                                        try:
+                                            val = float(item[1:])
+                                            updates.append((AXIS_MAP[axis], val))
+                                        except ValueError: pass
                             
+                            if updates:
+                                # WATCHDOG: Mamy poprawne dane, resetujemy timer
+                                self.last_packet_time = time.time()
 
+                                with self.lock:
+                                    for idx, val in updates:
+                                        self.current_angles[idx] = val
+                                    data_copy = self.current_angles.copy()
+                                
+                                if self.gui_callback:
+                                    self.gui_callback(data_copy)
+                    except Exception: 
+                        pass 
+
+                # Inne komunikaty tekstowe
                 else:
-                    if self.gui_callback: # Jeżeli nie jest ramką, to wypisz log.
+                    if self.gui_callback and len(line) > 1:
+                        # Każdy tekst od ESP to znak życia
+                        self.last_packet_time = time.time()
                         self.gui_callback(None, log_message=line)
 
-            except (serial.SerialException, OSError):
-                # Najczęstszy scenariusz to odłączenie kabla w trakcie pracy.
-                self.running = False
-                try:
-                    self.ser.close()
-                except Exception: pass
-
-                if self.gui_callback:
-                    self.gui_callback(None, log_message="#CONNECTION_LOST#")
-                break
-
             except Exception as e:
-                # Inne błędy odczytu nie powinny zatrzymywać całej aplikacji.
-                if self.running and self.gui_callback:
-                    self.gui_callback(None, log_message=f"Błąd odczytu: {e}")
+                # --- OBSŁUGA FAKTYCZNEGO ROZŁĄCZENIA ---
+                self.running = False
+                if self.gui_callback:
+                    self.gui_callback(None, log_message=f"Błąd połączenia: {e}")
+                    # WYMUSZENIE RECONNECTU W GUI
+                    self.gui_callback(None, log_message="#AUTO_RECONNECT#")
                 break
-
-    def get_current_angles(self):
-        with self.lock:
-            return self.current_angles.copy()
 
     def send_target_angles(self, th1, th2, th3, th4, th5):
-        # Wysyła wartości docelowe osi do ESP32.
-        # Format: X...,Y...,Z...,E...,A...*CS
-
         if not self.ser or not self.ser.is_open:
             return False, "Port nie jest otwarty"
 
-        # Konwersja radianów na stopnie
         radians = [th1, th2, th3, th4, th5]
         degrees = [math.degrees(v) for v in radians]
         
-        # Budowa właściwej części danych (payload)
         payload = (
             f"X{degrees[0]:.2f},"
             f"Y{degrees[1]:.2f},"
@@ -176,30 +196,26 @@ class RobotSerial:
             f"S{degrees[4]:.2f}"
         )
         
-        # Generowanie sumy kontrolnej (XOR) dla weryfikacji integralności
         checksum = 0
         for char in payload:
             checksum ^= ord(char)
             
-        # Finalizacja ramki: Payload + Separator + Suma (HEX) + Terminator
         cmd = f"{payload}*{checksum:02X}\n"
 
-        try: # Wysłanie ramki i wyświetlenie potwierdzenia
+        try:
             self.ser.write(cmd.encode("utf-8"))
             return True, f"Wysłano: {cmd.strip()}"
         except Exception as e:
             return False, f"Błąd wysyłania: {e}"
 
+    def get_current_angles(self):
+        with self.lock:
+            return self.current_angles.copy()
+
     def close(self):
-        # Zatrzymuje wątek odczytu i zamyka port.
-        
         self.running = False
-
-        # Czekamy na zakończenie wątku, żeby uniknąć wycieków wątków.
-        if self.reader_thread:
+        if self.reader_thread and self.reader_thread.is_alive():
             self.reader_thread.join(timeout=1.0)
-
-        # Bezpieczne zamknięcie portu.
         try:
             if self.ser and self.ser.is_open:
                 self.ser.close()
@@ -282,7 +298,6 @@ class RobotKinematics:
 
     @staticmethod
     def _normalize_angle(angle):
-        """Normalizacja kąta do zakresu [-π, π]"""
         return (angle + math.pi) % (2 * math.pi) - math.pi
     
     def get_joint_positions(self, th1, th2, th3, th4, th5=0.0):
@@ -318,9 +333,6 @@ class RobotKinematics:
         
         D_sq = R_wrist**2 + Z_wrist**2
         if D_sq > self.max_reach_sq or D_sq < self.min_reach_sq:
-            # D = math.sqrt(D_sq)
-            # Max = math.sqrt(self.max_reach_sq)
-            # print(f"[IK] Poza zasięgiem! Dist={D:.1f} vs Max={Max:.1f} (R_w={R_wrist:.1f}, Z_w={Z_wrist:.1f})")
             return None
         
         cos_th3 = (D_sq - self.L1_sq - self.L2_sq) / self.denom
@@ -342,8 +354,6 @@ class RobotKinematics:
         th3 = self._normalize_angle(th3)
         th4 = self._normalize_angle(th4)
         
-        # print(f"[IK] Przeszło weryfikację D_sq. Zwracane kąty to: th1={math.degrees(th1):.1f}°, th2={math.degrees(th2):.1f}°, th3={math.degrees(th3):.1f}°, th4={math.degrees(th4):.1f}°")
-
         return (th1, th2, th3, th4)
 
     def check_constraints(self, angles, positions):
@@ -356,17 +366,14 @@ class RobotKinematics:
         for key, val in zip(['th1', 'th2', 'th3', 'th4', 'th5'], [th1, th2, th3, th4, th5]):
             min_lim, max_lim = self.limits[key]
             if not (min_lim <= val <= max_lim):
-                # print(f"DEBUG: Odrzucono przez limit {key}: {math.degrees(val):.1f}")
                 return False, f"Limit {key}"
 
         elbow_z = positions[3][2]
         if elbow_z - self.radius < 0:
-            # print(f"DEBUG: Odrzucono - Łokieć w ziemi! Z={elbow_z:.2f} < {self.radius}")
             return False, f"Kolizja łokcia (Z={elbow_z:.1f})"
 
         tcp_z = positions[-1][2]
         if tcp_z < 0:
-             # print(f"DEBUG: Odrzucono - Efektor w ziemi! Z={tcp_z:.2f}")
              return False, f"Efektor w ziemi (Z={tcp_z:.1f})"
 
         p3 = positions[3]
@@ -382,7 +389,6 @@ class RobotKinematics:
         z_critical = z_axial - (len_xy * self.crit_offset_factor)
         
         if z_critical < 0: 
-            # print(f"DEBUG: Odrzucono - Punkt krytyczny (kolizja z bazą)! Val={z_critical:.2f}")
             return False, f"Kolizja z bazą (Crit={z_critical:.1f})"
 
         return True, "OK"
@@ -422,92 +428,26 @@ class RobotKinematics:
         
         return limit_cost + motion_cost + singularity_cost
 
-    def solve_ik(self, x, y, z, current_angles, phi_deg=None, roll_deg=0.0):
-        th5_target = math.radians(roll_deg)
-
-        if phi_deg is not None:
-            T_goal = self._construct_matrix(x, y, z, phi_deg)
-            sol, strategy = self._solve_from_matrix(T_goal, current_angles)
-            return (sol + (th5_target,), strategy) if sol else (None, "Cel nieosiągalny - Spróbuj użyć Auto-orientacji")
-
-        else:
-            def evaluate_phi(phi_val):
-                T_c = self._construct_matrix(x, y, z, phi_val)
-                s_sol, s_name = self._solve_from_matrix(T_c, current_angles, check_strategies=True)
-            
-                if s_sol:
-                    c = self.calculate_configuration_cost(s_sol + (th5_target,), current_angles)
-                    return c, s_sol, s_name, phi_val
-                
-                return float('inf'), None, None, phi_val
-
-            best_phi_coarse = 0.0
-            min_cost = float('inf')
-            found_valid = False
-
-            for phi in range(-180, 180, 1):
-                cost, _, _, _ = evaluate_phi(phi)
-                if cost < min_cost:
-                    min_cost = cost
-                    best_phi_coarse = phi
-                    found_valid = True
-
-            if not found_valid:
-                return None, "Brak rozwiązania (zasięg/kolizja) - Odrzucone na poziomie skanowania zgrubnego"
-
-            search_span = 2.0 
-            a = best_phi_coarse - search_span
-            b = best_phi_coarse + search_span
-            
-            GR = 0.61803398875
-            tol = 0.01
-            
-            c = b - (b - a) * GR
-            d = a + (b - a) * GR
-            
-            while abs(b - a) > tol:
-                cost_c, _, _, _ = evaluate_phi(c)
-                cost_d, _, _, _ = evaluate_phi(d)
-                
-                if cost_c == float('inf') and cost_d == float('inf'):
-                    a = (a + best_phi_coarse) / 2
-                    b = (b + best_phi_coarse) / 2
-                    c = b - (b - a) * GR
-                    d = a + (b - a) * GR
-                    continue
-
-                if cost_c < cost_d:
-                    b = d
-                    d = c
-                    c = b - (b - a) * GR
-                else:
-                    a = c
-                    c = d
-                    d = a + (b - a) * GR
-
-            final_phi = (a + b) / 2
-            final_cost, final_sol, final_name, final_phi_norm = evaluate_phi(final_phi)
-
-            if final_sol:
-                return final_sol + (th5_target,), f"{final_name} (φ={final_phi_norm:.2f}°)"
-            else:
-                cost_rough, sol_rough, name_rough, phi_rough = evaluate_phi(best_phi_coarse)
-                if sol_rough:
-                    return sol_rough + (th5_target,), f"{name_rough} (φ={phi_rough:.2f}°)"
-                
-                return None, f"Błąd optymalizacji (Best coarse: {best_phi_coarse}°) - Nie znaleziono rozwiązania metodą złotego podziału"
-
     def _construct_matrix(self, x, y, z, phi_deg):
+        """
+        Konstrukcja macierzy orientacji.
+        ZMIANA: Definicja Pitch została obrócona tak, aby 0 stopni oznaczało poziom.
+        """
         yaw = math.atan2(y, x)
         pitch = math.radians(phi_deg)
         
         cy, sy = np.cos(yaw), np.sin(yaw)
         cp, sp = np.cos(pitch), np.sin(pitch)
         
+        # Nowa definicja macierzy (0 = Poziomo, 90 = Pionowo góra)
+        # Oś Z (Approach) to: [cy*cp, sy*cp, sp]
+        # Oś X (Normal) to:   [cy*sp, sy*sp, -cp] (lub inna ortogonalna)
+        
+        # Poniżej macierz zgodna z definicją: Phi mierzone od poziomu
         R = np.array([
-            [cy * cp, -sy, cy * sp],
-            [sy * cp,  cy, sy * sp],
-            [   -sp,    0,     cp]
+            [cy * sp, -sy, cy * cp],
+            [sy * sp,  cy, sy * cp],
+            [   -cp,    0,     sp]
         ])
         
         T = np.eye(4)
@@ -518,8 +458,22 @@ class RobotKinematics:
     def _solve_from_matrix(self, T, current_angles, check_strategies=False):
         p_x, p_y, p_z = T[0, 3], T[1, 3], T[2, 3]
         
+        # Wektor podejścia (Approach Vector - Oś Z efektora)
         a_x, a_y, a_z = T[0, 2], T[1, 2], T[2, 2]
-        phi_deg = math.degrees(math.atan2(a_z, math.sqrt(a_x**2 + a_y**2)))
+        
+        # Obliczenie kąta bazy (Yaw)
+        th1_base_temp = math.atan2(p_y, p_x)
+        cy, sy = math.cos(th1_base_temp), math.sin(th1_base_temp)
+        
+        # Rzutowanie wektora podejścia na płaszczyznę pionową ramienia (Radial, Z)
+        # a_radial to składowa pozioma (przód/tył)
+        a_radial = a_x * cy + a_y * sy
+        
+        # Obliczenie Phi (Pitch) z wektora [a_radial, a_z]
+        # Zgodnie z nową definicją w _construct_matrix:
+        # a_radial = cp (cosinus), a_z = sp (sinus)
+        # tan(phi) = sin/cos = a_z / a_radial
+        phi_deg = math.degrees(math.atan2(a_z, a_radial))
         
         R_target = math.sqrt(p_x**2 + p_y**2)
         th1_base = math.atan2(p_y, p_x)
@@ -552,6 +506,147 @@ class RobotKinematics:
                         best_name = f"{'Elbow Up' if elbow_up else 'Elbow Down'}, {'Reverse' if reverse_base else 'Forward'}"
 
         return (best_sol, best_name) if best_sol else (None, None)
+
+    def solve_ik(self, x, y, z, current_angles, phi_deg=None, roll_deg=0.0, local_search=False):
+        th5_target = math.radians(roll_deg)
+
+        if phi_deg is not None:
+            T_goal = self._construct_matrix(x, y, z, phi_deg)
+            sol, strategy = self._solve_from_matrix(T_goal, current_angles)
+            return (sol + (th5_target,), strategy) if sol else (None, "Cel nieosiągalny")
+
+        else:
+            def evaluate_phi(phi_val):
+                T_c = self._construct_matrix(x, y, z, phi_val)
+                s_sol, s_name = self._solve_from_matrix(T_c, current_angles, check_strategies=True)
+                if s_sol:
+                    c = self.calculate_configuration_cost(s_sol + (th5_target,), current_angles)
+                    return c, s_sol, s_name, phi_val
+                return float('inf'), None, None, phi_val
+
+            if local_search:
+                if len(current_angles) >= 4:
+                    curr_phi_rad = current_angles[1] + current_angles[2] + current_angles[3]
+                    curr_phi_deg = math.degrees(curr_phi_rad)
+                    curr_phi_deg = (curr_phi_deg + 180) % 360 - 180
+                else:
+                    curr_phi_deg = 0.0
+                
+                scan_range = 25
+                start_scan = int(curr_phi_deg - scan_range)
+                end_scan = int(curr_phi_deg + scan_range)
+                step_val = 2
+            else:
+                start_scan = -175
+                end_scan = 175
+                step_val = 5
+
+            best_phi_coarse = 0.0
+            min_cost = float('inf')
+            found_valid = False
+
+            for phi in range(start_scan, end_scan, step_val):
+                cost, _, _, _ = evaluate_phi(phi)
+                if cost < min_cost:
+                    min_cost = cost
+                    best_phi_coarse = phi
+                    found_valid = True
+
+            if local_search and not found_valid:
+                for phi in range(-175, 175, 5):
+                    cost, _, _, _ = evaluate_phi(phi)
+                    if cost < min_cost:
+                        min_cost = cost
+                        best_phi_coarse = phi
+                        found_valid = True
+
+            if not found_valid:
+                return None, "Brak rozwiązania (zasięg/kolizja)"
+
+            search_span = float(step_val) * 1.5 
+            a = best_phi_coarse - search_span
+            b = best_phi_coarse + search_span
+            
+            GR = 0.61803398875
+            tol = 0.1
+            
+            c = b - (b - a) * GR
+            d = a + (b - a) * GR
+            
+            while abs(b - a) > tol:
+                cost_c, _, _, _ = evaluate_phi(c)
+                cost_d, _, _, _ = evaluate_phi(d)
+                
+                if cost_c == float('inf') and cost_d == float('inf'):
+                    mid = (a + b) / 2; a = mid - 0.5; b = mid + 0.5; break 
+
+                if cost_c < cost_d:
+                    b = d; d = c; c = b - (b - a) * GR
+                else:
+                    a = c; c = d; d = a + (b - a) * GR
+
+            final_phi = (a + b) / 2
+            final_cost, final_sol, final_name, final_phi_norm = evaluate_phi(final_phi)
+
+            if final_sol:
+                return final_sol + (th5_target,), f"Auto (φ={final_phi_norm:.1f}°)"
+            elif found_valid:
+                cost_rough, sol_rough, name_rough, phi_rough = evaluate_phi(best_phi_coarse)
+                return sol_rough + (th5_target,), f"Auto-Coarse (φ={phi_rough:.1f}°)"
+            
+            return None, "Błąd optymalizacji"
+
+    def generate_linear_path(self, start_cfg, end_cfg, step_mm=10.0):
+        p0 = np.array([start_cfg['x'], start_cfg['y'], start_cfg['z']])
+        p1 = np.array([end_cfg['x'], end_cfg['y'], end_cfg['z']])
+        
+        dist = np.linalg.norm(p1 - p0)
+        if dist < 0.1: return [] 
+        
+        num_steps = int(np.ceil(dist / step_mm))
+        if num_steps < 5: num_steps = 5
+        
+        steps = np.linspace(0, 1, num_steps + 1)
+        
+        trajectory_angles = []
+        last_joints_deg = start_cfg['current_joints']
+        
+        print(f"[PATH] Generowanie: {num_steps} kroków. Start={p0}, End={p1}")
+
+        for t in steps[1:]: 
+            curr_pos = p0 + (p1 - p0) * t
+            curr_roll = start_cfg['roll'] + (end_cfg['roll'] - start_cfg['roll']) * t
+            
+            last_joints_rad = [math.radians(a) for a in last_joints_deg[:5]]
+            
+            full_sol, strategy = self.solve_ik(
+                curr_pos[0], curr_pos[1], curr_pos[2], 
+                tuple(last_joints_rad), 
+                phi_deg=None, 
+                roll_deg=curr_roll,
+                local_search=True
+            )
+            
+            if full_sol is None:
+                print(f"[IK FAIL] t={t:.2f} Pos={curr_pos}")
+                return None, f"Błąd IK w t={t:.2f}"
+
+            deg_sol = [math.degrees(v) for v in full_sol]
+            
+            max_diff = 0
+            for i in range(5):
+                diff = abs(deg_sol[i] - last_joints_deg[i])
+                while diff > 180: diff = abs(diff - 360)
+                if diff > max_diff: max_diff = diff
+            
+            if max_diff > 35.0:
+                print(f"[PATH ERROR] Skok {max_diff:.1f}° w t={t:.2f}")
+                return None, f"Gwałtowny skok ({max_diff:.1f}°). Przerwanie."
+
+            trajectory_angles.append(deg_sol)
+            last_joints_deg = deg_sol 
+            
+        return trajectory_angles, "OK"
     
 # -------------------------------- GUI APP ---------------------------------
 
@@ -593,7 +688,7 @@ class RobotControlGUI:
         self.sequence_timer = None
         self.play_button = None 
         self.target_xyz = None 
-        self.POSITION_TOLERANCE = 10.0  # mm
+        self.POSITION_TOLERANCE = 1.0  # mm
 
         # Inicjalizacja GUI
         self.setup_ui()
@@ -772,12 +867,14 @@ class RobotControlGUI:
         ttk.Checkbutton(self.target_frame, text="Orientacja automatyczna",variable=self.auto_phi_var, 
                         command=self.toggle_phi_entry, style="TRadiobutton").grid(row=5, column=0, columnspan=2, pady=5, sticky="w")
         
-        btn_row = ttk.Frame(self.target_frame)
-        btn_row.grid(row=6, column=0, columnspan=2, sticky="ew", pady=5)
-        btn_row.columnconfigure((0, 1), weight=1, uniform="g")
-        ttk.Button(btn_row, text="WYŚLIJ POZYCJĘ", command=self.send_position).grid(row=0, column=0, padx=(0, 2), sticky="ew")
-        ttk.Button(btn_row, text="DODAJ PUNKT", command=self.add_point_to_sequence).grid(row=0, column=1, padx=(2, 0), sticky="ew")
-        
+        move_btn_row = ttk.Frame(self.target_frame)
+        move_btn_row.grid(row=6, column=0, columnspan=2, sticky="ew", pady=2)
+        move_btn_row.columnconfigure((0, 1), weight=1, uniform="g")
+
+        ttk.Button(move_btn_row, text="RUCH PTP", command=self.send_position).grid(row=0, column=0, padx=(0, 2), sticky="ew")
+        ttk.Button(move_btn_row, text="RUCH LINIOWY", command=self.perform_linear_move).grid(row=0, column=1, padx=(2, 0), sticky="ew")
+        ttk.Button(self.target_frame, text="DODAJ PUNKT DO LISTY", command=self.add_point_to_sequence).grid(row=7, column=0, columnspan=2, sticky="ew", pady=(5, 0))
+
         self.toggle_phi_entry()
         
         # 7. Log
@@ -908,32 +1005,71 @@ class RobotControlGUI:
 
     def update_position_display(self, angles=None, log_message=None):
         def _update_ui():
+            # --- 1. Obsługa Logów i Statusów ---
             if log_message:
-                if log_message == "#CONNECTION_LOST#":
-                    self.status_label.config(text="Rozłączony (Błąd I/O)", foreground="red")
-                    self.log("BŁĄD KRYTYCZNY: Utracono połączenie")
+                if log_message == "#AUTO_RECONNECT#":
+                    self.status_label.config(text="Rozłączony (Próba wznowienia...)", foreground="orange")
+                    self.log("Utracono połączenie. Próba wznowienia za 3s...")
+                    self.is_connected = False
+                    # Uruchomienie timera, który spróbuje połączyć się ponownie
+                    self.root.after(3000, self.auto_reconnect_attempt)
+                    return # Ważne: przerywamy, aby nie przetwarzać dalej
+                
+                elif log_message == "#CONNECTION_LOST#":
+                     self.status_label.config(text="Błąd krytyczny", foreground="red")
+                     self.is_connected = False
+                
                 else:
                     self.log(log_message)
             
+            # --- 2. Aktualizacja Kątów i Pozycji TCP ---
             if angles:
-                # Aktualizacja etykiet kątów
+                # Aktualizacja etykiet kątów (Joints)
                 for i, axis in enumerate(['X', 'Y', 'Z', 'E', 'S', 'A']):
                     if i < len(angles):
                         self.pos_labels[axis].config(text=f"{angles[i]:.2f}°")
                 
-                # Obliczanie pozycji tcp
-                current_rads = [math.radians(a) for a in angles[:5]]
-                tcp_matrix = self.kin.get_tcp_matrix(*current_rads)
-                current_xyz = tcp_matrix[:3, 3]
-                self.last_tcp_pos = current_xyz
-                for i, axis in enumerate(['TCP_X', 'TCP_Y', 'TCP_Z']):
-                    self.tcp_labels[axis].config(text=f"{current_xyz[i]:.2f}")
+                # Obliczanie pozycji TCP (Forward Kinematics) dla wyświetlania XYZ
+                try:
+                    current_rads = [math.radians(a) for a in angles[:5]]
+                    tcp_matrix = self.kin.get_tcp_matrix(*current_rads)
+                    current_xyz = tcp_matrix[:3, 3]
+                    
+                    self.last_tcp_pos = current_xyz # Zapamiętanie do logiki ruchu
+                    
+                    for i, axis in enumerate(['TCP_X', 'TCP_Y', 'TCP_Z']):
+                        self.tcp_labels[axis].config(text=f"{current_xyz[i]:.2f}")
+                except Exception:
+                    pass # Ignorujemy błędy matematyczne przy niepełnych danych
 
-        # Limitowanie częstotliwości odświeżania GUI
+        # --- 3. Throttling (Limitowanie odświeżania GUI) ---
+        # Logi i statusy puszczamy natychmiast, ale dane telemetryczne (angles)
+        # odświeżamy nie częściej niż co 200ms, aby nie zamulić interfejsu.
         now = time.time() * 1000.0
         if log_message or (now - self.last_gui_update_time >= 200.0):
             self.last_gui_update_time = now
             self.root.after(0, _update_ui)
+
+    def auto_reconnect_attempt(self):
+        """Funkcja wywoływana przez timer do próby ponownego połączenia."""
+        # Jeśli w międzyczasie połączono ręcznie, przerywamy pętlę
+        if self.is_connected: 
+            return 
+        
+        self.log("Automatyczne wznawianie połączenia...")
+        
+        # Próba fizycznego połączenia
+        success, msg = self.robot.connect()
+        
+        if success:
+            self.status_label.config(text="Połączono (Wznowiono)", foreground="green")
+            self.log(f"SUKCES: Połączenie przywrócone ({msg}).")
+            self.is_connected = True
+            
+            # Opcjonalnie: Jeśli byłeś w trakcie sekwencji, tu można by ją wznowić
+        else:
+            self.log(f"Niepowodzenie: {msg}. Ponowna próba!")
+            self.root.after(500, self.auto_reconnect_attempt)
 
     def toggle_phi_entry(self):
         state = 'disabled' if self.auto_phi_var.get() else 'normal'
@@ -1067,7 +1203,136 @@ class RobotControlGUI:
                 self._last_snd = t
                 
         self.angle_send_timer = self.root.after(50, self.send_angles_continuously)
-    
+
+    def perform_linear_move(self):
+        if not self.is_connected:
+            messagebox.showwarning("Info", "Brak połączenia")
+            return
+
+        try:
+            # --- 1. Pobranie danych wejściowych ---
+            target_x = float(self.x_entry.get())
+            target_y = float(self.y_entry.get())
+            target_z = float(self.z_entry.get())
+            target_roll = float(self.roll_entry.get())
+
+            # --- 2. Pobranie stanu początkowego ---
+            start_x, start_y, start_z = self.last_tcp_pos
+            current_joints = self.robot.get_current_angles()
+            
+            # Obliczenie startowego Phi (suma kątów th2+th3+th4) dla płynnego startu
+            # Zakładamy, że current_joints są w stopniach
+            start_phi = current_joints[1] + current_joints[2] + current_joints[3]
+            start_roll = current_joints[4]
+
+            # Jeśli auto-phi włączone, celujemy w utrzymanie obecnego kąta lub 0
+            if self.auto_phi_var.get():
+                target_phi = start_phi 
+            else:
+                target_phi = float(self.phi_entry.get())
+
+            # --- 3. Konfiguracja generatora ---
+            start_cfg = {
+                'x': start_x, 'y': start_y, 'z': start_z, 
+                'phi': start_phi, 'roll': start_roll, 'current_joints': current_joints
+            }
+            end_cfg = {
+                'x': target_x, 'y': target_y, 'z': target_z, 
+                'phi': target_phi, 'roll': target_roll
+            }
+
+            self.log(f"Generowanie trasy: Phi {start_phi:.1f}° -> {target_phi:.1f}°")
+            
+            # Generujemy ścieżkę (krok 5mm dla stabilności)
+            path, msg = self.kin.generate_linear_path(start_cfg, end_cfg, step_mm=5.0)
+            
+            if path is None:
+                messagebox.showerror("Błąd", f"Nie można wyznaczyć trasy:\n{msg}")
+                return
+            
+            self.log(f"Trasa wyznaczona: {len(path)} punktów. Rozpoczynam ruch sekwencyjny...")
+            
+            # --- 4. Uruchomienie sekwencji (Stop-and-Go) ---
+            self.linear_path_queue = path
+            self.linear_path_index = 0
+            self.execute_linear_step()
+
+        except ValueError:
+            messagebox.showerror("Błąd", "Złe dane wejściowe")
+
+    def execute_linear_step(self):
+        """Wysyła jeden punkt i uruchamia oczekiwanie."""
+        if self.linear_path_index >= len(self.linear_path_queue):
+            self.log("Ruch liniowy zakończony.")
+            return
+
+        # 1. Wyczyszczenie flagi potwierdzenia
+        self.robot.cmd_ok_event.clear()
+
+        # 2. Pobranie punktu
+        target_angles = self.linear_path_queue[self.linear_path_index]
+        rads = [math.radians(a) for a in target_angles]
+        
+        # 3. Obliczenie fizycznej pozycji celu (dla warunku nr 2)
+        # Musimy wiedzieć gdzie (XYZ) robot ma dojechać w tym kroku
+        tcp_matrix = self.kin.get_tcp_matrix(*rads)
+        self.current_step_target_xyz = tcp_matrix[:3, 3] 
+
+        # 4. Wysłanie do robota
+        self.robot.send_target_angles(*rads)
+        
+        # 5. Start oczekiwania
+        self.root.after(1, self.wait_for_ack_and_motion)
+
+    def wait_for_ack_and_motion(self):
+        """
+        Czeka na DWIE rzeczy:
+        1. Potwierdzenie CMD_OK od ESP (że ramka dotarła).
+        2. Zbliżenie się fizyczne do celu (że silniki dojechały).
+        """
+        # --- WARUNEK 1: Czy ESP potwierdziło odbiór? ---
+        if not self.robot.cmd_ok_event.is_set():
+            # Jeszcze nie ma ACK -> czekaj
+            self.root.after(5, self.wait_for_ack_and_motion)
+            return
+
+        # --- WARUNEK 2: Czy robot fizycznie dojechał? ---
+        # Sprawdzamy dystans między aktualną pozycją (z telemetry) a celem kroku
+        dist = np.linalg.norm(self.last_tcp_pos - self.current_step_target_xyz)
+        
+        # Tolerancja np. 2.0 mm (musi być mniejsza niż Twój krok generatora czyli 5mm)
+        if dist > 2.0:
+            # Robot wciąż jedzie -> czekaj
+            self.root.after(10, self.wait_for_ack_and_motion)
+            return
+
+        # --- SUKCES: Otrzymano ACK i Robot jest na miejscu ---
+        self.linear_path_index += 1
+        
+        if self.linear_path_index % 5 == 0:
+            self.log(f"Wykonano krok {self.linear_path_index}/{len(self.linear_path_queue)}")
+        
+        # Wyślij kolejny punkt
+        self.root.after(5, self.execute_linear_step)
+
+    def wait_for_linear_step(self):
+        """Sprawdza czy robot dojechał do celu pośredniego."""
+        # Oblicz dystans między aktualną pozycją robota (z enkoderów) a celem kroku
+        dist = np.linalg.norm(self.last_tcp_pos - self.current_step_target_xyz)
+
+        # Tolerancja np. 1mm
+        if dist < 2.0:
+            # Dojechał -> następny krok
+            self.linear_path_index += 1
+            # Log co 5 kroków, żeby nie śmiecić
+            if self.linear_path_index % 5 == 0:
+                self.log(f"Krok {self.linear_path_index}/{len(self.linear_path_queue)}")
+            
+            self.execute_linear_step()
+        else:
+            # Nie dojechał -> sprawdź ponownie za 20ms
+            self.root.after(20, self.wait_for_linear_step)
+
     def on_closing(self):
         self.is_connected = False
         self.stop_continuous_send()
