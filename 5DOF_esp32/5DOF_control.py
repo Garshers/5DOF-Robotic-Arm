@@ -282,7 +282,6 @@ class RobotKinematics:
 
     @staticmethod
     def _normalize_angle(angle):
-        """Normalizacja kąta do zakresu [-π, π]"""
         return (angle + math.pi) % (2 * math.pi) - math.pi
     
     def get_joint_positions(self, th1, th2, th3, th4, th5=0.0):
@@ -308,7 +307,7 @@ class RobotKinematics:
         return J
     
     def inverse_kinematics(self, R, Z, th1, phi_deg=0.0, elbow_up=True, reverse_base=False):
-        phi_rad = self._normalize_angle(math.radians(phi_deg + 270.0))
+        phi_rad = self._normalize_angle(math.radians(phi_deg))
         phi_corr = phi_rad - self.geo_phi_offset
         
         R_ik = -R if reverse_base else R
@@ -318,9 +317,6 @@ class RobotKinematics:
         
         D_sq = R_wrist**2 + Z_wrist**2
         if D_sq > self.max_reach_sq or D_sq < self.min_reach_sq:
-            # D = math.sqrt(D_sq)
-            # Max = math.sqrt(self.max_reach_sq)
-            # print(f"[IK] Poza zasięgiem! Dist={D:.1f} vs Max={Max:.1f} (R_w={R_wrist:.1f}, Z_w={Z_wrist:.1f})")
             return None
         
         cos_th3 = (D_sq - self.L1_sq - self.L2_sq) / self.denom
@@ -342,8 +338,6 @@ class RobotKinematics:
         th3 = self._normalize_angle(th3)
         th4 = self._normalize_angle(th4)
         
-        # print(f"[IK] Przeszło weryfikację D_sq. Zwracane kąty to: th1={math.degrees(th1):.1f}°, th2={math.degrees(th2):.1f}°, th3={math.degrees(th3):.1f}°, th4={math.degrees(th4):.1f}°")
-
         return (th1, th2, th3, th4)
 
     def check_constraints(self, angles, positions):
@@ -356,17 +350,14 @@ class RobotKinematics:
         for key, val in zip(['th1', 'th2', 'th3', 'th4', 'th5'], [th1, th2, th3, th4, th5]):
             min_lim, max_lim = self.limits[key]
             if not (min_lim <= val <= max_lim):
-                # print(f"DEBUG: Odrzucono przez limit {key}: {math.degrees(val):.1f}")
                 return False, f"Limit {key}"
 
         elbow_z = positions[3][2]
         if elbow_z - self.radius < 0:
-            # print(f"DEBUG: Odrzucono - Łokieć w ziemi! Z={elbow_z:.2f} < {self.radius}")
             return False, f"Kolizja łokcia (Z={elbow_z:.1f})"
 
         tcp_z = positions[-1][2]
         if tcp_z < 0:
-             # print(f"DEBUG: Odrzucono - Efektor w ziemi! Z={tcp_z:.2f}")
              return False, f"Efektor w ziemi (Z={tcp_z:.1f})"
 
         p3 = positions[3]
@@ -382,7 +373,6 @@ class RobotKinematics:
         z_critical = z_axial - (len_xy * self.crit_offset_factor)
         
         if z_critical < 0: 
-            # print(f"DEBUG: Odrzucono - Punkt krytyczny (kolizja z bazą)! Val={z_critical:.2f}")
             return False, f"Kolizja z bazą (Crit={z_critical:.1f})"
 
         return True, "OK"
@@ -413,101 +403,30 @@ class RobotKinematics:
             barrier = centered ** 6
             limit_cost += barrier * 10.0
             
-        motion_cost = 2.0 * self.calculate_joint_distance(current_angles, angles)
+        motion_cost = 5.0 * self.calculate_joint_distance(current_angles, angles)
             
         J = self.get_jacobian(th1, th2, th3, th4, th5)
         J_pos = J[:3, :]
         manipulability = math.sqrt(np.linalg.det(J_pos @ J_pos.T))
         singularity_cost = 1.0 / (manipulability + 0.001)
         
-        return limit_cost + motion_cost + singularity_cost
-
-    def solve_ik(self, x, y, z, current_angles, phi_deg=None, roll_deg=0.0):
-        th5_target = math.radians(roll_deg)
-
-        if phi_deg is not None:
-            T_goal = self._construct_matrix(x, y, z, phi_deg)
-            sol, strategy = self._solve_from_matrix(T_goal, current_angles)
-            return (sol + (th5_target,), strategy) if sol else (None, "Cel nieosiągalny - Spróbuj użyć Auto-orientacji")
-
-        else:
-            def evaluate_phi(phi_val):
-                T_c = self._construct_matrix(x, y, z, phi_val)
-                s_sol, s_name = self._solve_from_matrix(T_c, current_angles, check_strategies=True)
-            
-                if s_sol:
-                    c = self.calculate_configuration_cost(s_sol + (th5_target,), current_angles)
-                    return c, s_sol, s_name, phi_val
-                
-                return float('inf'), None, None, phi_val
-
-            best_phi_coarse = 0.0
-            min_cost = float('inf')
-            found_valid = False
-
-            for phi in range(-180, 180, 1):
-                cost, _, _, _ = evaluate_phi(phi)
-                if cost < min_cost:
-                    min_cost = cost
-                    best_phi_coarse = phi
-                    found_valid = True
-
-            if not found_valid:
-                return None, "Brak rozwiązania (zasięg/kolizja) - Odrzucone na poziomie skanowania zgrubnego"
-
-            search_span = 2.0 
-            a = best_phi_coarse - search_span
-            b = best_phi_coarse + search_span
-            
-            GR = 0.61803398875
-            tol = 0.01
-            
-            c = b - (b - a) * GR
-            d = a + (b - a) * GR
-            
-            while abs(b - a) > tol:
-                cost_c, _, _, _ = evaluate_phi(c)
-                cost_d, _, _, _ = evaluate_phi(d)
-                
-                if cost_c == float('inf') and cost_d == float('inf'):
-                    a = (a + best_phi_coarse) / 2
-                    b = (b + best_phi_coarse) / 2
-                    c = b - (b - a) * GR
-                    d = a + (b - a) * GR
-                    continue
-
-                if cost_c < cost_d:
-                    b = d
-                    d = c
-                    c = b - (b - a) * GR
-                else:
-                    a = c
-                    c = d
-                    d = a + (b - a) * GR
-
-            final_phi = (a + b) / 2
-            final_cost, final_sol, final_name, final_phi_norm = evaluate_phi(final_phi)
-
-            if final_sol:
-                return final_sol + (th5_target,), f"{final_name} (φ={final_phi_norm:.2f}°)"
-            else:
-                cost_rough, sol_rough, name_rough, phi_rough = evaluate_phi(best_phi_coarse)
-                if sol_rough:
-                    return sol_rough + (th5_target,), f"{name_rough} (φ={phi_rough:.2f}°)"
-                
-                return None, f"Błąd optymalizacji (Best coarse: {best_phi_coarse}°) - Nie znaleziono rozwiązania metodą złotego podziału"
+        return motion_cost #limit_cost + motion_cost + singularity_cost
 
     def _construct_matrix(self, x, y, z, phi_deg):
+        """
+        Konstrukcja macierzy orientacji.
+        """
         yaw = math.atan2(y, x)
         pitch = math.radians(phi_deg)
         
         cy, sy = np.cos(yaw), np.sin(yaw)
         cp, sp = np.cos(pitch), np.sin(pitch)
         
+        # Poniżej macierz zgodna z definicją: Phi mierzone od poziomu
         R = np.array([
-            [cy * cp, -sy, cy * sp],
-            [sy * cp,  cy, sy * sp],
-            [   -sp,    0,     cp]
+            [cy * sp, -sy, cy * cp],
+            [sy * sp,  cy, sy * cp],
+            [   -cp,    0,     sp]
         ])
         
         T = np.eye(4)
@@ -518,8 +437,22 @@ class RobotKinematics:
     def _solve_from_matrix(self, T, current_angles, check_strategies=False):
         p_x, p_y, p_z = T[0, 3], T[1, 3], T[2, 3]
         
+        # Wektor podejścia (Approach Vector - Oś Z efektora)
         a_x, a_y, a_z = T[0, 2], T[1, 2], T[2, 2]
-        phi_deg = math.degrees(math.atan2(a_z, math.sqrt(a_x**2 + a_y**2)))
+        
+        # Obliczenie kąta bazy (Yaw)
+        th1_base_temp = math.atan2(p_y, p_x)
+        cy, sy = math.cos(th1_base_temp), math.sin(th1_base_temp)
+        
+        # Rzutowanie wektora podejścia na płaszczyznę pionową ramienia (Radial, Z)
+        # a_radial to składowa pozioma (przód/tył)
+        a_radial = a_x * cy + a_y * sy
+        
+        # Obliczenie Phi (Pitch) z wektora [a_radial, a_z]
+        # Zgodnie z nową definicją w _construct_matrix:
+        # a_radial = cp (cosinus), a_z = sp (sinus)
+        # tan(phi) = sin/cos = a_z / a_radial
+        phi_deg = math.degrees(math.atan2(a_z, a_radial))
         
         R_target = math.sqrt(p_x**2 + p_y**2)
         th1_base = math.atan2(p_y, p_x)
@@ -552,6 +485,83 @@ class RobotKinematics:
                         best_name = f"{'Elbow Up' if elbow_up else 'Elbow Down'}, {'Reverse' if reverse_base else 'Forward'}"
 
         return (best_sol, best_name) if best_sol else (None, None)
+
+    def solve_ik(self, x, y, z, current_angles, phi_deg=None, roll_deg=0.0, local_search=False):
+        th5_target = math.radians(roll_deg)
+
+        if phi_deg is not None:
+            T_goal = self._construct_matrix(x, y, z, phi_deg)
+            sol, strategy = self._solve_from_matrix(T_goal, current_angles)
+            return (sol + (th5_target,), strategy) if sol else (None, "Cel nieosiągalny")
+
+        else:
+            def evaluate_phi(phi_val):
+                T_c = self._construct_matrix(x, y, z, phi_val)
+                s_sol, s_name = self._solve_from_matrix(T_c, current_angles, check_strategies=True)
+                if s_sol:
+                    c = self.calculate_configuration_cost(s_sol + (th5_target,), current_angles)
+                    return c, s_sol, s_name, phi_val
+                return float('inf'), None, None, phi_val
+
+            # Ustalenie parametrów skanowania na podstawie trybu ruchu
+            if local_search:
+                # Tryb Liniowy: Ścisła okolica aktualnego phi
+                if len(current_angles) >= 4:
+                    curr_phi_rad = current_angles[1] + current_angles[2] + current_angles[3]
+                    curr_phi_deg = math.degrees(curr_phi_rad)
+                    curr_phi_deg = (curr_phi_deg + 180) % 360 - 180
+                else:
+                    curr_phi_deg = 0.0
+                
+                start_scan, end_scan, step_val = int(curr_phi_deg - 20), int(curr_phi_deg + 20), 2
+            else:
+                # Tryb PTP: Pełny skan co 1 stopień
+                start_scan, end_scan, step_val = -180, 180, 1
+
+            best_phi_coarse = 0.0
+            min_cost = float('inf')
+            found_valid = False
+
+            # Faza 1: Skanowanie zgrubne (Grid Search)
+            for phi in range(start_scan, end_scan + 1, step_val):
+                cost, _, _, _ = evaluate_phi(phi)
+                if cost < min_cost:
+                    min_cost = cost
+                    best_phi_coarse = phi
+                    found_valid = True
+
+            # Kluczowa zmiana: W ruchu liniowym NIE pozwalamy na skok globalny
+            if not found_valid:
+                return None, "Brak rozwiązania w zadanym zakresie"
+
+            # Faza 2: Złoty podział (Golden Section Search) - dokładność 0.01
+            search_span = float(step_val) 
+            a, b = best_phi_coarse - search_span, best_phi_coarse + search_span
+            GR, tol = 0.61803398875, 0.01 # Zwiększona precyzja do 0.01
+            
+            c_gs = b - (b - a) * GR
+            d_gs = a + (b - a) * GR
+            
+            while abs(b - a) > tol:
+                cost_c, _, _, _ = evaluate_phi(c_gs)
+                cost_d, _, _, _ = evaluate_phi(d_gs)
+                
+                if cost_c < cost_d:
+                    b = d_gs; d_gs = c_gs; c_gs = b - (b - a) * GR
+                else:
+                    a = c_gs; c_gs = d_gs; d_gs = a + (b - a) * GR
+
+            final_phi = (a + b) / 2
+            final_cost, final_sol, final_name, final_phi_norm = evaluate_phi(final_phi)
+
+            if final_sol:
+                return final_sol + (th5_target,), f"Opt (φ={final_phi_norm:.2f}°)"
+            else:
+                # Fallback do najlepszego wyniku ze skanowania, jeśli optymalizacja wpadła w błąd
+                res = evaluate_phi(best_phi_coarse)
+                if res[1]: return res[1] + (th5_target,), f"Coarse (φ={res[3]:.1f}°)"
+            
+            return None, "Błąd optymalizacji"
     
 # -------------------------------- GUI APP ---------------------------------
 
