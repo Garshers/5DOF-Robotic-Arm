@@ -507,7 +507,8 @@ class RobotKinematics:
             if local_search:
                 # Tryb Liniowy: Ścisła okolica aktualnego phi
                 if len(current_angles) >= 4:
-                    curr_phi_rad = current_angles[1] + current_angles[2] + current_angles[3]
+                    # Poprawiona algebra: Zgodnie z modelem transformacji FK, Phi = th2 - th3 - th4
+                    curr_phi_rad = current_angles[1] - current_angles[2] - current_angles[3]
                     curr_phi_deg = math.degrees(curr_phi_rad)
                     curr_phi_deg = (curr_phi_deg + 180) % 360 - 180
                 else:
@@ -562,6 +563,45 @@ class RobotKinematics:
                 if res[1]: return res[1] + (th5_target,), f"Coarse (φ={res[3]:.1f}°)"
             
             return None, "Błąd optymalizacji"
+
+    def generate_linear_trajectory(self, start_pose, end_pose, current_angles, step_size_mm=2.0):
+        """
+        Generuje dyskretną trajektorię w przestrzeni konfiguracyjnej dla ruchu liniowego w XYZ.
+        Parametry start_pose i end_pose to krotki: (X, Y, Z, Phi, Roll).
+        """
+        p0 = np.array(start_pose[:3])
+        p1 = np.array(end_pose[:3])
+        
+        distance = np.linalg.norm(p1 - p0)
+        steps = max(int(distance / step_size_mm), 1)
+        
+        trajectory_joints = []
+        last_angles = current_angles
+        
+        for i in range(steps + 1):
+            t = i / steps
+            
+            # Liniowa interpolacja przestrzeni kartezjańskiej (XYZ)
+            x, y, z = p0 + t * (p1 - p0)
+            
+            # Zabezpieczona interpolacja kątów orientacji (Phi, Roll)
+            if start_pose[3] is not None and end_pose[3] is not None:
+                phi = start_pose[3] + t * (end_pose[3] - start_pose[3])
+            else:
+                phi = None
+                
+            roll = start_pose[4] + t * (end_pose[4] - start_pose[4])
+            
+            # Parametr local_search=True wymusza poszukiwanie orientacji bez skoków konfiguracji
+            sol, msg = self.solve_ik(x, y, z, last_angles, phi_deg=phi, roll_deg=roll, local_search=True)
+            
+            if sol is None:
+                return None, f"Błąd w kroku {i}/{steps} (x={x:.1f}, y={y:.1f}, z={z:.1f}): {msg}"
+            
+            trajectory_joints.append(sol)
+            last_angles = sol
+            
+        return trajectory_joints, "OK"
     
 # -------------------------------- GUI APP ---------------------------------
 
@@ -784,10 +824,12 @@ class RobotControlGUI:
         
         btn_row = ttk.Frame(self.target_frame)
         btn_row.grid(row=6, column=0, columnspan=2, sticky="ew", pady=5)
-        btn_row.columnconfigure((0, 1), weight=1, uniform="g")
-        ttk.Button(btn_row, text="WYŚLIJ POZYCJĘ", command=self.send_position).grid(row=0, column=0, padx=(0, 2), sticky="ew")
-        ttk.Button(btn_row, text="DODAJ PUNKT", command=self.add_point_to_sequence).grid(row=0, column=1, padx=(2, 0), sticky="ew")
+        btn_row.columnconfigure((0, 1, 2), weight=1, uniform="g")
         
+        ttk.Button(btn_row, text="RUCH PTP", command=self.send_position).grid(row=0, column=0, padx=(0, 2), sticky="ew")
+        ttk.Button(btn_row, text="RUCH LINIOWY", command=self.send_position_linear).grid(row=0, column=1, padx=(2, 2), sticky="ew")
+        ttk.Button(btn_row, text="DODAJ PUNKT", command=self.add_point_to_sequence).grid(row=0, column=2, padx=(2, 0), sticky="ew")
+
         self.toggle_phi_entry()
         
         # 7. Log
@@ -1008,7 +1050,80 @@ class RobotControlGUI:
         except Exception as e:
             self.log(f"Nieoczekiwany błąd: {e}")
             messagebox.showerror("Błąd krytyczny", str(e))
-    
+
+    def execute_linear_trajectory(self, trajectory_joints, delay_ms=50):
+        """
+        Inicjalizuje asynchroniczne strumieniowanie wygenerowanej trajektorii do sterownika sprzętowego.
+        Wartość delay_ms powinna być skorelowana z POP_INTERVAL_MS na układzie ESP32.
+        """
+        self.trajectory_buffer = trajectory_joints
+        self.trajectory_index = 0
+        self.sequence_playing = True 
+        self._stream_trajectory_point(delay_ms)
+
+    def _stream_trajectory_point(self, delay_ms):
+        """
+        Pojedynczy krok strumieniowania wywoływany rekurencyjnie przez pętlę zdarzeń (Event Loop).
+        """
+        if not self.sequence_playing or self.trajectory_index >= len(self.trajectory_buffer):
+            self.stop_sequence("Zakończono ruch liniowy")
+            return
+
+        target_angles = self.trajectory_buffer[self.trajectory_index]
+        self.robot.send_target_angles(*target_angles)
+        
+        self.trajectory_index += 1
+        
+        # Wykorzystanie zdarzeń non-blocking tkintera do zachowania interwału
+        self.sequence_timer = self.root.after(delay_ms, lambda: self._stream_trajectory_point(delay_ms))
+
+    def send_position_linear(self):
+        try:
+            def safe_float(entry, default=0.0):
+                txt = entry.get().strip().replace(',', '.')
+                return float(txt) if txt else default
+
+            x = safe_float(self.x_entry)
+            y = safe_float(self.y_entry)
+            z = safe_float(self.z_entry)
+            phi = safe_float(self.phi_entry) if not self.auto_phi_var.get() else None
+            roll = safe_float(self.roll_entry)
+
+            cur_rads = [math.radians(a) for a in self.robot.get_current_angles()[:5]]
+            
+            # Wyznaczenie wektora stanu początkowego P_0 z macierzy TCP
+            T_tcp = self.kin.get_tcp_matrix(*cur_rads)
+            pos = T_tcp[:3, 3]
+            
+            # Ekstrakcja analityczna kąta Pitch (Phi) zgodnie z rzutowaniem wektora a_z / a_radial
+            a_x, a_y, a_z = T_tcp[0, 2], T_tcp[1, 2], T_tcp[2, 2]
+            th1_base = math.atan2(pos[1], pos[0])
+            a_radial = a_x * math.cos(th1_base) + a_y * math.sin(th1_base)
+            fi_rad = math.atan2(a_z, a_radial)
+            
+            start_pose = (pos[0], pos[1], pos[2], math.degrees(fi_rad), math.degrees(cur_rads[4]))
+            end_pose = (x, y, z, phi, roll)
+
+            self.log(f"Synteza trajektorii liniowej TCP: X={x}, Y={y}, Z={z}")
+            
+            # Generowanie macierzy węzłów
+            trajectory, msg = self.kin.generate_linear_trajectory(start_pose, end_pose, tuple(cur_rads))
+            
+            if trajectory is None:
+                messagebox.showerror("Niestabilność kinematyczna", f"Błąd solvera IK:\n{msg}")
+                self.log(f"Przerwano procedurę: {msg}")
+                return
+            
+            self.log(f"Strumieniowanie danych: {len(trajectory)} węzłów przestrzennych.")
+            # Stała czasowa musi być silnie skorelowana z POP_INTERVAL_MS (50 ms) sprzętowej pętli serwo
+            self.execute_linear_trajectory(trajectory, delay_ms=50)
+
+        except ValueError as e:
+            messagebox.showerror("Błąd preprocesingu", str(e))
+        except Exception as e:
+            self.log(f"Błąd algorytmu: {e}")
+            messagebox.showerror("Błąd krytyczny", str(e))
+
     def on_angle_slider_change(self, key, val):
         angle = float(val)
         self.angle_value_labels[key].config(text=f"{angle:.1f}°")

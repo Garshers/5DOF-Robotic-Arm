@@ -339,15 +339,15 @@ void readEncoders() {
 
 void motorControlTask(void *parameter) {
     long targetSteps[5] = {0, 0, 0, 0, 0};
-    float localTargetAngles[5];
-    float localCurrentAngles[5];
+    float localTargetAngles[5] = {START_ANGLES[0], START_ANGLES[1], START_ANGLES[2], START_ANGLES[3], START_ANGLES[4]};
+    float localCurrentAngles[5] = {START_ANGLES[0], START_ANGLES[1], START_ANGLES[2], START_ANGLES[3], START_ANGLES[4]};
     float stepsPerDegree[5];
     float localTargetServo = 0.0;
     float localCurrentServo = 0.0;
 
     // Parametry czasowe dla bufora trajektorii
     TickType_t lastPopTime = 0;
-    const TickType_t POP_INTERVAL_MS = 50; 
+    const TickType_t POP_INTERVAL_MS = 10; 
 
     // Zmienne stanu dla kompensacji osi X
     const float BACKLASH_X_DEG = 1.3; 
@@ -413,10 +413,14 @@ void motorControlTask(void *parameter) {
             }
         }
         
-        // Aktualizacja bieżącej pozycji sprzętowej z ochroną Mutex
-        if (xSemaphoreTake(xMutex, 10 / portTICK_PERIOD_MS)) {
-            memcpy(localCurrentAngles, (void*)currentAngles, sizeof(localCurrentAngles));
-            xSemaphoreGive(xMutex);
+        // Aktualizacja bieżącej pozycji sprzętowej z ochroną Mutex z zabezpieczeniem Mutex starvation
+        static unsigned long lastMutexTime = 0;
+        if (currentMillis - lastMutexTime >= 10) {
+            if (xSemaphoreTake(xMutex, 0)) {
+                memcpy(localCurrentAngles, (void*)currentAngles, sizeof(localCurrentAngles));
+                xSemaphoreGive(xMutex);
+            }
+            lastMutexTime = currentMillis;
         }
         
         // ===== Sterowanie silnikami krokowymi oraz serwomechanizmem =====
