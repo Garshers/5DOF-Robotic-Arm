@@ -54,6 +54,15 @@ volatile float targetServoAngle = 0.0; // Stan serwonapędu
 volatile float currentServoAngle = 0.0;
 volatile bool newTargetAvailable = true;
 
+// ===================== Bufor trajektorii (FIFO) ======================
+struct TrajectoryPoint {
+    float angles[5];
+    float servoAngle;
+};
+
+QueueHandle_t trajectoryQueue;
+const UBaseType_t QUEUE_SIZE = 64; // Bufor trajektorii
+
 // ===================== Bufor komunikacyjny =======================
 #define RX_BUF_SIZE 64
 char inputBuffer[RX_BUF_SIZE];
@@ -189,17 +198,23 @@ void parsePythonCommand(char* cmd) {
         token = strtok(NULL, ","); // Pobierz kolejny token
     }
     
-    // 3. Aktualizacja zmiennych sterujących
+    // 3. Aktualizacja zmiennych sterujących (Zapis do FIFO)
     if (validCommand) {
+        TrajectoryPoint newPoint;
+        
+        memcpy(newPoint.angles, newTargets, sizeof(newTargets));
+        newPoint.servoAngle = newServo;
+
         if (xSemaphoreTake(xMutex, portMAX_DELAY)) {
             memcpy((void*)targetAngles, newTargets, sizeof(newTargets));
             targetServoAngle = newServo;
-            newTargetAvailable = true;
             xSemaphoreGive(xMutex);
         }
-        
-        Serial.printf("Nowe cele: E=%.2f Z=%.2f Y=%.2f X=%.2f\n", 
-                      newTargets[0], newTargets[1], newTargets[3], newTargets[4]);
+
+        // Operacja Push do kolejki FIFO z czasem oczekiwania równym zero (non-blocking)
+        if (xQueueSend(trajectoryQueue, &newPoint, 0) != pdPASS) {
+            Serial.println("OSTRZEŻENIE: Przepełnienie bufora trajektorii (Buffer Overflow)!");
+        }
     }
 }
 
@@ -330,21 +345,25 @@ void motorControlTask(void *parameter) {
     float localTargetServo = 0.0;
     float localCurrentServo = 0.0;
 
+    // Parametry czasowe dla bufora trajektorii
+    TickType_t lastPopTime = 0;
+    const TickType_t POP_INTERVAL_MS = 50; 
+
     // Zmienne stanu dla kompensacji osi X
     const float BACKLASH_X_DEG = 1.3; 
     static float lastTargetX = 0.0;
     static float activeBacklashX = 0.0;
     static bool isFirstRun = true;
 
-    const float KP_MAIN = 1.0;          // Wzmocnienie proporcjonalne dla osi          
-    const float KP_SLAVE_TRACKING = 1.0;// Wzmocnienie śledzenia osi Slave
-    const float KP_SLAVE_SYNC = 0.15;   // Wzmocnienie błędu synchronizacji    
+    const float KP_MAIN = 1.0;          
+    const float KP_SLAVE_TRACKING = 1.0;
+    const float KP_SLAVE_SYNC = 0.15;   
     
-    const float SYNC_DEADBAND = 0.05;       // Strefa nieczułości dla błędu synchronicznego
-    const float SYNC_MAX_CORR = 2.0;  // Siła korekty  
+    const float SYNC_DEADBAND = 0.05;       
+    const float SYNC_MAX_CORR = 2.0;  
     
     unsigned long lastAxisCorrTime[5] = {0, 0, 0, 0, 0};
-    const unsigned long CORR_INTERVAL = 20; // Okres próbkowania regulatora
+    const unsigned long CORR_INTERVAL = 20; 
     
     AccelStepper* motors[5] = {&motorE, &motorZ, &motorY, &motorA, &motorX};
 
@@ -362,7 +381,7 @@ void motorControlTask(void *parameter) {
         stepsPerDegree[i] = (STEPS_PER_MOTOR_REV * ENCODER_LEVER[i]) / 360.0;
     }
     
-    // Inicjalizacja zmiennej startowej dla X (żeby nie szarpnęło przy starcie)
+    // Inicjalizacja zmiennej startowej dla X
     lastTargetX = START_ANGLES[4];
 
     Serial.println("Rdzeń 1: Task sterowania uruchomiony");
@@ -370,45 +389,40 @@ void motorControlTask(void *parameter) {
     while (true) {
         unsigned long currentMillis = millis();
 
-        // ===== Pobieranie danych i obsługa backlash osi X =====
-        if (xSemaphoreTake(xMutex, 10 / portTICK_PERIOD_MS)) {
-            if (newTargetAvailable) {
-                // Kopiujemy nowe cele
-                memcpy(localTargetAngles, (void*)targetAngles, sizeof(localTargetAngles));
-                newTargetAvailable = false;
-
-                currentServoAngle = localCurrentServo;
+        // ===== Konsumpcja bufora sprzętowego (Pop) =====
+        if (currentMillis - lastPopTime >= POP_INTERVAL_MS) {
+            lastPopTime = currentMillis;
+            TrajectoryPoint currentPoint;
+            
+            // Operacja Pop (non-blocking)
+            if (xQueueReceive(trajectoryQueue, &currentPoint, 0) == pdPASS) {
+                memcpy(localTargetAngles, currentPoint.angles, sizeof(localTargetAngles));
+                localTargetServo = currentPoint.servoAngle;
                 
                 // Obsługa backlash osi X
                 float newX = localTargetAngles[4];
-                
                 if (isFirstRun) {
                     lastTargetX = newX;
                     isFirstRun = false;
                 }
-
-                // Porównujemy nowy cel z poprzednim zapamiętanym
-                if (abs(newX - lastTargetX) > 0.1) { // Tolerancja na float
-                    if (newX > lastTargetX) {
-                        activeBacklashX = BACKLASH_X_DEG;   // Ruch w stronę dodatnią
-                    } 
-                    else if (newX < lastTargetX) {
-                        activeBacklashX = -BACKLASH_X_DEG;  // Ruch w stronę ujemną
-                    }
+                if (abs(newX - lastTargetX) > 0.1) { 
+                    if (newX > lastTargetX) activeBacklashX = BACKLASH_X_DEG;
+                    else if (newX < lastTargetX) activeBacklashX = -BACKLASH_X_DEG;
                     lastTargetX = newX;
                 }
-                // ==========================================================
             }
-            
-            // Aktualizacja pozycji bieżącej
+        }
+        
+        // Aktualizacja bieżącej pozycji sprzętowej z ochroną Mutex
+        if (xSemaphoreTake(xMutex, 10 / portTICK_PERIOD_MS)) {
             memcpy(localCurrentAngles, (void*)currentAngles, sizeof(localCurrentAngles));
             xSemaphoreGive(xMutex);
         }
         
         // ===== Sterowanie silnikami krokowymi oraz serwomechanizmem =====
         if (abs(localTargetServo - localCurrentServo) > 0.5) {
-            gripperServo.write((int)localTargetServo); // Zapis do sprzętu
-            localCurrentServo = localTargetServo;      // Aktualizacja stanu
+            gripperServo.write((int)localTargetServo); 
+            localCurrentServo = localTargetServo;      
         }
 
         for (int i = 0; i < 5; i++) {
@@ -420,7 +434,7 @@ void motorControlTask(void *parameter) {
 
             // Obliczanie odchyłki od celu
             float effectiveTarget = localTargetAngles[i];
-            if (i == 4) { //Oś X
+            if (i == 4) { // Oś X
                 effectiveTarget += activeBacklashX;
             }
             float error = effectiveTarget - localCurrentAngles[i];
@@ -510,6 +524,13 @@ void setup() {
     xMutex = xSemaphoreCreateMutex();
     if (xMutex == NULL) {
         Serial.println("BŁĄD: Nie można utworzyć mutexu!");
+        while(1);
+    }
+
+    // Inicjalizacja buforu FIFO
+    trajectoryQueue = xQueueCreate(QUEUE_SIZE, sizeof(TrajectoryPoint));
+    if (trajectoryQueue == NULL) {
+        Serial.println("BŁĄD KRYTYCZNY: Nie alokowano pamięci dla trajectoryQueue!");
         while(1);
     }
 
