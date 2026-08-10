@@ -365,7 +365,7 @@ void motorControlTask(void *parameter) {
     // Inicjalizacja zmiennej startowej dla X (żeby nie szarpnęło przy starcie)
     lastTargetX = START_ANGLES[4];
 
-    Serial.println("Rdzeń 1: Task sterowania uruchomiony (Logika: Target Hysteresis)");
+    Serial.println("Rdzeń 1: Task sterowania uruchomiony");
     
     while (true) {
         unsigned long currentMillis = millis();
@@ -483,6 +483,7 @@ void setup() {
     Serial.begin(BAUD);
     Wire.begin(SDA_PIN, SCL_PIN);
     Wire.setClock(400000);
+    Wire.setTimeOut(50);
     
     // Konfiguracja pinów
     pinMode(STEP_X, OUTPUT);
