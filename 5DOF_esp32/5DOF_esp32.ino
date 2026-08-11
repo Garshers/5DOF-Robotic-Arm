@@ -347,7 +347,7 @@ void motorControlTask(void *parameter) {
 
     // Parametry czasowe dla bufora trajektorii
     TickType_t lastPopTime = 0;
-    const TickType_t POP_INTERVAL_MS = 10; 
+    const TickType_t POP_INTERVAL_MS = 1;
 
     // Zmienne stanu dla kompensacji osi X
     const float BACKLASH_X_DEG = 1.3; 
