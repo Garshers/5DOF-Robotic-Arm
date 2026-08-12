@@ -806,9 +806,9 @@ class RobotControlGUI:
         
         input_defs = [
             ("X:", "200", "x_entry"), 
-            ("Y:", "0", "y_entry"), 
-            ("Z:", "3", "z_entry"), 
-            ("Pitch φ [°]:", "0", "phi_entry"),
+            ("Y:", "150", "y_entry"), 
+            ("Z:", "20", "z_entry"), 
+            ("Pitch φ [°]:", "-90", "phi_entry"),
             ("Roll [°]:", "0", "roll_entry")
         ]
         for i, (lbl_txt, def_val, attr_name) in enumerate(input_defs):
@@ -1051,7 +1051,7 @@ class RobotControlGUI:
             self.log(f"Nieoczekiwany błąd: {e}")
             messagebox.showerror("Błąd krytyczny", str(e))
 
-    def execute_linear_trajectory(self, trajectory_joints, delay_ms=50):
+    def execute_linear_trajectory(self, trajectory_joints, delay_ms=10):
         """
         Inicjalizuje asynchroniczne strumieniowanie wygenerowanej trajektorii do sterownika sprzętowego.
         Wartość delay_ms powinna być skorelowana z POP_INTERVAL_MS na układzie ESP32.
@@ -1115,8 +1115,8 @@ class RobotControlGUI:
                 return
             
             self.log(f"Strumieniowanie danych: {len(trajectory)} węzłów przestrzennych.")
-            # Stała czasowa musi być silnie skorelowana z POP_INTERVAL_MS (50 ms) sprzętowej pętli serwo
-            self.execute_linear_trajectory(trajectory, delay_ms=50)
+            # Stała czasowa musi być silnie skorelowana z POP_INTERVAL_MS (10 ms) sprzętowej pętli serwo
+            self.execute_linear_trajectory(trajectory, delay_ms=10)
 
         except ValueError as e:
             messagebox.showerror("Błąd preprocesingu", str(e))

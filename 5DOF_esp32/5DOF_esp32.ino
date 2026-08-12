@@ -41,7 +41,7 @@ const float START_ANGLES[5] = {90.0, 90.0, 135.0, 135.0, 0.0};
 const bool ENCODER_INVERT[] = {true, false, false, true, false};
 const uint8_t ENCODER_CHANNEL[] = {4, 5, 6, 7, 3};
 const float ENCODER_LEVER[] = {2.0, 3.6, 4.5, 4.5, 4.0};
-const uint16_t ENCODER_ZPOS[] = {3777 + 45, 3982, 1280+100+1500-100, 2908-60-420+100, 1800};
+const uint16_t ENCODER_ZPOS[] = {3822, 3982, 2780+200, 2528+225, 1800};
 int16_t rotationCount[] = {0, 0, 0, 0, 0};
 uint16_t lastRawAngle[] = {0, 0, 0, 0, 0};
 const float angleConst = 360.0 / 4096.0;
@@ -345,22 +345,21 @@ void motorControlTask(void *parameter) {
     float localTargetServo = 0.0;
     float localCurrentServo = 0.0;
 
-    // Parametry czasowe dla bufora trajektorii
-    TickType_t lastPopTime = 0;
-    const TickType_t POP_INTERVAL_MS = 1;
+    // Parametr aproksymacji punktu pośredniego (promień akceptacji węzła)
+    const float WAYPOINT_EPSILON = 1.6; // empirycznie 1.6 dla delay_ms=10 oraz step_size_mm=2.0
 
     // Zmienne stanu dla kompensacji osi X
-    const float BACKLASH_X_DEG = 1.3; 
+    const float BACKLASH_X_DEG = 1.3;
     static float lastTargetX = 0.0;
     static float activeBacklashX = 0.0;
     static bool isFirstRun = true;
 
-    const float KP_MAIN = 1.0;          
+    const float KP_MAIN = 1.0;
     const float KP_SLAVE_TRACKING = 1.0;
-    const float KP_SLAVE_SYNC = 0.15;   
+    const float KP_SLAVE_SYNC = 0.15;
     
-    const float SYNC_DEADBAND = 0.05;       
-    const float SYNC_MAX_CORR = 2.0;  
+    const float SYNC_DEADBAND = 0.05;
+    const float SYNC_MAX_CORR = 2.0;
     
     unsigned long lastAxisCorrTime[5] = {0, 0, 0, 0, 0};
     const unsigned long CORR_INTERVAL = 20; 
@@ -389,9 +388,22 @@ void motorControlTask(void *parameter) {
     while (true) {
         unsigned long currentMillis = millis();
 
+        // ===== Ewaluacja osiągnięcia punktu pośredniego =====
+        bool isWaypointReached = true;
+        for (int i = 0; i < 5; i++) {
+            if (i == 3) continue; // Pomiń Slave A
+            
+            float effectiveTarget = localTargetAngles[i];
+            if (i == 4) effectiveTarget += activeBacklashX;
+            
+            if (abs(effectiveTarget - localCurrentAngles[i]) > WAYPOINT_EPSILON) {
+                isWaypointReached = false;
+                break;
+            }
+        }
+
         // ===== Konsumpcja bufora sprzętowego (Pop) =====
-        if (currentMillis - lastPopTime >= POP_INTERVAL_MS) {
-            lastPopTime = currentMillis;
+        if (isWaypointReached) {
             TrajectoryPoint currentPoint;
             
             // Operacja Pop (non-blocking)
