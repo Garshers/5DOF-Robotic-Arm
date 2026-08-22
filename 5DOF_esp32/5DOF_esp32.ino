@@ -6,6 +6,7 @@
 // ==================== Podstawowe ustawienia ====================
 #define BAUD 115200
 #define SIMULATION_MODE false
+#define CALIBRATION_MODE false
 
 // ======================= Piny silników ======================
 #define SERVO_PIN 13
@@ -41,10 +42,15 @@ const float START_ANGLES[5] = {90.0, 90.0, 135.0, 135.0, 0.0};
 const bool ENCODER_INVERT[] = {true, false, false, true, false};
 const uint8_t ENCODER_CHANNEL[] = {4, 5, 6, 7, 3};
 const float ENCODER_LEVER[] = {2.0, 3.6, 4.5, 4.5, 4.0};
-const uint16_t ENCODER_ZPOS[] = {3822, 3982, 2780+200, 2528+225, 1800};
+const uint16_t ENCODER_ZPOS[] = {3822, 3982, 2996, 2891, 1800}; //Y:2161 A:3215 -1054- 2528 2780+100;2780-96+93...2161+785, 3215-450...2753, 2840 Y:2926 A:2821
 int16_t rotationCount[] = {0, 0, 0, 0, 0};
 uint16_t lastRawAngle[] = {0, 0, 0, 0, 0};
 const float angleConst = 360.0 / 4096.0;
+
+// ===================== Parametry sterowania ======================
+const bool AXIS_INVERT[] = {false, true, true, true, true};
+const unsigned long ENCODER_READ_INTERVAL = 15; // Dopasowane do pętli korekty
+const unsigned long PYTHON_SEND_INTERVAL = 50;
 
 // ===================== Zmienne współdzielone (z mutex) ======================
 SemaphoreHandle_t xMutex;
@@ -54,25 +60,16 @@ volatile float targetServoAngle = 0.0; // Stan serwonapędu
 volatile float currentServoAngle = 0.0;
 volatile bool newTargetAvailable = true;
 
-// ===================== Bufor trajektorii (FIFO) ======================
+// ===================== Bufor trajektorii (FIFO) i komunikacyjny ======================
 struct TrajectoryPoint {
     float angles[5];
     float servoAngle;
 };
-
 QueueHandle_t trajectoryQueue;
-const UBaseType_t QUEUE_SIZE = 64; // Bufor trajektorii
-
-// ===================== Bufor komunikacyjny =======================
-#define RX_BUF_SIZE 64
+const int QUEUE_SIZE = 124; // Bufor trajektorii
+#define RX_BUF_SIZE 64 // Bufor komunikacji
 char inputBuffer[RX_BUF_SIZE];
 uint8_t inputIdx = 0;
-
-// ===================== Parametry sterowania ======================
-const bool AXIS_INVERT[] = {false, true, true, true, true};
-const float ANGLE_TOLERANCE = 0.05;
-const unsigned long ENCODER_READ_INTERVAL = 5;
-const unsigned long PYTHON_SEND_INTERVAL = 50;
 
 // Deklaracje funkcji (prototypy)
 void readSerialCommands();
@@ -349,21 +346,23 @@ void motorControlTask(void *parameter) {
     const float WAYPOINT_EPSILON = 1.6; // empirycznie 1.6 dla delay_ms=10 oraz step_size_mm=2.0
 
     // Zmienne stanu dla kompensacji osi X
-    const float BACKLASH_X_DEG = 1.3;
+    const float BACKLASH_X_DEG = 0.0; //1.3
     static float lastTargetX = 0.0;
     static float activeBacklashX = 0.0;
     static bool isFirstRun = true;
 
+    // Uniwersalne nastawy
     const float KP_MAIN = 1.0;
+    const float ANGLE_TOLERANCE = 0.05; // dla kroku 0.028125
+
+    // Nastawy slave oś A
     const float KP_SLAVE_TRACKING = 1.0;
-    const float KP_SLAVE_SYNC = 0.15;
-    
-    const float SYNC_DEADBAND = 0.05;
-    const float SYNC_MAX_CORR = 2.0;
+    const float KP_SLAVE_SYNC = 0.12;
+    const float SYNC_DEADBAND = 0.5;
+    const float SYNC_MAX_CORR = 5.0;
     
     unsigned long lastAxisCorrTime[5] = {0, 0, 0, 0, 0};
-    const unsigned long CORR_INTERVAL = 20; 
-    
+    const unsigned long CORR_INTERVAL = 20;
     AccelStepper* motors[5] = {&motorE, &motorZ, &motorY, &motorA, &motorX};
 
     // Konfiguracja kinematyki i profilowanie
@@ -459,17 +458,14 @@ void motorControlTask(void *parameter) {
             if (abs(error) > ANGLE_TOLERANCE) {
                 
                 long stepsCorr = (long)(error * KP_MAIN * stepsPerDegree[i]);
-                
                 stepsCorr = constrain(stepsCorr, -MAX_CORR_STEPS, MAX_CORR_STEPS);
-
-                if (AXIS_INVERT[i]) {
-                    stepsCorr = -stepsCorr;
-                }
+                if (AXIS_INVERT[i]) stepsCorr = -stepsCorr;
 
                 motors[i]->moveTo(motors[i]->currentPosition() + stepsCorr);
                 
                 // --- LOGIKA MASTER-SLAVE DLA OSI A ---
                 if (i == 2) {
+                //if (false) {
                     float errorA = localTargetAngles[2] - localCurrentAngles[3];
                     float syncDeviation = localCurrentAngles[2] - localCurrentAngles[3];
                     
@@ -488,7 +484,6 @@ void motorControlTask(void *parameter) {
                     float totalCorrA = errorA * KP_SLAVE_TRACKING + syncCorr;
                     long stepsCorrA = (long)(totalCorrA * stepsPerDegree[3]);
                     stepsCorrA = constrain(stepsCorrA, -MAX_CORR_STEPS, MAX_CORR_STEPS);
-
                     if (AXIS_INVERT[3]) stepsCorrA = -stepsCorrA;
 
                     motors[3]->moveTo(motors[3]->currentPosition() + stepsCorrA);
@@ -551,7 +546,11 @@ void setup() {
     }
 
     // Kalibracja enkoderów
-    Serial.println("Kalibracja enkoderów...");
+    const char* axisNames[] = {"E", "Z", "Y", "A", "X"};  
+    if(CALIBRATION_MODE){
+        Serial.println("Kalibracja enkoderów...");
+        calibration(axisNames);
+    }
 
     // === funkcja weryfikująca pozycję startową ===
     if (!isStartPosition()) {
@@ -559,14 +558,7 @@ void setup() {
         while(!isStartPosition()) vTaskDelay(1000);
     }
 
-    const char* axisNames[] = {"E", "Z", "Y", "A", "X"};    
-    
-    /*
-    // Kalibracja enkoderów
-    Serial.println("Kalibracja enkoderów...");
-    calibration(axisNames);
-    */
-    
+
     for(int i = 0; i < 5; i++) {
         Serial.printf("Enkoder %s: Ustawiona stała RAW=%d (start=%.1f°)\n", 
                       axisNames[i], ENCODER_ZPOS[i], START_ANGLES[i]);
@@ -693,9 +685,16 @@ void calibrateX() {
 
 void calibration(const char* axisNames[]) {
     unsigned long lastPrint = 0;
-    
+
     Serial.println(F("Wyslij 'x' aby uruchomic bazowanie osi X."));
-    
+    Serial.println(F("Wyslij 'y'/'h' (os Y) lub 'a'/'z' (os A) aby wykonac ruch o 20 krokow."));
+
+    // Konfiguracja profilu kinematycznego dla ruchu recznego
+    motorY.setMaxSpeed(400);
+    motorY.setAcceleration(500);
+    motorA.setMaxSpeed(400);
+    motorA.setAcceleration(500);
+
     // Statyczny bufor dla logów - wystarczający na 5 osi
     char logBuffer[128]; 
 
@@ -704,19 +703,31 @@ void calibration(const char* axisNames[]) {
             char cmd = Serial.read();
             if (cmd == 'x' || cmd == 'X') {
                 calibrateX();
+            } else if (cmd == 'y') {
+                motorY.move(20);
+            } else if (cmd == 'h') {
+                motorY.move(-20);
+            } else if (cmd == 'a') {
+                motorA.move(20);
+            } else if (cmd == 'z') {
+                motorA.move(-20);
             }
         }
 
+        // Realizacja obliczonych trajektorii (nieblokujace)
+        motorY.run();
+        motorA.run();
+
         if (millis() - lastPrint >= 500) {
             lastPrint = millis();
-            
+
             // Wyczyszczenie bufora i przygotowanie wskaźnika przesunięcia
             int offset = 0;
             logBuffer[0] = '\0';
 
             for (int i = 0; i < 5; i++) {
                 uint16_t rawAngle = getEncoderRawAngle(ENCODER_CHANNEL[i]); 
-                
+
                 // Bezpieczne dopisywanie do bufora (append)
                 if (rawAngle != 0xFFFF) {
                     offset += snprintf(logBuffer + offset, sizeof(logBuffer) - offset, 
@@ -725,13 +736,14 @@ void calibration(const char* axisNames[]) {
                     offset += snprintf(logBuffer + offset, sizeof(logBuffer) - offset, 
                                        "%s:ERROR ", axisNames[i]);
                 }
-                
+
                 // Zabezpieczenie przed wyjściem poza bufor
                 if (offset >= sizeof(logBuffer)) break; 
             }
             Serial.println(logBuffer);
         }
-        vTaskDelay(10);
+        
+        yield(); // Oddanie sterowania do RTOS bez blokowania generatora krokow
     }
 }
 

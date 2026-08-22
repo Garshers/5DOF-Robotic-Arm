@@ -403,14 +403,14 @@ class RobotKinematics:
             barrier = centered ** 6
             limit_cost += barrier * 10.0
             
-        motion_cost = 5.0 * self.calculate_joint_distance(current_angles, angles)
+        motion_cost = 10.0 * self.calculate_joint_distance(current_angles, angles)
             
         J = self.get_jacobian(th1, th2, th3, th4, th5)
         J_pos = J[:3, :]
         manipulability = math.sqrt(np.linalg.det(J_pos @ J_pos.T))
-        singularity_cost = 1.0 / (manipulability + 0.001)
+        singularity_cost = 1.0 / (manipulability + 0.01)
         
-        return motion_cost #limit_cost + motion_cost + singularity_cost
+        return motion_cost #+ limit_cost #+ singularity_cost
 
     def _construct_matrix(self, x, y, z, phi_deg):
         """
