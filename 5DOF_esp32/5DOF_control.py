@@ -602,9 +602,146 @@ class RobotKinematics:
             last_angles = sol
             
         return trajectory_joints, "OK"
-    
-# -------------------------------- GUI APP ---------------------------------
 
+    def _ik_orbit(self, R, z, th1_dir, phi_world, branch):
+        """IK dla jednej gałęzi. Dla gałęzi 'reverse' (TCP za podstawą) phi w płaszczyźnie ramienia = 180 - phi."""
+        elbow_up, reverse_base = [(True, False), (False, False), (True, True), (False, True)][branch]
+        th1 = self._normalize_angle(th1_dir + math.pi) if reverse_base else th1_dir
+        phi_arm = 180.0 - phi_world if reverse_base else phi_world
+        return self.inverse_kinematics(R, z, th1, phi_arm, elbow_up, reverse_base)
+
+    def generate_orbit_trajectory(self, current_angles, phi_step=0.5, node_gate_deg=6.0, max_step_deg=1.0):
+        """
+        Orbitowanie: TCP zostaje w jednym punkcie, zmienia się tylko orientacja (phi).
+        Ruch: aktualna konfiguracja -> maksymalne phi ("do góry") -> minimalne phi ("w dół")
+              -> powrót do konfiguracji początkowej.
+        Zwraca (trajektoria [krotki 5 kątów w rad], info) albo (None, komunikat_błędu).
+        """
+        import heapq
+        q0 = np.array(current_angles[:5], dtype=float)
+
+        # --- aktualny punkt TCP i phi (jak w send_position_linear) ---
+        T = self.get_tcp_matrix(*q0)
+        p = T[:3, 3]
+        th1_dir = math.atan2(p[1], p[0])
+        a_rad = T[0, 2] * math.cos(th1_dir) + T[1, 2] * math.sin(th1_dir)
+        phi0 = math.degrees(math.atan2(T[2, 2], a_rad))
+        R = math.hypot(p[0], p[1])
+
+        W = np.array([1.0, 5.0, 3.0, 1.0])
+        lims = [self.limits[n] for n in ('th1', 'th2', 'th3', 'th4')]
+        deltas = np.arange(-180.0, 180.0, phi_step)           # delta = 0 -> phi0
+        wrap = lambda a: (a + math.pi) % (2 * math.pi) - math.pi
+
+        # --- węzły: wszystkie poprawne konfiguracje IK dla tego punktu (każde phi x każda gałąź) ---
+        layers = []                                           # layers[m] = (Q[n,4], ids[n], branch[n])
+        node_q, node_delta, node_branch = [], [], []
+        for m, dlt in enumerate(deltas):
+            phi = ((phi0 + dlt + 180.0) % 360.0) - 180.0
+            Qm, Im, Bm = [], [], []
+            for b in range(4):
+                sol = self._ik_orbit(R, p[2], th1_dir, phi, b)
+                if sol is None or any(not (lo <= v <= hi) for v, (lo, hi) in zip(sol, lims)):
+                    continue
+                if not self.check_constraints(sol, self.get_joint_positions(*sol))[0]:
+                    continue
+                Qm.append(sol); Im.append(len(node_q)); Bm.append(b)
+                node_q.append(np.array(sol)); node_delta.append(dlt); node_branch.append(b)
+            layers.append((np.array(Qm), Im, Bm))
+        if not node_q:
+            return None, "Brak poprawnych konfiguracji dla aktualnego punktu TCP."
+
+        # --- krawędzie: sąsiednie phi, ciągłość w przestrzeni złączy ---
+        gate = math.radians(node_gate_deg)
+        adj = [[] for _ in node_q]
+        for m in range(len(layers) - 1):
+            Qa, Ia, _ = layers[m]; Qb, Ib, _ = layers[m + 1]
+            if len(Qa) == 0 or len(Qb) == 0:
+                continue
+            diff = wrap(Qb[None, :, :] - Qa[:, None, :])
+            ok = np.abs(diff).max(axis=2) <= gate
+            cost = (np.abs(diff) * W).sum(axis=2)
+            for ia, ib in zip(*np.nonzero(ok)):
+                adj[Ia[ia]].append((Ib[ib], cost[ia, ib]))
+                adj[Ib[ib]].append((Ia[ia], cost[ia, ib]))
+
+        # --- węzeł startowy = rozwiązanie dla delta=0 najbliższe aktualnym kątom ---
+        m0 = int(np.argmin(np.abs(deltas)))
+        Q0, I0, _ = layers[m0]
+        if len(Q0) == 0:
+            return None, "Aktualna konfiguracja jest poza dopuszczalnymi limitami (brak rozwiązania IK)."
+        d0 = np.abs(wrap(Q0 - q0[:4])).max(axis=1)
+        start = I0[int(np.argmin(d0))]
+        if d0.min() > math.radians(2.0):
+            return None, f"Aktualne kąty nie pasują do żadnego rozwiązania IK (odchyłka {math.degrees(d0.min()):.1f}°)."
+
+        def dijkstra(src):
+            dist = {src: 0.0}; prev = {}; pq = [(0.0, src)]
+            while pq:
+                dcur, u = heapq.heappop(pq)
+                if dcur > dist.get(u, 1e18):
+                    continue
+                for v, w in adj[u]:
+                    nd = dcur + w
+                    if nd < dist.get(v, 1e18):
+                        dist[v] = nd; prev[v] = u; heapq.heappush(pq, (nd, v))
+            return dist, prev
+
+        def path_to(prev, src, dst):
+            out = [dst]
+            while out[-1] != src:
+                out.append(prev[out[-1]])
+            return out[::-1]
+
+        dist_s, prev_s = dijkstra(start)                      # składowa spójna zawierająca konfigurację startową
+        reach = list(dist_s.keys())
+        up = max(reach, key=lambda i: (node_delta[i], -dist_s[i]))
+        down = min(reach, key=lambda i: (node_delta[i], dist_s[i]))
+        if node_delta[up] <= 0 and node_delta[down] >= 0:
+            return None, "W tym punkcie nie ma swobody zmiany orientacji (phi)."
+
+        dist_u, prev_u = dijkstra(up)
+        seq = path_to(prev_s, start, up) + path_to(prev_u, up, down)[1:] + path_to(prev_s, start, down)[::-1][1:]
+
+        # --- próbki: pierwszy i ostatni punkt = dokładnie aktualna konfiguracja ---
+        pts = [np.append(node_q[i], q0[4]) for i in seq]
+        pts[0] = q0.copy(); pts[-1] = q0.copy()
+
+        # --- zagęszczenie: max krok złącza ~ max_step_deg; w obrębie jednej gałęzi każdy punkt
+        #     pośredni to dokładne IK dla pośredniego phi (TCP zostaje w miejscu) ---
+        step = math.radians(max_step_deg)
+        traj = []
+        for ia, ib, a, b in zip(seq[:-1], seq[1:], pts[:-1], pts[1:]):
+            dq = wrap(b - a)
+            same = node_branch[ia] == node_branch[ib]
+            n = max(int(math.ceil(np.abs(dq[:4]).max() / step)), 1)
+            for _ in range(4):                                   # dogęszczaj, aż każdy krok <= max_step_deg
+                seg = []
+                for k_ in range(1, n + 1):
+                    f = k_ / n
+                    q_k = None
+                    if same and k_ < n:
+                        phi_k = phi0 + node_delta[ia] + f * (node_delta[ib] - node_delta[ia])
+                        sol = self._ik_orbit(R, p[2], th1_dir, ((phi_k + 180.0) % 360.0) - 180.0, node_branch[ia])
+                        if sol is not None:
+                            q_k = np.append(sol, q0[4])
+                    seg.append(a + dq * f if q_k is None else q_k)
+                chain = np.vstack([a] + seg)
+                worst = np.abs(wrap(np.diff(chain, axis=0)))[:, :4].max()
+                if worst <= step * 1.05:
+                    break
+                n = int(math.ceil(n * worst / step))
+            traj.extend(tuple(q) for q in seg)
+        traj[-1] = tuple(q0)                                     # powrót dokładnie do pozycji początkowej
+
+        info = {
+            "phi_max": phi0 + node_delta[up], "phi_min": phi0 + node_delta[down], "phi0": phi0,
+            "tcp": tuple(p), "points": len(traj),
+            "elbow_changed": len({node_branch[i] for i in seq}) > 1,
+        }
+        return traj, info
+
+# -------------------------------- GUI APP ---------------------------------
 class RobotControlGUI:
     def __init__(self, root):
         self.root = root
@@ -645,6 +782,7 @@ class RobotControlGUI:
         self.target_xyz = None 
         self.POSITION_TOLERANCE = 10.0  # mm
         self.START_POSITION_DEG = [0.0, 135.0, 90.0, 90.0, 0.0]   # th1..th5
+        self.ORBIT_DELAY_MS = 15
 
         # Inicjalizacja GUI
         self.setup_ui()
@@ -751,8 +889,11 @@ class RobotControlGUI:
             self.tcp_labels[axis] = lbl
 
         ttk.Button(pos_frame, text="POZYCJA STARTOWA",
-           command=self.go_to_start_position).grid(
-               row=3, column=0, columnspan=6, sticky="ew", pady=(8, 2))
+                   command=self.go_to_start_position).grid(
+                       row=3, column=0, columnspan=3, sticky="ew", padx=(0, 3), pady=(8, 2))
+        ttk.Button(pos_frame, text="ORBITOWANIE",
+                   command=self.orbit_tcp).grid(
+                       row=3, column=3, columnspan=3, sticky="ew", padx=(3, 0), pady=(8, 2))
 
         # 4. Kąty docelowe (IK)
         angles_header = ttk.Label(self.content_frame, text="Kąty docelowe (wynik IK)", style="Header.TLabel")
@@ -1214,6 +1355,30 @@ class RobotControlGUI:
         rads = [math.radians(d) for d in self.START_POSITION_DEG]
         ok, msg = self.robot.send_target_angles(*rads)
         self.log("Pozycja startowa: " + msg)
+
+    def orbit_tcp(self):
+        if not self.is_connected:
+            messagebox.showwarning("Info", "Brak połączenia")
+            return
+
+        # Zatrzymaj wszystko, co wysyła konkurencyjne cele
+        if self.live_control_var.get():
+            self.live_control_var.set(False)
+        self.stop_continuous_send()
+        if self.sequence_playing:
+            self.stop_sequence("Przerwano: orbitowanie TCP")
+
+        cur_rads = [math.radians(a) for a in self.robot.get_current_angles()[:5]]
+        traj, info = self.kin.generate_orbit_trajectory(cur_rads)
+        if traj is None:
+            self.log(f"Orbitowanie: {info}")
+            messagebox.showerror("Orbitowanie", info)
+            return
+
+        self.log(f"Orbitowanie: φ {info['phi0']:.1f}° → {info['phi_max']:.1f}° → "
+                 f"{info['phi_min']:.1f}° → {info['phi0']:.1f}°, {info['points']} punktów"
+                 + (", ze zmianą łokcia" if info['elbow_changed'] else ""))
+        self.execute_linear_trajectory(traj, delay_ms=self.ORBIT_DELAY_MS)
 
     def send_angles_continuously(self):
         if not self.angle_send_active: return
