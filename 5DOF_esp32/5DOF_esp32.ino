@@ -73,7 +73,7 @@ uint8_t inputIdx = 0;
 
 // Deklaracje funkcji (prototypy)
 void readSerialCommands();
-void parsePythonCommand(String cmd);
+void parsePythonCommand(char* cmd);
 void sendPositionToPython();
 void readEncoders();
 uint16_t getEncoderRawAngle(uint8_t channel); 

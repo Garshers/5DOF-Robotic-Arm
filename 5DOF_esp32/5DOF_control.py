@@ -22,7 +22,7 @@ class RobotSerial:
         self.running = False        # Flaga kontrolująca pracę wątku odczytu.
         self.reader_thread = None   # Wątek odpowiedzialny za odbiór danych w tle.
 
-        # Aktualne wartości odczytane z kontrolera [X, Y, Z, E, A, S] w stopniach.
+        # Aktualne wartości odczytane z kontrolera [X, Y, Z, E, A, S] w stopniach.S
         self.current_angles = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
         # mutex w c++
@@ -475,8 +475,8 @@ class RobotKinematics:
                 is_valid, _ = self.check_constraints(sol, fk_positions)
                 
                 if is_valid:
-                    if check_strategies:
-                        return sol, "Auto"
+                    #if check_strategies:
+                    #    return sol, "Auto"
                     
                     cost = self.calculate_configuration_cost(sol + (current_angles[4],), current_angles)
                     if cost < min_cost:
@@ -644,6 +644,7 @@ class RobotControlGUI:
         self.play_button = None 
         self.target_xyz = None 
         self.POSITION_TOLERANCE = 10.0  # mm
+        self.START_POSITION_DEG = [0.0, 135.0, 90.0, 90.0, 0.0]   # th1..th5
 
         # Inicjalizacja GUI
         self.setup_ui()
@@ -748,6 +749,10 @@ class RobotControlGUI:
             lbl = ttk.Label(pos_frame, text="0.00", font=('Arial', 10, 'bold'), foreground="#377df0")
             lbl.grid(row=2, column=col+1, sticky="w", padx=5)
             self.tcp_labels[axis] = lbl
+
+        ttk.Button(pos_frame, text="POZYCJA STARTOWA",
+           command=self.go_to_start_position).grid(
+               row=3, column=0, columnspan=6, sticky="ew", pady=(8, 2))
 
         # 4. Kąty docelowe (IK)
         angles_header = ttk.Label(self.content_frame, text="Kąty docelowe (wynik IK)", style="Header.TLabel")
@@ -866,7 +871,13 @@ class RobotControlGUI:
             axis.set_tick_params(colors=COLORS['TEXT'])
             
         self.canvas = FigureCanvasTkAgg(self.fig, master=viz_frame)
-        ttk.Button(viz_frame, text="Resetuj widok", command=self.reset_3d_view).pack(side=tk.TOP, anchor="nw", pady=5, padx=5)
+
+        view_bar = ttk.Frame(viz_frame)
+        view_bar.pack(side=tk.TOP, anchor="nw", pady=5, padx=5)
+        ttk.Button(view_bar, text="Resetuj widok", command=self.reset_3d_view).pack(side=tk.LEFT)
+        ttk.Button(view_bar, text="Widok X-Z", command=self.set_view_xz).pack(side=tk.LEFT, padx=(5, 0))
+        ttk.Button(view_bar, text="Widok Y-Z", command=self.set_view_yz).pack(side=tk.LEFT, padx=(5, 0))
+
         self.canvas.get_tk_widget().config(bg=COLORS['BG'])
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         
@@ -896,12 +907,25 @@ class RobotControlGUI:
         self.ax.plot_wireframe(X, Y, np.zeros_like(X), alpha=0.1, color='gray', linewidth=0.5)
 
     def reset_3d_view(self):
+        self.ax.set_proj_type('persp')
         self.ax.set_xlim([-self.max_reach, self.max_reach])
         self.ax.set_ylim([-self.max_reach, self.max_reach])
         self.ax.set_zlim([0, self.max_reach])
         self.ax.view_init(elev=20, azim=45)
         self.canvas.draw()
 
+    def set_view_xz(self):
+        # Kamera patrzy wzdłuż osi Y: X w prawo, Z do góry
+        self.ax.set_proj_type('ortho')
+        self.ax.view_init(elev=0, azim=-90)
+        self.canvas.draw()
+
+    def set_view_yz(self):
+        # Kamera patrzy wzdłuż osi X: Y w prawo, Z do góry
+        self.ax.set_proj_type('ortho')
+        self.ax.view_init(elev=0, azim=0)
+        self.canvas.draw()
+        
     def update_3d_visualization(self):
         try:
             # Usunięcie starych elementów (linii i strzałek)
@@ -1170,7 +1194,27 @@ class RobotControlGUI:
         if self.angle_send_timer:
             self.root.after_cancel(self.angle_send_timer)
             self.angle_send_timer = None
-    
+
+    def go_to_start_position(self):
+        if not self.is_connected:
+            messagebox.showwarning("Info", "Brak połączenia")
+            return
+
+        # Stop anything that would keep sending competing targets
+        if self.live_control_var.get():
+            self.live_control_var.set(False)
+        self.stop_continuous_send()
+        if self.sequence_playing:          # also cancels linear-move streaming
+            self.stop_sequence("Przerwano: powrót do pozycji startowej")
+
+        # Keep the sliders in sync with the commanded pose
+        for key, deg in zip(['th1', 'th2', 'th3', 'th4', 'th5'], self.START_POSITION_DEG):
+            self.angle_sliders[key].set(deg)
+
+        rads = [math.radians(d) for d in self.START_POSITION_DEG]
+        ok, msg = self.robot.send_target_angles(*rads)
+        self.log("Pozycja startowa: " + msg)
+
     def send_angles_continuously(self):
         if not self.angle_send_active: return
         
